@@ -112,7 +112,6 @@ typedef struct xfer {
 
 typedef struct {
     bool in_use;
-    bool interfaces_claimed;
     bool claimed_interfaces[USBIP_MAX_INTERFACES]; /* includes a partial claim after failure */
     bool release_pending;           /* session ended with a transfer in flight: release when it is done */
     uint32_t halted_eps;            /* endpoints halted by a STALL (see ep_halt_bit()) */
@@ -414,7 +413,7 @@ static bool has_claimed_interfaces_locked(int slot)
     if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use) {
         return false;
     }
-    for (uint8_t i = 0; i < s_state.devices[slot].device.num_interfaces; i++) {
+    for (uint8_t i = 0; i < USBIP_MAX_INTERFACES; i++) {
         if (s_state.devices[slot].claimed_interfaces[i]) {
             return true;
         }
@@ -428,9 +427,7 @@ static void release_interfaces_locked(int slot)
         return;
     }
     usb_device_handle_t dev_hdl = s_state.devices[slot].dev_hdl;
-    const usbip_backend_device_t *device = &s_state.devices[slot].device;
-
-    for (uint8_t i = 0; i < device->num_interfaces; i++) {
+    for (uint8_t i = 0; i < USBIP_MAX_INTERFACES; i++) {
         if (!s_state.devices[slot].claimed_interfaces[i]) {
             continue;
         }
@@ -444,41 +441,61 @@ static void release_interfaces_locked(int slot)
 
     /* Pipe slots are allocated dynamically per URB — nothing to free here. */
 
-    s_state.devices[slot].interfaces_claimed = false;
 }
 
-static esp_err_t ensure_interfaces_claimed_locked(int slot)
+/* Resolve an endpoint to its alternate-setting-zero interface. Interface
+   numbers need not be contiguous, and num_interfaces is a descriptor count,
+   not a bound on bInterfaceNumber. The claim bitmap bounds supported numbers. */
+static int find_endpoint_interface_locked(int slot, uint8_t endpoint_addr)
+{
+    if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use
+        || (endpoint_addr & 0x0f) == 0) {
+        return -1;
+    }
+    const usb_config_desc_t *cfg = NULL;
+    if (usb_host_get_active_config_descriptor(s_state.devices[slot].dev_hdl, &cfg) != ESP_OK
+        || cfg == NULL) {
+        return -1;
+    }
+    for (int num = 0; num < USBIP_MAX_INTERFACES; num++) {
+        int offset = 0;
+        const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, num, 0, &offset);
+        if (intf == NULL) {
+            continue;
+        }
+        for (int i = 0; i < intf->bNumEndpoints; i++) {
+            int ep_offset = offset;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &ep_offset);
+            if (ep != NULL && ep->bEndpointAddress == endpoint_addr) {
+                return num;
+            }
+        }
+    }
+    return -1;
+}
+
+static esp_err_t ensure_endpoint_interface_claimed_locked(int slot, uint8_t endpoint_addr)
 {
     if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_state.devices[slot].interfaces_claimed) {
+    const int num = find_endpoint_interface_locked(slot, endpoint_addr);
+    if (num < 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (s_state.devices[slot].claimed_interfaces[num]) {
         return ESP_OK;
     }
 
     usb_device_handle_t dev_hdl = s_state.devices[slot].dev_hdl;
-    const usbip_backend_device_t *device = &s_state.devices[slot].device;
-
-    ESP_LOGD(TAG, "Claiming %u interfaces for %s (lazy)", device->num_interfaces, device->busid);
-    for (uint8_t i = 0; i < device->num_interfaces; i++) {
-        if (s_state.devices[slot].claimed_interfaces[i]) {
-            continue; /* A prior release failed: the host still owns this claim. */
-        }
-        esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, i, 0);
-        if (err != ESP_OK) {
-            ESP_LOGD(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(err));
-            /* A composite device may exceed the remaining host channels.
-               Unwind earlier claims and retain any failed releases for retry. */
-            release_interfaces_locked(slot);
-            return err;
-        }
-        s_state.devices[slot].claimed_interfaces[i] = true;
+    esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, num, 0);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "usb_host_interface_claim(%d) failed: %s", num, esp_err_to_name(err));
+        /* The host library unwinds this interface's partial endpoint allocation.
+           Do not release other interfaces: they may have transfers in flight. */
+        return err;
     }
-
-    /* Pipe slots are allocated dynamically per URB — no per-endpoint
-       reservation needed. */
-
-    s_state.devices[slot].interfaces_claimed = true;
+    s_state.devices[slot].claimed_interfaces[num] = true;
     return ESP_OK;
 }
 
@@ -611,7 +628,6 @@ static void export_new_device(uint8_t address)
     s_state.devices[free_slot].in_use = true;
     s_state.devices[free_slot].dev_hdl = dev_hdl;
     s_state.devices[free_slot].device = device;
-    s_state.devices[free_slot].interfaces_claimed = false;
     memset(s_state.devices[free_slot].claimed_interfaces, 0,
            sizeof(s_state.devices[free_slot].claimed_interfaces));
 
@@ -649,9 +665,10 @@ static void remove_gone_device(usb_device_handle_t dev_hdl)
    which frees their host pipes and DWC channels for other devices.  The host
    has 16 channels and every device's EP0 and each hub's interrupt endpoint
    hold one for good, so a few devices with many endpoints claimed (CDC + MSC
-   + HID + MIDI) exhaust them and later claims fail.  The next session claims
-   the interfaces again, with fresh pipes at DATA0, on its first non-control
-   transfer.  A device with a transfer still in flight keeps its interfaces. */
+   + HID + MIDI) exhaust them and later claims fail. The next session claims
+   each interface again, with fresh pipes at DATA0, on its first non-control
+   transfer to that interface. A device with a transfer still in flight keeps
+   its interfaces. */
 static bool busid_in_flight_locked(const char busid[32])
 {
     for (const xfer_t *x = s_state.inflight_head; x != NULL; x = x->next) {
@@ -767,8 +784,9 @@ static int collect_claimed_endpoints_locked(int dev_slot, int intf_filter,
         || cfg == NULL) {
         return 0;
     }
-    for (int intf_num = 0; intf_num < s_state.devices[dev_slot].device.num_interfaces; intf_num++) {
-        if (intf_filter >= 0 && intf_num != intf_filter) {
+    for (int intf_num = 0; intf_num < USBIP_MAX_INTERFACES; intf_num++) {
+        if (!s_state.devices[dev_slot].claimed_interfaces[intf_num]
+            || (intf_filter >= 0 && intf_num != intf_filter)) {
             continue;
         }
         int offset = 0;
@@ -839,7 +857,8 @@ static void apply_standard_request_to_host(const xfer_t *pipe)
     usb_backend_device_slot_t *dev = &s_state.devices[dev_slot];
     if (intf_filter == -2) {
         const uint8_t ep = setup->wIndex & 0xff;
-        if ((ep & 0x0f) != 0) {
+        const int num = find_endpoint_interface_locked(dev_slot, ep);
+        if (num >= 0 && dev->claimed_interfaces[num]) {
             eps[num_eps++] = ep;
         }
     } else {
@@ -852,15 +871,10 @@ static void apply_standard_request_to_host(const xfer_t *pipe)
     for (int i = 0; i < num_eps; i++) {
         dev->halted_eps &= ~ep_halt_bit(eps[i]);
     }
-    /* Pipes are allocated (at DATA0) when the interfaces are claimed, so
-       there is nothing to reset before the first non-control transfer. */
-    const bool claimed = dev->interfaces_claimed;
+    /* Unclaimed endpoints have no host pipe; a later claim starts at DATA0. */
     const usb_device_handle_t dev_hdl = dev->dev_hdl;
     xSemaphoreGive(s_state.state_mutex);
 
-    if (!claimed) {
-        return;
-    }
     for (int i = 0; i < num_eps; i++) {
         ESP_LOGD(TAG, "%s: reset host endpoint 0x%02x (bRequest %u)",
                  pipe->busid, eps[i], setup->bRequest);
@@ -906,14 +920,15 @@ static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
     if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK || cfg == NULL) {
         return mps;
     }
-    for (int intf_num = 0; intf_num < s_state.devices[dev_slot].device.num_interfaces; intf_num++) {
+    for (int intf_num = 0; intf_num < USBIP_MAX_INTERFACES; intf_num++) {
         int offset = 0;
         const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, intf_num, 0, &offset);
         if (intf == NULL) {
             continue;
         }
         for (int i = 0; i < intf->bNumEndpoints; i++) {
-            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &offset);
+            int ep_offset = offset;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &ep_offset);
             if (ep != NULL && ep->bEndpointAddress == endpoint_addr) {
                 return ep->wMaxPacketSize;
             }
@@ -935,7 +950,7 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
     const int dev_slot = find_slot_by_busid_locked(pipe->busid);
     if (dev_slot >= 0) {
         if (!pipe->is_control) {
-            esp_err_t claim_err = ensure_interfaces_claimed_locked(dev_slot);
+            esp_err_t claim_err = ensure_endpoint_interface_claimed_locked(dev_slot, pipe->endpoint_addr);
             if (claim_err != ESP_OK) {
                 xSemaphoreGive(s_state.state_mutex);
                 return -EIO;
