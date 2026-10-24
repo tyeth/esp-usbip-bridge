@@ -1,0 +1,87 @@
+diff --git a/include/usb/usb_host.h b/include/usb/usb_host.h
+index bdadba4..4e4e237 100644
+--- a/include/usb/usb_host.h
++++ b/include/usb/usb_host.h
+@@ -707,6 +707,9 @@ esp_err_t usb_host_endpoint_reset_toggle(usb_device_handle_t dev_hdl, uint8_t bE
+  */
+ esp_err_t usb_host_transfer_alloc(size_t data_buffer_size, int num_isoc_packets, usb_transfer_t **transfer);
+ 
++/* Temporary diagnostic: call only from the completed transfer callback. */
++void usb_host_diagnostic_times(usb_transfer_t *transfer, uint64_t *active_us, uint64_t *done_us);
++
+ /**
+  * @brief Free a transfer object
+  *
+diff --git a/private_include/usb_private.h b/private_include/usb_private.h
+index d808623..0d45ae3 100644
+--- a/private_include/usb_private.h
++++ b/private_include/usb_private.h
+@@ -45,6 +45,9 @@ struct urb_s {
+     // Host Lib Layer:
+     void *usb_host_client;  // Currently only used when submitted to shared pipes (i.e., Device default pipes)
+     bool usb_host_inflight; // Debugging variable, used to prevent re-submitting URBs already inflight
++    // Temporary diagnostic timestamps. Clear on each HCD enqueue; no public ABI change.
++    uint64_t diagnostic_active_us;
++    uint64_t diagnostic_hcd_done_us;
+     // Public transfer structure. Must be last due to variable length array
+     usb_transfer_t transfer;
+ };
+diff --git a/src/hcd_dwc.c b/src/hcd_dwc.c
+index 4a8698a..39b33ed 100644
+--- a/src/hcd_dwc.c
++++ b/src/hcd_dwc.c
+@@ -20,6 +20,7 @@
+ #include "hal/usb_dwc_hal.h"
+ #include "hcd.h"
+ #include "usb_private.h"
++#include "esp_timer.h"
+ #include "usb/usb_types_ch9.h"
+ 
+ #include "esp_cache.h"
+@@ -2514,6 +2515,9 @@ static void IRAM_ATTR _buffer_exec(pipe_t *pipe)
+     // Update buffer and multi buffer flags
+     buffer_to_exec->status_flags.executing = 1;
+     pipe->multi_buffer_control.buffer_is_executing = 1;
++    if (buffer_to_exec->urb->transfer.bEndpointAddress == 0x83 && buffer_to_exec->urb->transfer.num_bytes == 4096) {
++        buffer_to_exec->urb->diagnostic_active_us = esp_timer_get_time();
++    }
+     usb_dwc_hal_chan_activate(pipe->chan_obj, buffer_to_exec->xfer_desc_list, desc_list_len, start_idx);
+ }
+ 
+@@ -2746,6 +2750,9 @@ static void _buffer_parse(pipe_t *pipe)
+         _buffer_parse_error(buffer_to_parse);
+     }
+     urb_t *urb = buffer_to_parse->urb;
++    if (urb->transfer.bEndpointAddress == 0x83 && urb->transfer.num_bytes == 4096) {
++        urb->diagnostic_hcd_done_us = esp_timer_get_time();
++    }
+     urb->hcd_var = URB_HCD_STATE_DONE;
+     buffer_to_parse->urb = NULL;
+     buffer_to_parse->flags.val = 0; // Clear flags
+@@ -2836,6 +2843,8 @@ esp_err_t hcd_urb_enqueue(hcd_pipe_handle_t pipe_hdl, urb_t *urb)
+     urb->hcd_ptr = (void *)pipe;
+     // Add the URB to the pipe's pending tailq
+     urb->hcd_var = URB_HCD_STATE_PENDING;
++    urb->diagnostic_active_us = 0;
++    urb->diagnostic_hcd_done_us = 0;
+     TAILQ_INSERT_TAIL(&pipe->pending_urb_tailq, urb, tailq_entry);
+     pipe->num_urb_pending++;
+     // use the URB's reserved_flags to store the URB's current state
+diff --git a/src/usb_host.c b/src/usb_host.c
+index abe06cb..e0f1bce 100644
+--- a/src/usb_host.c
++++ b/src/usb_host.c
+@@ -1839,6 +1839,13 @@ esp_err_t usb_host_transfer_alloc(size_t data_buffer_size, int num_isoc_packets,
+     return ESP_OK;
+ }
+ 
++void usb_host_diagnostic_times(usb_transfer_t *transfer, uint64_t *active_us, uint64_t *done_us)
++{
++    urb_t *urb = __containerof(transfer, urb_t, transfer);
++    *active_us = urb->diagnostic_active_us;
++    *done_us = urb->diagnostic_hcd_done_us;
++}
++
+ esp_err_t usb_host_transfer_free(usb_transfer_t *transfer)
+ {
+     if (transfer == NULL) {

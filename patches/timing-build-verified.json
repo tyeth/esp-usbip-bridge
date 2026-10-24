@@ -1,0 +1,55 @@
+{
+  "verified_utc": "2026-10-23T23:39:32.568544+00:00",
+  "build_exit": 0,
+  "installed": false,
+  "diagnostic_only": true,
+  "base": "bec1d71e1379e08e279327bdb222b3207456cebe",
+  "idf": "ce2100de51a4d9a372f26578fd2ee763ca4b1279",
+  "dependencies_match_baseline": true,
+  "config_matches_baseline": true,
+  "artifacts": {
+    "dependencies.lock": {
+      "bytes": 1307,
+      "sha256": "3bc90259e3c25f32fee9e816196037624c7d81f813298d15996e4199b223888f"
+    },
+    "main/idf_component.yml": {
+      "bytes": 1028,
+      "sha256": "04f812b7a361a6dbd316245462f5026b3c946d4e515c94e8045f3f2d0a75464c"
+    },
+    "sdkconfig.s31-function-coreboard-1": {
+      "bytes": 115465,
+      "sha256": "ac33f2ed8eca08b06530d36af9f3bbe76e64466a516e0d98482d241ea7b216b2"
+    },
+    "build-msc-timing/esp32p4_usbip_bridge.bin": {
+      "bytes": 829920,
+      "sha256": "0ca729ae316abeb9c5eff233621462a70e1ca91243c4fffb7926fb13bac1b6ef"
+    },
+    "build-msc-timing/esp32p4_usbip_bridge.elf": {
+      "bytes": 11877064,
+      "sha256": "99b51d60f94a676e9c33ae3caf423d7f516bbec11cc45a04a816d43f3901f434"
+    },
+    "build-msc-timing/partition_table/partition-table.bin": {
+      "bytes": 3072,
+      "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
+    }
+  },
+  "source_sha256": {
+    "usb_backend.h": "b1970c116bacdb5d4f61b11ed15d9d66f52a626a3f35ae5bcc19c26bbc3fa7c2",
+    "usb_backend.c": "2b916cec4e37800aba328a90a0ec2b1e22bd4b00cd4050fdb1509bf4ec1c60bc",
+    "usbip_server.c": "c7842bc521240a053a2402419d6f96fb793c3c5842751cb1a16e93e153e98c60"
+  },
+  "harness_tree_sha256": "d38351791f9dda8ccc72063ab4e7dea122c6116b57d6b878fffa1e7dafc7279c",
+  "log_sha256": "4076c40169c665ac832ebfbfd142b203597218a95a1adb55cc8606c57933a808",
+  "tests": {
+    "native_timing_scenario_groups": 6,
+    "native_claim_groups": 17,
+    "parser_tests": 7
+  },
+  "limits": [
+    "reply_us is after send attempt; correlate with received network reply",
+    "callback_us is client event dispatch, not electrical USB completion",
+    "submitted_us is latest attempt; retries contribute to queue-to-submit interval",
+    "post-reply UART logging can perturb subsequent requests",
+    "not installed; guarded temporary install, probe and restore still need preparation"
+  ]
+}

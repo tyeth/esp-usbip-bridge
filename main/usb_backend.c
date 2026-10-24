@@ -11,6 +11,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 #include "usb/usb_host.h"
@@ -741,6 +742,10 @@ void usb_backend_session_ended(const char busid[32])
 static void xfer_done_cb(usb_transfer_t *transfer)
 {
     xfer_t *x = (xfer_t *)transfer->context;
+    if (x->req != NULL && x->req->diagnostic_timing) {
+        x->req->diagnostic_callback_us = esp_timer_get_time();
+        usb_host_diagnostic_times(transfer, &x->req->diagnostic_active_us, &x->req->diagnostic_hcd_done_us);
+    }
     x->completed = true;
 }
 
@@ -1007,10 +1012,17 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
     transfer->num_bytes = xfer_len;
     transfer->timeout_ms = 0;   /* not enforced by the host library; deadlines are ours */
 
+    if (pipe->req->diagnostic_timing) {
+        pipe->req->diagnostic_submitted_us = esp_timer_get_time();
+        pipe->req->diagnostic_attempts++;
+    }
     if (pipe->is_control) {
         err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
     } else {
         err = usb_host_transfer_submit(transfer);
+    }
+    if (pipe->req->diagnostic_timing) {
+        pipe->req->diagnostic_submit_return_us = esp_timer_get_time();
     }
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "submit failed: %s (ep=0x%02x)",

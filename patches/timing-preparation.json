@@ -1,0 +1,12 @@
+{
+  "base": "bec1d71e1379e08e279327bdb222b3207456cebe",
+  "diagnostic_only": true,
+  "installed": false,
+  "harness_tree_sha256": "d38351791f9dda8ccc72063ab4e7dea122c6116b57d6b878fffa1e7dafc7279c",
+  "source_sha256": {
+    "usb_backend.h": "b1970c116bacdb5d4f61b11ed15d9d66f52a626a3f35ae5bcc19c26bbc3fa7c2",
+    "usb_backend.c": "2b916cec4e37800aba328a90a0ec2b1e22bd4b00cd4050fdb1509bf4ec1c60bc",
+    "usbip_server.c": "c7842bc521240a053a2402419d6f96fb793c3c5842751cb1a16e93e153e98c60"
+  },
+  "sdkconfig_sha256": "ac33f2ed8eca08b06530d36af9f3bbe76e64466a516e0d98482d241ea7b216b2"
+}

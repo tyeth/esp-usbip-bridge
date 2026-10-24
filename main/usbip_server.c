@@ -19,6 +19,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 #include "usb_backend.h"
@@ -368,6 +369,23 @@ typedef struct {
    task; the writer sends the reply and frees everything.  A pending read
    therefore costs only this item and its buffer, as a pending URB does on
    a Linux host. */
+/* TEMPORARY DIAGNOSTIC: RAM timestamps only on the backend path.
+ * Output is emitted after the reply, outside its mutex. Logs can affect later
+ * requests, so this must be compared to the unchanged baseline and restored.
+ * Callback time is client event dispatch, not an electrical USB completion. */
+_Static_assert(URB_SEG_SIZE == 4096, "Timing fixture requires 4 KiB segments");
+typedef struct {
+    uint64_t queued_us, submitted_us, callback_us, done_us;
+    uint64_t submit_return_us, active_us, hcd_done_us;
+    uint32_t attempts;
+    int status;
+    size_t bytes;
+} msc_segment_timing_t;
+typedef struct {
+    msc_segment_timing_t segments[16];
+    size_t recorded;
+} msc_urb_timing_t;
+
 typedef struct urb_work_item {
     urb_stream_ctx_t *stream;
     usbip_header_t request;
@@ -381,6 +399,7 @@ typedef struct urb_work_item {
     int status;                             /* result for the reply */
     size_t in_len;
     int slot;                               /* index in stream->in_flight[] */
+    msc_urb_timing_t *diagnostic;
 } urb_work_item_t;
 
 /* Free an in-flight slot so it can be reused.  Caller holds write_mutex. */
@@ -487,6 +506,15 @@ static void urb_submit_segment(urb_work_item_t *item)
     item->req.out_len = is_in ? 0 : n;
     item->req.in_data = is_in ? data : NULL;
     item->req.in_capacity = is_in ? n : 0;
+    if (item->diagnostic != NULL && item->seg < 16) {
+        item->diagnostic->segments[item->seg].queued_us = esp_timer_get_time();
+        item->req.diagnostic_submitted_us = 0;
+        item->req.diagnostic_callback_us = 0;
+        item->req.diagnostic_submit_return_us = 0;
+        item->req.diagnostic_active_us = 0;
+        item->req.diagnostic_hcd_done_us = 0;
+        item->req.diagnostic_attempts = 0;
+    }
     usb_backend_submit(&item->req);
 }
 
@@ -499,6 +527,19 @@ static void urb_backend_done(usb_backend_req_t *req, int status, size_t in_len)
     const bool is_in = urb_is_in(item);
     urb_buf_t *buf = is_in ? &item->in : &item->out;
     const size_t nsegs = urb_buf_nsegs(buf);
+    if (item->diagnostic != NULL && item->seg < 16) {
+        msc_segment_timing_t *stamp = &item->diagnostic->segments[item->seg];
+        stamp->submitted_us = req->diagnostic_submitted_us;
+        stamp->callback_us = req->diagnostic_callback_us;
+        stamp->submit_return_us = req->diagnostic_submit_return_us;
+        stamp->active_us = req->diagnostic_active_us;
+        stamp->hcd_done_us = req->diagnostic_hcd_done_us;
+        stamp->done_us = esp_timer_get_time();
+        stamp->attempts = req->diagnostic_attempts;
+        stamp->status = status;
+        stamp->bytes = in_len;
+        item->diagnostic->recorded = item->seg + 1;
+    }
 
     if (status == 0) {
         const size_t n = (item->seg < nsegs) ? urb_buf_seg_len(buf, item->seg) : 0;
@@ -573,6 +614,13 @@ static void urb_start(urb_work_item_t *item, virtual_device_t *vdev)
     if (endpoint == 0) {
         memcpy(&item->req.setup, item->request.u.cmd_submit.setup, sizeof(item->req.setup));
     }
+    if (direction == USBIP_DIR_IN && endpoint == 3 && item->in.len == 65536) {
+        item->diagnostic = calloc(1, sizeof(*item->diagnostic));
+        item->req.diagnostic_timing = item->diagnostic != NULL;
+        if (item->diagnostic == NULL) {
+            ESP_LOGW(TAG, "MSC_TIMING_ALLOCATION_FAILED");
+        }
+    }
     item->req.done = urb_backend_done;
     urb_submit_segment(item);
 }
@@ -624,10 +672,27 @@ static void urb_writer_task(void *arg)
            CMD_UNLINK sees either a pending URB or one already answered. */
         xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
         urb_send_reply(item);
+        const uint64_t diagnostic_reply_us = item->diagnostic != NULL ? esp_timer_get_time() : 0;
         urb_stream_free_slot(ctx, item->slot);
         xSemaphoreGive(ctx->write_mutex);
         xSemaphoreGive(ctx->slot_sem);
 
+        if (item->diagnostic != NULL) {
+            const uint32_t seq = ntohl(item->request.base.seqnum);
+            ESP_LOGI(TAG, "MSC_TIMING_END seq=%"PRIu32" status=%d bytes=%u segments=%u reply_us=%"PRIu64,
+                     seq, item->status, (unsigned)item->in_len,
+                     (unsigned)item->diagnostic->recorded, diagnostic_reply_us);
+            for (size_t i = 0; i < item->diagnostic->recorded; i++) {
+                const msc_segment_timing_t *stamp = &item->diagnostic->segments[i];
+                ESP_LOGI(TAG, "MSC_HCD_SEG seq=%"PRIu32" index=%u r=%"PRIu64" a=%"PRIu64" h=%"PRIu64,
+                         seq, (unsigned)i, stamp->submit_return_us, stamp->active_us, stamp->hcd_done_us);
+                ESP_LOGI(TAG, "MSC_TIMING_SEG seq=%"PRIu32" index=%u q=%"PRIu64" s=%"PRIu64" c=%"PRIu64" d=%"PRIu64" attempts=%"PRIu32" status=%d bytes=%u",
+                         seq, (unsigned)i, stamp->queued_us, stamp->submitted_us,
+                         stamp->callback_us, stamp->done_us, stamp->attempts,
+                         stamp->status, (unsigned)stamp->bytes);
+            }
+            free(item->diagnostic);
+        }
         urb_buf_free(&item->out);
         urb_buf_free(&item->in);
         free(item);

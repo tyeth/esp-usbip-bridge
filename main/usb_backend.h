@@ -99,6 +99,14 @@ struct usb_backend_req {
     struct usb_backend_req *next;
     uint32_t seq;
     int status;
+    /* Temporary bounded MSC timing instrumentation; not a production fix. */
+    bool diagnostic_timing;
+    uint64_t diagnostic_submitted_us;
+    uint64_t diagnostic_callback_us;
+    uint64_t diagnostic_submit_return_us;
+    uint64_t diagnostic_active_us;
+    uint64_t diagnostic_hcd_done_us;
+    uint32_t diagnostic_attempts;
 };
 
 /* Queue a transfer.  Never blocks; done() follows from the backend task,
