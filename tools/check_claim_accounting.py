@@ -85,6 +85,8 @@ typedef struct {
     uint32_t exhaustion_events;
     int64_t last_exhaustion_us;
     char last_exhaustion_busid[32];
+    int hcd_channels_total;
+    int hcd_channels_allocated;
 } usb_backend_claims_totals_t;
 typedef struct { int addr; } usb_backend_hub_t;
 static int fake_hubs = 2;
@@ -92,6 +94,11 @@ static size_t usb_backend_get_hubs(usb_backend_hub_t *out, size_t max) {
  (void)out; return (size_t)(fake_hubs < (int)max ? fake_hubs : (int)max);
 }
 static int64_t esp_timer_get_time(void) { return 424242; }
+static int fake_hcd_total = 16, fake_hcd_allocated = 7, fake_hcd_err;
+static esp_err_t usb_host_channel_stats(int *total, int *allocated) {
+ if (fake_hcd_err) return ESP_ERR_INVALID_STATE;
+ *total = fake_hcd_total; *allocated = fake_hcd_allocated; return ESP_OK;
+}
 static size_t strlcpy(char *d, const char *s, size_t n) { snprintf(d, n, "%s", s); return strlen(s); }
 static const char *esp_err_to_name(esp_err_t e) {
  switch (e) { case 3: return "ESP_ERR_NOT_SUPPORTED"; case 4: return "ESP_ERR_NO_MEM"; default: return "ESP_ERR_OTHER"; }
@@ -155,6 +162,11 @@ int main(void) {
  CHECK(totals.connected_devices==2 && totals.external_hubs==2);
  CHECK(totals.claimed_interfaces==3 && totals.claimed_endpoints==4);
  CHECK(totals.exhaustion_events==0 && totals.last_exhaustion_us==0);
+ CHECK(totals.hcd_channels_total==16 && totals.hcd_channels_allocated==7);
+ fake_hcd_err=1;
+ CHECK(usb_backend_get_claims(out,4,&totals)==2);
+ CHECK(totals.hcd_channels_total==-1 && totals.hcd_channels_allocated==-1);
+ fake_hcd_err=0;
  CHECK(invalid==0);
 
  /* 2: in-flight transfers are counted per busid */

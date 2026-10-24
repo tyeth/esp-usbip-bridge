@@ -942,7 +942,13 @@ static api_result_t core_usb_claims(void)
     }
 
     cJSON *tt = cJSON_AddObjectToObject(j, "totals");
-    cJSON_AddNumberToObject(tt, "channels_total", 16);
+    cJSON_AddNumberToObject(tt, "channels_total",
+                            totals.hcd_channels_total > 0 ? totals.hcd_channels_total : 16);
+    if (totals.hcd_channels_allocated >= 0) {
+        /* The HCD's own ledger: every allocated channel, including the
+           EP0/hub/host-stack pipes the estimate cannot see. */
+        cJSON_AddNumberToObject(tt, "channels_in_use", totals.hcd_channels_allocated);
+    }
     cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
     cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);
@@ -951,9 +957,12 @@ static api_result_t core_usb_claims(void)
                             totals.connected_devices + totals.external_hubs
                             + totals.claimed_endpoints);
     cJSON_AddStringToObject(tt, "estimate_note",
-        "EP0 per connected device + one interrupt pipe per external hub + "
-        "every claimed endpoint; a lower bound (the host library does not "
-        "expose its per-channel table)");
+        totals.hcd_channels_allocated >= 0
+            ? "channels_in_use is the HCD's own ledger (authoritative); "
+              "estimated_channels_in_use remains the claim-derived lower bound"
+            : "EP0 per connected device + one interrupt pipe per external hub + "
+              "every claimed endpoint; a lower bound (this host library build "
+              "does not expose its per-channel ledger)");
     cJSON_AddNumberToObject(tt, "exhaustion_events", totals.exhaustion_events);
     if (totals.exhaustion_events > 0 && totals.last_exhaustion_us > 0) {
         cJSON_AddNumberToObject(tt, "last_exhaustion_ms_ago",
