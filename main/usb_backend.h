@@ -119,4 +119,36 @@ void usb_backend_session_ended(const char busid[32]);
 /* Snapshot of the external hubs currently attached. */
 size_t usb_backend_get_hubs(usb_backend_hub_t *out_hubs, size_t max_hubs);
 
+/* Claim accounting: which interfaces and endpoints each connected device
+   holds (each claimed endpoint pins one DWC host channel; each connected
+   device also holds one EP0 channel, and each external hub one interrupt
+   channel), plus claim-failure history.  The HCD's own per-channel table is
+   not reachable from here, so totals derived from these counts are
+   estimates, not an authoritative channel ledger. */
+typedef struct {
+    char busid[32];
+    uint8_t claimed_interfaces[USBIP_MAX_INTERFACES]; /* interface numbers */
+    int num_claimed_interfaces;
+    int num_claimed_endpoints;  /* endpoints of claimed interfaces (data pipes) */
+    int in_flight;              /* transfers currently in flight */
+    bool release_pending;
+    uint32_t claim_failures;    /* usb_host_interface_claim() failures */
+    char last_claim_error[24];  /* esp_err_to_name() of the last failure, "" when none */
+    bool last_claim_was_exhaustion; /* ESP_ERR_NOT_SUPPORTED: how hcd_pipe_alloc
+                                       reports "No more HCD channels available" */
+} usb_backend_claims_device_t;
+
+typedef struct {
+    int connected_devices;      /* real devices open (one EP0 channel each) */
+    int external_hubs;          /* each holds one interrupt channel */
+    int claimed_interfaces;
+    int claimed_endpoints;
+    uint32_t exhaustion_events; /* claim failures that were channel exhaustion */
+    int64_t last_exhaustion_us; /* esp_timer clock; 0 = never */
+    char last_exhaustion_busid[32];
+} usb_backend_claims_totals_t;
+
+size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
+                              usb_backend_claims_totals_t *totals);
+
 #endif

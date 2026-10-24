@@ -11,6 +11,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 #include "usb/usb_host.h"
@@ -115,6 +116,8 @@ typedef struct {
     bool claimed_interfaces[USBIP_MAX_INTERFACES]; /* includes a partial claim after failure */
     bool release_pending;           /* session ended with a transfer in flight: release when it is done */
     uint32_t halted_eps;            /* endpoints halted by a STALL (see ep_halt_bit()) */
+    uint32_t claim_failures;        /* usb_host_interface_claim() failures on this device */
+    esp_err_t last_claim_err;       /* ESP_OK when it has never failed */
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
 } usb_backend_device_slot_t;
@@ -137,6 +140,11 @@ typedef struct {
 
     usb_host_client_handle_t client_hdl;
     usb_backend_device_slot_t devices[CONFIG_USBIP_MAX_DEVICES];
+
+    /* Claim-failure accounting (state_mutex). */
+    uint32_t exhaustion_events;
+    int64_t last_exhaustion_us;
+    char last_exhaustion_busid[32];
 } usb_backend_state_t;
 
 static const char *TAG = "usb_backend";
@@ -491,6 +499,17 @@ static esp_err_t ensure_endpoint_interface_claimed_locked(int slot, uint8_t endp
     esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, num, 0);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "usb_host_interface_claim(%d) failed: %s", num, esp_err_to_name(err));
+        s_state.devices[slot].claim_failures++;
+        s_state.devices[slot].last_claim_err = err;
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            /* hcd_pipe_alloc(): "No more HCD channels available" */
+            s_state.exhaustion_events++;
+            s_state.last_exhaustion_us = esp_timer_get_time();
+            strlcpy(s_state.last_exhaustion_busid, s_state.devices[slot].device.busid,
+                    sizeof(s_state.last_exhaustion_busid));
+            ESP_LOGW(TAG, "%s: interface %d claim failed: no free host channel",
+                     s_state.devices[slot].device.busid, num);
+        }
         /* The host library unwinds this interface's partial endpoint allocation.
            Do not release other interfaces: they may have transfers in flight. */
         return err;
@@ -630,6 +649,8 @@ static void export_new_device(uint8_t address)
     s_state.devices[free_slot].device = device;
     memset(s_state.devices[free_slot].claimed_interfaces, 0,
            sizeof(s_state.devices[free_slot].claimed_interfaces));
+    s_state.devices[free_slot].claim_failures = 0;
+    s_state.devices[free_slot].last_claim_err = ESP_OK;
 
     /* Pipe slots are allocated dynamically per URB — no per-device
        pre-allocation needed. */
@@ -1577,6 +1598,75 @@ size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_d
         copied += virtual_device_get_all(out_devices + copied, max_devices - copied);
     }
 
+    return copied;
+}
+
+static int count_in_flight_locked(const char busid[32])
+{
+    int n = 0;
+    for (const xfer_t *x = s_state.inflight_head; x != NULL; x = x->next) {
+        if (busid_matches_key(busid, x->busid)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
+                              usb_backend_claims_totals_t *totals)
+{
+    size_t copied = 0;
+    usb_backend_claims_totals_t sums;
+    memset(&sums, 0, sizeof(sums));
+
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES; i++) {
+        if (!s_state.devices[i].in_use) {
+            continue;
+        }
+        uint8_t eps[USBIP_MAX_ENDPOINTS];
+        const int num_eps = collect_claimed_endpoints_locked(i, -1, eps, USBIP_MAX_ENDPOINTS);
+        usb_backend_claims_device_t scratch;
+        usb_backend_claims_device_t *d = (out != NULL && copied < max) ? &out[copied] : &scratch;
+        memset(d, 0, sizeof(*d));
+        strlcpy(d->busid, s_state.devices[i].device.busid, sizeof(d->busid));
+        int num_intf = 0;
+        for (int n = 0; n < USBIP_MAX_INTERFACES; n++) {
+            if (s_state.devices[i].claimed_interfaces[n]) {
+                d->claimed_interfaces[num_intf++] = (uint8_t)n;
+            }
+        }
+        d->num_claimed_interfaces = num_intf;
+        d->num_claimed_endpoints = num_eps;
+        d->in_flight = count_in_flight_locked(s_state.devices[i].device.busid);
+        d->release_pending = s_state.devices[i].release_pending;
+        d->claim_failures = s_state.devices[i].claim_failures;
+        if (s_state.devices[i].last_claim_err != ESP_OK) {
+            strlcpy(d->last_claim_error, esp_err_to_name(s_state.devices[i].last_claim_err),
+                    sizeof(d->last_claim_error));
+            d->last_claim_was_exhaustion =
+                (s_state.devices[i].last_claim_err == ESP_ERR_NOT_SUPPORTED);
+        }
+        if (out != NULL && copied < max) {
+            copied++;
+        }
+        sums.connected_devices++;
+        sums.claimed_interfaces += num_intf;
+        sums.claimed_endpoints += num_eps;
+    }
+    sums.exhaustion_events = s_state.exhaustion_events;
+    sums.last_exhaustion_us = s_state.last_exhaustion_us;
+    strlcpy(sums.last_exhaustion_busid, s_state.last_exhaustion_busid,
+            sizeof(sums.last_exhaustion_busid));
+    xSemaphoreGive(s_state.state_mutex);
+
+    /* Hubs are outside the device table; each holds one interrupt channel. */
+    usb_backend_hub_t hubs[USB_BACKEND_MAX_HUBS];
+    sums.external_hubs = (int)usb_backend_get_hubs(hubs, USB_BACKEND_MAX_HUBS);
+
+    if (totals != NULL) {
+        *totals = sums;
+    }
     return copied;
 }
 
