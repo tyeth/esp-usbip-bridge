@@ -6,6 +6,7 @@ No hardware access. Run with --source <old usb_backend.c> for the negative contr
 import argparse
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 
@@ -127,6 +128,12 @@ def main():
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     source = args.source.read_text()
+    if 'static esp_err_t ensure_endpoint_interface_claimed_locked(' in source:
+        # Preserve the old --source regression path for historical all-interface
+        # implementations; current code has a per-interface demand contract.
+        return subprocess.run([sys.executable,
+                               str(Path(__file__).with_name('check_interface_demand.py')),
+                               '--source', str(args.source), '--cc', args.cc]).returncode
     names = ['release_interfaces_locked', 'ensure_interfaces_claimed_locked', 'release_session_device']
     if 'static bool has_claimed_interfaces_locked(' in source:
         names.insert(0, 'has_claimed_interfaces_locked')
