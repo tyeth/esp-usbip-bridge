@@ -34,8 +34,10 @@ PREAMBLE = r'''
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 1
 #define ESP_ERR_NO_MEM 2
+#define ESP_ERR_NOT_SUPPORTED 3
 #define ESP_LOGD(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
 #define portMAX_DELAY 0
 #define xSemaphoreTake(...) ((void)0)
 #define xSemaphoreGive(...) ((void)0)
@@ -47,9 +49,14 @@ typedef struct {
     bool claimed_interfaces[USBIP_MAX_INTERFACES];
     int dev_hdl;
     uint32_t halted_eps;
+    uint32_t claim_failures;
+    esp_err_t last_claim_err;
     usbip_backend_device_t device;
 } slot_t;
-static struct { slot_t devices[CONFIG_USBIP_MAX_DEVICES]; int client_hdl, state_mutex; } s_state;
+static struct { slot_t devices[CONFIG_USBIP_MAX_DEVICES]; int client_hdl, state_mutex;
+    uint32_t exhaustion_events; int64_t last_exhaustion_us; char last_exhaustion_busid[32]; } s_state;
+static int64_t esp_timer_get_time(void) { return 424242; }
+static size_t strlcpy(char *d, const char *s, size_t n) { snprintf(d, n, "%s", s); return strlen(s); }
 static bool host_claims[USBIP_MAX_INTERFACES], in_flight;
 static int claim_failure, release_failure, invalid_calls;
 static int find_slot_by_busid_locked(const char *busid) { (void)busid; return s_state.devices[0].in_use ? 0 : -1; }

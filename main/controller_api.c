@@ -908,6 +908,61 @@ static api_result_t core_enum_events(void)
     return result(200, j);
 }
 
+/* GET /api/usb/claims: interface-claim and channel-pressure accounting.
+   The DWC OTG host has 16 channels; EP0 of every connected device and each
+   external hub's interrupt pipe hold one for good, and every claimed
+   endpoint holds one until the interface is released.  The host library
+   does not expose its per-channel table, so estimated_channels_in_use is a
+   documented lower bound, not an authoritative ledger. */
+static api_result_t core_usb_claims(void)
+{
+    usb_backend_claims_device_t devs[CONFIG_USBIP_MAX_DEVICES];
+    usb_backend_claims_totals_t totals;
+    const size_t n = usb_backend_get_claims(devs, CONFIG_USBIP_MAX_DEVICES, &totals);
+
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "devices");
+    for (size_t i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "busid", devs[i].busid);
+        cJSON *ints = cJSON_AddArrayToObject(o, "claimed_interfaces");
+        for (int k = 0; k < devs[i].num_claimed_interfaces; k++) {
+            cJSON_AddItemToArray(ints, cJSON_CreateNumber(devs[i].claimed_interfaces[k]));
+        }
+        cJSON_AddNumberToObject(o, "claimed_endpoints", devs[i].num_claimed_endpoints);
+        cJSON_AddNumberToObject(o, "in_flight", devs[i].in_flight);
+        cJSON_AddBoolToObject(o, "release_pending", devs[i].release_pending);
+        cJSON_AddNumberToObject(o, "claim_failures", devs[i].claim_failures);
+        if (devs[i].last_claim_error[0] != '\0') {
+            cJSON_AddStringToObject(o, "last_claim_error", devs[i].last_claim_error);
+            cJSON_AddBoolToObject(o, "last_claim_error_was_exhaustion",
+                                  devs[i].last_claim_was_exhaustion);
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+
+    cJSON *tt = cJSON_AddObjectToObject(j, "totals");
+    cJSON_AddNumberToObject(tt, "channels_total", 16);
+    cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
+    cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
+    cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);
+    cJSON_AddNumberToObject(tt, "claimed_endpoints", totals.claimed_endpoints);
+    cJSON_AddNumberToObject(tt, "estimated_channels_in_use",
+                            totals.connected_devices + totals.external_hubs
+                            + totals.claimed_endpoints);
+    cJSON_AddStringToObject(tt, "estimate_note",
+        "EP0 per connected device + one interrupt pipe per external hub + "
+        "every claimed endpoint; a lower bound (the host library does not "
+        "expose its per-channel table)");
+    cJSON_AddNumberToObject(tt, "exhaustion_events", totals.exhaustion_events);
+    if (totals.exhaustion_events > 0 && totals.last_exhaustion_us > 0) {
+        cJSON_AddNumberToObject(tt, "last_exhaustion_ms_ago",
+            (double)((esp_timer_get_time() - totals.last_exhaustion_us) / 1000));
+        cJSON_AddStringToObject(tt, "last_exhaustion_busid", totals.last_exhaustion_busid);
+    }
+    return result(200, j);
+}
+
 static api_result_t core_restore(void)
 {
     int n = hub_ctl_restore_now();
@@ -1093,6 +1148,7 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/devices/{busid}/name",          true,  "Set a friendly name for the device on a port", "{\"name\":str}" },
     { "GET",  "/api/usb/hubs",                      false, "Hubs with power switching mode and per-port status", NULL },
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
+    { "GET",  "/api/usb/claims",                    false, "Interface-claim and host-channel-pressure accounting per device, with claim-failure history and exhaustion events (estimated channel totals; the 16-channel HCD table itself is not exposed by the host library)", NULL },
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
@@ -1188,6 +1244,11 @@ static const mcp_tool_t k_tools[] = {
       "Recent USB enumerations with failures diagnosed: a timeout means the device stayed connected but did "
       "not answer (slow or stalled); a disconnect or transfer error means it reset or rebooted. Each failure "
       "says whether the port enumerated again afterwards and how soon.", NO_ARGS },
+    { "get_usb_claims",
+      "Interface-claim and host-channel-pressure accounting: per exported device the claimed interfaces, "
+      "their endpoints (each holds one of the 16 host channels until released), in-flight transfers and "
+      "claim-failure history, plus totals with channel-exhaustion events. Totals are a documented lower "
+      "bound, not the HCD's own channel table.", NO_ARGS },
     { "set_enum_timeout",
       "Set how long the USB host waits for a device to answer an enumeration control request before "
       "disabling its port (so one unresponsive device cannot stop others enumerating). Without path: the "
@@ -1274,6 +1335,9 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
     }
     if (strcmp(name, "get_enum_events") == 0) {
         return core_enum_events();
+    }
+    if (strcmp(name, "get_usb_claims") == 0) {
+        return core_usb_claims();
     }
     if (strcmp(name, "set_enum_timeout") == 0) {
         return core_set_enum_timeout(args);
@@ -1544,6 +1608,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_hubs();
     } else if (path_is(path, "/api/usb/enum_events")) {
         r = core_enum_events();
+    } else if (path_is(path, "/api/usb/claims")) {
+        r = core_usb_claims();
     } else if (path_is(path, "/api/usb/debug")) {
         /* Diagnostics: the USB host's hub/port/enumeration state goes to the console */
         esp_err_t err = usb_host_hub_debug_dump();

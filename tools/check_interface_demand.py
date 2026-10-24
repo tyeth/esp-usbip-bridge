@@ -59,8 +59,11 @@ typedef struct { uint8_t bmRequestType,bRequest; uint16_t wValue,wIndex; } usb_s
 typedef struct { usb_setup_packet_t setup; char busid[32]; } xfer_t;
 typedef struct { uint8_t num_interfaces; char busid[32]; } usbip_backend_device_t;
 typedef struct { bool in_use,release_pending; bool claimed_interfaces[USBIP_MAX_INTERFACES]; int dev_hdl;
- uint32_t halted_eps; usbip_backend_device_t device; } usb_backend_device_slot_t;
-static struct { usb_backend_device_slot_t devices[2]; int client_hdl,state_mutex; } s_state;
+ uint32_t halted_eps; uint32_t claim_failures; esp_err_t last_claim_err; usbip_backend_device_t device; } usb_backend_device_slot_t;
+static struct { usb_backend_device_slot_t devices[2]; int client_hdl,state_mutex;
+ uint32_t exhaustion_events; int64_t last_exhaustion_us; char last_exhaustion_busid[32]; } s_state;
+static int64_t esp_timer_get_time(void) { return 424242; }
+static size_t strlcpy(char *d, const char *s, size_t n) { snprintf(d, n, "%s", s); return strlen(s); }
 static usb_config_desc_t configs[2];
 static bool claims[2][USBIP_MAX_INTERFACES], config_error, config_null, in_flight;
 static int channels,invalid,claim_calls,claim_fail,release_fail,resets;
@@ -134,6 +137,9 @@ int main(void) {
  for(int fail=0;fail<4;fail++) {
   reset();cases++;claim_fail=fail;
   for(int retry=0;retry<3;retry++){CHECK(ensure_endpoint_interface_claimed_locked(0,0x81+fail)==ESP_ERR_NOT_SUPPORTED);CHECK(channels==8);}
+  CHECK(s_state.devices[0].claim_failures==3);CHECK(s_state.exhaustion_events==3);
+  CHECK(s_state.devices[0].last_claim_err==ESP_ERR_NOT_SUPPORTED);
+  CHECK(strcmp(s_state.last_exhaustion_busid,"a")==0);CHECK(s_state.last_exhaustion_us!=0);
   CHECK(!has_claimed_interfaces_locked(0));claim_fail=-1;
   CHECK(ensure_endpoint_interface_claimed_locked(0,0x81+fail)==ESP_OK);
   release_interfaces_locked(0);CHECK(channels==8);CHECK(invalid==0);
