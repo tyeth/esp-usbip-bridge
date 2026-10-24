@@ -225,6 +225,9 @@ esp_err_t device_naming_set_device_name(const char *busid, const char *name)
 
     if (strlen(name) == 0) {
         err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;   /* clearing a name that was never set is a no-op */
+        }
     } else {
         err = nvs_set_str(h, key, name);
     }
