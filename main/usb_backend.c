@@ -113,6 +113,7 @@ typedef struct xfer {
 typedef struct {
     bool in_use;
     bool interfaces_claimed;
+    bool claimed_interfaces[USBIP_MAX_INTERFACES]; /* includes a partial claim after failure */
     bool release_pending;           /* session ended with a transfer in flight: release when it is done */
     uint32_t halted_eps;            /* endpoints halted by a STALL (see ep_halt_bit()) */
     usb_device_handle_t dev_hdl;
@@ -408,22 +409,36 @@ static void clear_slot_locked(int slot)
     memset(&s_state.devices[slot], 0, sizeof(s_state.devices[slot]));
 }
 
+static bool has_claimed_interfaces_locked(int slot)
+{
+    if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use) {
+        return false;
+    }
+    for (uint8_t i = 0; i < s_state.devices[slot].device.num_interfaces; i++) {
+        if (s_state.devices[slot].claimed_interfaces[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void release_interfaces_locked(int slot)
 {
     if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use) {
         return;
     }
-    if (!s_state.devices[slot].interfaces_claimed) {
-        return;
-    }
-
     usb_device_handle_t dev_hdl = s_state.devices[slot].dev_hdl;
     const usbip_backend_device_t *device = &s_state.devices[slot].device;
 
     for (uint8_t i = 0; i < device->num_interfaces; i++) {
+        if (!s_state.devices[slot].claimed_interfaces[i]) {
+            continue;
+        }
         esp_err_t err = usb_host_interface_release(s_state.client_hdl, dev_hdl, i);
         if (err != ESP_OK) {
             ESP_LOGD(TAG, "usb_host_interface_release(%u) failed: %s", i, esp_err_to_name(err));
+        } else {
+            s_state.devices[slot].claimed_interfaces[i] = false;
         }
     }
 
@@ -446,11 +461,18 @@ static esp_err_t ensure_interfaces_claimed_locked(int slot)
 
     ESP_LOGD(TAG, "Claiming %u interfaces for %s (lazy)", device->num_interfaces, device->busid);
     for (uint8_t i = 0; i < device->num_interfaces; i++) {
+        if (s_state.devices[slot].claimed_interfaces[i]) {
+            continue; /* A prior release failed: the host still owns this claim. */
+        }
         esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, i, 0);
         if (err != ESP_OK) {
             ESP_LOGD(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(err));
+            /* A composite device may exceed the remaining host channels.
+               Unwind earlier claims and retain any failed releases for retry. */
+            release_interfaces_locked(slot);
             return err;
         }
+        s_state.devices[slot].claimed_interfaces[i] = true;
     }
 
     /* Pipe slots are allocated dynamically per URB — no per-endpoint
@@ -590,6 +612,8 @@ static void export_new_device(uint8_t address)
     s_state.devices[free_slot].dev_hdl = dev_hdl;
     s_state.devices[free_slot].device = device;
     s_state.devices[free_slot].interfaces_claimed = false;
+    memset(s_state.devices[free_slot].claimed_interfaces, 0,
+           sizeof(s_state.devices[free_slot].claimed_interfaces));
 
     /* Pipe slots are allocated dynamically per URB — no per-device
        pre-allocation needed. */
@@ -642,7 +666,7 @@ static void release_session_device(const char busid[32])
 {
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     const int slot = find_slot_by_busid_locked(busid);
-    if (slot >= 0 && s_state.devices[slot].interfaces_claimed) {
+    if (has_claimed_interfaces_locked(slot)) {
         if (busid_in_flight_locked(busid)) {
             /* An orphan (a transfer the device never finished) is still in
                flight: release once it is retired, unless a new session
