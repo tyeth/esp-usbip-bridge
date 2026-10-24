@@ -146,6 +146,10 @@ typedef struct {
     uint32_t exhaustion_events; /* claim failures that were channel exhaustion */
     int64_t last_exhaustion_us; /* esp_timer clock; 0 = never */
     char last_exhaustion_busid[32];
+    /* Authoritative ledger from the HCD itself (usb_host_channel_stats());
+       -1 when the running host library does not provide it. */
+    int hcd_channels_total;
+    int hcd_channels_allocated;
 } usb_backend_claims_totals_t;
 
 size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,

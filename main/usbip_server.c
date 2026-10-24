@@ -1065,6 +1065,22 @@ static void usbip_server_task(void *arg)
         int nodelay = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+        /* Issue #22: a client that vanishes without a FIN (power loss, cable
+           pull, network cut) otherwise keeps its USB/IP session established
+           forever, so the device's interfaces stay claimed and their host
+           channels leak until the device itself disconnects. TCP keepalive
+           makes the dead session's recv() fail, which runs the normal
+           session-ended cleanup (usb_backend_session_ended releases the
+           claims). Probe after 30 s idle, every 10 s, 3 misses ≈ 60 s. */
+        int keepalive = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#ifdef TCP_KEEPIDLE
+        int keep_idle = 30, keep_intvl = 10, keep_cnt = 3;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+#endif
+
         const int count = atomic_fetch_add(&active_connections, 1) + 1;
         ESP_LOGD(TAG, "Client connected (%d active connection%s)",
                  count, count == 1 ? "" : "s");
