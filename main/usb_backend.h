@@ -154,6 +154,15 @@ typedef struct {
     int hcd_channels_allocated;
     /* Pipes queued for a free channel under dynamic binding; -1 unknown. */
     int hcd_channel_waiters;
+    /* Parked bulk IN listener and rotation counters (usb_host_parked_stats());
+       every field is -1 when unknown. rotor_active is 0/1. */
+    int parked_bound;
+    int rotor_active;
+    int promotions;
+    int yields_req;
+    int yields_done;
+    int cap_refusals;
+    int reserve_refusals;
 } usb_backend_claims_totals_t;
 
 size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,

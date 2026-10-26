@@ -1678,6 +1678,24 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     if (usb_host_channel_waiters(&hcd_waiters) == ESP_OK) {
         sums.hcd_channel_waiters = hcd_waiters;
     }
+    /* Parked-listener and rotation counters (phase 2f). */
+    sums.parked_bound = -1;
+    sums.rotor_active = -1;
+    sums.promotions = -1;
+    sums.yields_req = -1;
+    sums.yields_done = -1;
+    sums.cap_refusals = -1;
+    sums.reserve_refusals = -1;
+    usb_host_parked_stats_t ps;
+    if (usb_host_parked_stats(&ps) == ESP_OK) {
+        sums.parked_bound = ps.parked_bound;
+        sums.rotor_active = ps.rotor_active ? 1 : 0;
+        sums.promotions = (int)ps.promotions;
+        sums.yields_req = (int)ps.yields_req;
+        sums.yields_done = (int)ps.yields_done;
+        sums.cap_refusals = (int)ps.cap_refusals;
+        sums.reserve_refusals = (int)ps.reserve_refusals;
+    }
 
     if (totals != NULL) {
         *totals = sums;
