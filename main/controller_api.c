@@ -953,14 +953,19 @@ static api_result_t core_usb_claims(void)
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
     cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);
     cJSON_AddNumberToObject(tt, "claimed_endpoints", totals.claimed_endpoints);
+    /* Each external hub holds TWO channels: its interrupt pipe and its own
+       EP0. Confirmed against the authoritative ledger on the bench
+       (2026-10-26): devices + 2*hubs + claimed endpoints matched
+       channels_in_use at every load step. */
     cJSON_AddNumberToObject(tt, "estimated_channels_in_use",
-                            totals.connected_devices + totals.external_hubs
+                            totals.connected_devices + 2 * totals.external_hubs
                             + totals.claimed_endpoints);
     cJSON_AddStringToObject(tt, "estimate_note",
         totals.hcd_channels_allocated >= 0
             ? "channels_in_use is the HCD's own ledger (authoritative); "
-              "estimated_channels_in_use remains the claim-derived lower bound"
-            : "EP0 per connected device + one interrupt pipe per external hub + "
+              "estimated_channels_in_use is claim-derived (devices + 2*hubs + "
+              "claimed endpoints, bench-validated 2026-10-26)"
+            : "EP0 per connected device + EP0 and interrupt pipe per external hub + "
               "every claimed endpoint; a lower bound (this host library build "
               "does not expose its per-channel ledger)");
     cJSON_AddNumberToObject(tt, "exhaustion_events", totals.exhaustion_events);
