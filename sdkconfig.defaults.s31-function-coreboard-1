@@ -61,3 +61,10 @@ CONFIG_ETH_EMAC_RGMII_TX_CLK_SRC_APLL=y
 # Track up to 32 wired DUTs (idle ones stay powered off per port; the DWC
 # host's 16 channels bound how many can be enumerated/claimed at once).
 CONFIG_USBIP_MAX_DEVICES=32
+
+# LwIP socket budget (stock 10 starved the HTTP API at the 8th attach,
+# accept() errno=23). One TCP socket per attached usbip device, plus two
+# listeners (usbipd and HTTP), plus HTTP clients. 32 devices + listeners +
+# HTTP clients fits in 40; active TCP PCBs are sized above the socket count.
+CONFIG_LWIP_MAX_SOCKETS=40
+CONFIG_LWIP_MAX_ACTIVE_TCP=64
