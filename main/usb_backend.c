@@ -121,6 +121,7 @@ typedef struct {
     esp_err_t last_claim_err;       /* ESP_OK when it has never failed */
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
+    bool ep0_round_logged;          /* the control-IN MPS rounding quirk was logged once (issue #37) */
 } usb_backend_device_slot_t;
 
 typedef struct {
@@ -965,6 +966,25 @@ static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
     return mps;
 }
 
+/* EP0 max packet size of the device behind a handle (its real bMaxPacketSize0);
+   64 when the host library cannot tell. */
+static uint16_t ep0_mps_for(usb_device_handle_t dev_hdl, uint8_t *addr_out)
+{
+    usb_device_info_t info;
+    if (addr_out != NULL) {
+        *addr_out = 0;
+    }
+    if (dev_hdl != NULL && usb_host_device_info(dev_hdl, &info) == ESP_OK) {
+        if (addr_out != NULL) {
+            *addr_out = info.dev_addr;
+        }
+        if (info.bMaxPacketSize0 != 0) {
+            return info.bMaxPacketSize0;
+        }
+    }
+    return 64;
+}
+
 /* Submit one transfer to the host library.  Returns 0 on success (the
    transfer is in flight; the callback sets completed), -EAGAIN when EP0
    refused it while being recovered (try again next pass), or another
@@ -1010,6 +1030,16 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
     }
     if (pipe->payload_len > CONFIG_USBIP_MAX_TRANSFER) {
         return -EMSGSIZE;
+    }
+    /* EP0 IN (tyeth-ai-assisted/esp-usbip-bridge#37): the HAL needs IN transfer sizes to be
+       multiples of the endpoint MPS. An unrounded data stage is a packet-level error for a
+       device that answers with a longer packet than wLength (seen on ESP32-C5 USB-Serial/JTAG,
+       bMaxPacketSize0 64, short GET_DESCRIPTOR -> EPROTO). Round the data stage up as the
+       enumeration path does; the client still gets at most wLength (see complete_transfer). */
+    if (pipe->is_control && pipe->is_in && pipe->payload_len > 0) {
+        const uint16_t mps0 = ep0_mps_for(pipe->dev_hdl, NULL);
+        const size_t rounded = ((pipe->payload_len + mps0 - 1) / mps0) * mps0;
+        xfer_len = USB_SETUP_PACKET_SIZE + rounded;
     }
 
     usb_transfer_t *transfer = NULL;
@@ -1088,6 +1118,28 @@ static int complete_transfer(xfer_t *pipe, size_t *in_len)
             bytes = (transfer->actual_num_bytes > USB_SETUP_PACKET_SIZE)
                         ? (transfer->actual_num_bytes - USB_SETUP_PACKET_SIZE)
                         : 0;
+            /* Never report more than the client asked for (wLength), even when the
+               rounded data stage returned a longer packet (issue #37). */
+            const size_t asked = (pipe->setup.wLength < pipe->payload_len)
+                                     ? pipe->setup.wLength : pipe->payload_len;
+            if (bytes > asked) {
+                uint8_t dev_addr = 0;
+                (void)ep0_mps_for(pipe->dev_hdl, &dev_addr);
+                usb_backend_device_slot_t *dev = NULL;
+                xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+                const int slot = find_slot_by_busid_locked(pipe->busid);
+                if (slot >= 0 && !s_state.devices[slot].ep0_round_logged) {
+                    s_state.devices[slot].ep0_round_logged = true;
+                    dev = &s_state.devices[slot];
+                }
+                xSemaphoreGive(s_state.state_mutex);
+                if (dev != NULL) {
+                    ESP_LOGW(TAG, "%s (device address %u): control IN returned %u bytes for wLength %u; "
+                             "data stage rounded to EP0 MPS, reporting %u (tyeth-ai-assisted/esp-usbip-bridge#37)",
+                             pipe->busid, (unsigned)dev_addr, (unsigned)bytes, (unsigned)asked, (unsigned)asked);
+                }
+                bytes = asked;
+            }
         } else {
             bytes = transfer->actual_num_bytes;
             if (bytes > pipe->payload_len) {
