@@ -5,7 +5,7 @@ dependencies:
   espressif/usb:
     git: https://github.com/tyeth-ai-assisted/esp-usb.git
     path: host/usb
-    version: 5a8fb161e031612ae3781dc7a0257fcb26a79546
+    version: dcc8571a43a31c97351857e15f1d58de5cac1e2d
   espressif/mdns:
     version: ">=1.9.1"
   espressif/cjson:

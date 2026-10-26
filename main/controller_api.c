@@ -990,7 +990,15 @@ static api_result_t core_debug_dump_enum(const cJSON *json)
     if (busid == NULL || strlen(busid) == 0 || strlen(busid) > 31) {
         return fail(400, "busid (port path, e.g. 1-1.3.3) required");
     }
-    usb_backend_arm_ep0_dump(0, 4);
+    /* "all": true arms the wildcard (every control execution on any address, 16 of them), so
+       the window covers address 0 AND the new address of this enumeration, and a debug_ctrl
+       sent right after lands inside it. Otherwise only address 0, 4 executions. */
+    const bool all = json_bool(json, "all", false);
+    if (all) {
+        usb_backend_arm_ep0_dump(0xFF, 16);
+    } else {
+        usb_backend_arm_ep0_dump(0, 4);
+    }
     api_result_t off = core_port_power(busid, false, true);
     if (off.json != NULL) {
         cJSON_Delete(off.json);
@@ -1002,8 +1010,8 @@ static api_result_t core_debug_dump_enum(const cJSON *json)
     }
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "busid", busid);
-    cJSON_AddNumberToObject(j, "armed_address", 0);
-    cJSON_AddNumberToObject(j, "armed_count", 4);
+    cJSON_AddStringToObject(j, "armed_address", all ? "any" : "0");
+    cJSON_AddNumberToObject(j, "armed_count", all ? 16 : 4);
     cJSON_AddNumberToObject(j, "off_status", off.status);
     cJSON_AddNumberToObject(j, "on_status", on.status);
     cJSON_AddStringToObject(j, "note", "EPDUMP lines appear on the console (prefix EPDUMP:)");
@@ -1303,7 +1311,7 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
     { "GET",  "/api/usb/claims",                    false, "Interface-claim and host-channel-pressure accounting per device, with claim-failure history and exhaustion events (estimated channel totals; the 16-channel HCD table itself is not exposed by the host library)", NULL },
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
-    { "POST", "/api/usb/debug_dump_enum",           true,  "Arm the EPDUMP register dump for address 0, power-cycle the port so it re-enumerates, and dump the enumeration's first control reads to the console (diagnostics, issue #37)", "{\"busid\":str}" },
+    { "POST", "/api/usb/debug_dump_enum",           true,  "Arm the EPDUMP register dump for address 0, power-cycle the port so it re-enumerates, and dump the enumeration's first control reads to the console (diagnostics, issue #37)", "{\"busid\":str,\"all\":bool}" },
     { "POST", "/api/usb/debug_ctrl",                true,  "Submit one control transfer to a connected device through the same backend path as a forwarded usbip EP0 request (diagnostics, issue #37). OUT requests must have wlength 0", "{\"busid\":str,\"bm\":int,\"breq\":int,\"wvalue\":int,\"windex\":int,\"wlength\":int}" },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
