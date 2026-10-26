@@ -68,3 +68,6 @@ CONFIG_USBIP_MAX_DEVICES=32
 # HTTP clients fits in 40; active TCP PCBs are sized above the socket count.
 CONFIG_LWIP_MAX_SOCKETS=40
 CONFIG_LWIP_MAX_ACTIVE_TCP=64
+
+# Parked-listener rotation period (phase 2j): tick-only yields, paced at 100 ms.
+CONFIG_USB_HOST_PARKED_IN_ROTATE_MS=100
