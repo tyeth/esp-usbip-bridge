@@ -1461,9 +1461,10 @@ static void handle_connection(int fd)
 
     /* GET /api/devices */
     if (strcmp(url, "/api/devices") == 0 && strcmp(req.method, "GET") == 0) {
-        char *resp = malloc(4096);
+        const size_t devs_cap = 1024 + 256 * (CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX);
+        char *resp = malloc(devs_cap);
         if (!resp) { free(body_buf); free(buf); http_500(fd); return; }
-        build_devices_json(resp, 4096);
+        build_devices_json(resp, devs_cap);
         send_json_ok(fd, resp, strlen(resp));
         free(resp);
         free(body_buf); free(buf);

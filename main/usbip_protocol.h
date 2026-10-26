@@ -21,7 +21,9 @@
 
 #define USBIP_NON_ISO_PACKETS 0xFFFFFFFFu
 
-#define USBIP_MAX_INTERFACES 8
+#include "sdkconfig.h"
+
+#define USBIP_MAX_INTERFACES CONFIG_USBIP_MAX_INTERFACES
 
 typedef struct __attribute__((packed)) {
     uint16_t version;

@@ -325,11 +325,33 @@ config USBIP_MAX_URB_SIZE
 
 config USBIP_MAX_DEVICES
     int "Maximum exported USB devices"
-    range 1 16
+    range 1 64
     default 8
     help
-        Maximum number of simultaneously exported non-hub USB devices.
-        Increase this when using downstream hubs with multiple peripherals.
+        Maximum number of simultaneously exported non-hub USB devices the
+        bridge tracks. Increase this when using downstream hubs with many
+        peripherals. Note the independent hardware budget: the DWC OTG host
+        has a fixed number of channels (16 on ESP32-S31/P4), and every
+        ENUMERATED device holds one for its EP0 (plus one per claimed
+        endpoint and two per external hub) - so a large fleet relies on
+        per-port power keeping idle devices off the bus, not on this limit.
+
+config USBIP_MAX_INTERFACES
+    int "Maximum interfaces per exported device"
+    range 1 32
+    default 8
+    help
+        Per-device interface table size (claim bitmap, descriptors). USB
+        allows up to 32; composite bench devices rarely exceed 8.
+
+config USBIP_MAX_ENDPOINTS
+    int "Maximum endpoints per exported device"
+    range 2 32
+    default 16
+    help
+        Per-device endpoint table size. Each CLAIMED endpoint pins one DWC
+        host channel until its interface is released, so raising this does
+        not raise the concurrent-channel budget.
 
 config USBIP_MAX_INFLIGHT_XFERS
     int "Maximum transfers in flight at the USB host"

@@ -16,7 +16,9 @@ typedef struct {
     uint8_t interface_protocol;
 } usbip_backend_interface_t;
 
-#define USBIP_MAX_ENDPOINTS 16
+#include "sdkconfig.h"
+
+#define USBIP_MAX_ENDPOINTS CONFIG_USBIP_MAX_ENDPOINTS
 
 typedef struct {
     uint8_t address;

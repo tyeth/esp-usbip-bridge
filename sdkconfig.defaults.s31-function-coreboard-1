@@ -57,3 +57,7 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 # which the RGMII TX clock cannot make 125 MHz ("EMAC out frequency cannot be
 # used", network init aborts). Clock RGMII from the APLL instead.
 CONFIG_ETH_EMAC_RGMII_TX_CLK_SRC_APLL=y
+
+# Track up to 32 wired DUTs (idle ones stay powered off per port; the DWC
+# host's 16 channels bound how many can be enumerated/claimed at once).
+CONFIG_USBIP_MAX_DEVICES=32

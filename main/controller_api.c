@@ -340,6 +340,10 @@ static api_result_t core_info(void)
     cJSON_AddBoolToObject(j, "auth_required", s_token[0] != '\0');
     cJSON_AddBoolToObject(j, "mux_bus_ok", analog_mux_bus_ok());
     cJSON_AddNumberToObject(j, "usbip_port", 3240);
+    cJSON_AddNumberToObject(j, "max_devices", CONFIG_USBIP_MAX_DEVICES);
+    cJSON_AddNumberToObject(j, "max_interfaces_per_device", CONFIG_USBIP_MAX_INTERFACES);
+    cJSON_AddNumberToObject(j, "max_endpoints_per_device", CONFIG_USBIP_MAX_ENDPOINTS);
+    cJSON_AddNumberToObject(j, "max_inflight_transfers", CONFIG_USBIP_MAX_INFLIGHT_XFERS);
     return result(200, j);
 }
 
@@ -916,7 +920,11 @@ static api_result_t core_enum_events(void)
    documented lower bound, not an authoritative ledger. */
 static api_result_t core_usb_claims(void)
 {
-    usb_backend_claims_device_t devs[CONFIG_USBIP_MAX_DEVICES];
+    usb_backend_claims_device_t *devs =
+        calloc(CONFIG_USBIP_MAX_DEVICES, sizeof(*devs));
+    if (devs == NULL) {
+        return fail(503, "out of memory");
+    }
     usb_backend_claims_totals_t totals;
     const size_t n = usb_backend_get_claims(devs, CONFIG_USBIP_MAX_DEVICES, &totals);
 
@@ -940,6 +948,7 @@ static api_result_t core_usb_claims(void)
         }
         cJSON_AddItemToArray(arr, o);
     }
+    free(devs);
 
     cJSON *tt = cJSON_AddObjectToObject(j, "totals");
     cJSON_AddNumberToObject(tt, "channels_total",
