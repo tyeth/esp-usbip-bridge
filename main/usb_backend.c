@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -1008,6 +1009,9 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
     usb_transfer_t *transfer = NULL;
     esp_err_t err = usb_host_transfer_alloc(xfer_len, 0, &transfer);
     if (err != ESP_OK || transfer == NULL) {
+        /* Name the size: a silent -ENOMEM cost a debugging session. */
+        ESP_LOGE(TAG, "usb_host_transfer_alloc(%u) failed: %s (ep=0x%02x)",
+                 (unsigned)xfer_len, esp_err_to_name(err), pipe->endpoint_addr);
         return -ENOMEM;
     }
 
@@ -1716,6 +1720,11 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
         sums.rej_too_big = (int)ps.rej_too_big;
         sums.halt_noop = (int)ps.halt_noop;
     }
+
+    sums.heap_free = (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    sums.heap_min = (int)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+    sums.dma_free = (int)heap_caps_get_free_size(MALLOC_CAP_DMA);
+    sums.dma_largest = (int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
 
     if (totals != NULL) {
         *totals = sums;

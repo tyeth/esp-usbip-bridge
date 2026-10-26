@@ -963,7 +963,7 @@ static api_result_t core_usb_claims(void)
            (their transfers run as soon as one frees, instead of failing). */
         cJSON_AddNumberToObject(tt, "channels_waiting", totals.hcd_channel_waiters);
     }
-    /* Parked-listener and rotation counters (short flat keys, phase 2f). */
+    /* Parked-listener and rotation counters (short flat keys, phase 2f/2g). */
     if (totals.parked_bound >= 0) {
         cJSON_AddNumberToObject(tt, "parked_bound", totals.parked_bound);
         cJSON_AddBoolToObject(tt, "rotor_active", totals.rotor_active == 1);
@@ -983,6 +983,11 @@ static api_result_t core_usb_claims(void)
         cJSON_AddNumberToObject(tt, "rej_too_big", totals.rej_too_big);
         cJSON_AddNumberToObject(tt, "halt_noop", totals.halt_noop);
     }
+    /* Heap telemetry (bytes): total free, minimum ever free, DMA free, largest DMA block. */
+    cJSON_AddNumberToObject(tt, "heap_free", totals.heap_free);
+    cJSON_AddNumberToObject(tt, "heap_min", totals.heap_min);
+    cJSON_AddNumberToObject(tt, "dma_free", totals.dma_free);
+    cJSON_AddNumberToObject(tt, "dma_largest", totals.dma_largest);
     cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
     cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);

@@ -244,6 +244,8 @@ static bool urb_buf_alloc(urb_buf_t *buf, size_t len)
     for (size_t i = 0; i < urb_buf_nsegs(buf); i++) {
         buf->seg[i] = malloc(urb_buf_seg_len(buf, i));
         if (buf->seg[i] == NULL) {
+            ESP_LOGE(TAG, "URB segment alloc failed: %u bytes (urb %u bytes, segment %u of %u)",
+                     (unsigned)urb_buf_seg_len(buf, i), (unsigned)len, (unsigned)i, (unsigned)urb_buf_nsegs(buf));
             urb_buf_free(buf);
             return false;
         }

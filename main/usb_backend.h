@@ -163,6 +163,13 @@ typedef struct {
     int yields_done;
     int cap_refusals;
     int reserve_refusals;
+    /* Heap telemetry (bytes; -1 unknown): total free and minimum-ever free
+       (MALLOC_CAP_DEFAULT), DMA-capable free and largest free DMA block
+       (MALLOC_CAP_DMA, what the host transfer allocator uses). */
+    int heap_free;
+    int heap_min;
+    int dma_free;
+    int dma_largest;
     int rot_passes;
     int rej_not_bound;
     int rej_not_parked;
