@@ -170,6 +170,9 @@ typedef struct {
     int heap_min;
     int dma_free;
     int dma_largest;
+    /* In-flight transfers now (sum over endpoints) and peak since boot (leak detector). */
+    int inflight_now;
+    int inflight_peak;
     int rot_passes;
     int rej_not_bound;
     int rej_not_parked;

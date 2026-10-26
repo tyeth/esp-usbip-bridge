@@ -138,6 +138,7 @@ typedef struct {
     xfer_t *inflight_tail;
     int num_inflight;
     int num_in_inflight;            /* bulk/interrupt IN among them */
+    int inflight_peak;              /* leak detector: highest num_inflight seen (round 2m) */
 
     usb_host_client_handle_t client_hdl;
     usb_backend_device_slot_t devices[CONFIG_USBIP_MAX_DEVICES];
@@ -1129,6 +1130,9 @@ static void inflight_append_locked(xfer_t *x)
     }
     s_state.inflight_tail = x;
     s_state.num_inflight++;
+    if (s_state.num_inflight > s_state.inflight_peak) {
+        s_state.inflight_peak = s_state.num_inflight;
+    }
     if (!x->is_control && x->is_in) {
         s_state.num_in_inflight++;
     }
@@ -1271,6 +1275,21 @@ static void process_inflight(TickType_t now)
                 usb_host_transfer_free(x->xfer);
                 x->xfer = NULL;
                 finish_xfer(x, 0, 0);
+            } else if (!x->is_control && x->dev_hdl != NULL
+                       && (now - x->cancel_tick) >= pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS)) {
+                /* Round 2m: an orphan still executing after its cancel keeps its endpoint's
+                   in-flight slot (and the endpoint's pipe) busy. Re-issue the cancel, with
+                   the halt/flush/clear that retires a stuck pipe, once per wait period
+                   until the host completes it. Without this a silent device wedges the
+                   endpoint for good. */
+                x->cancel_tick = now;
+                ESP_LOGW(TAG, "%s ep 0x%02x: orphaned transfer still executing, re-cancelling",
+                         x->busid, x->endpoint_addr);
+                if (usb_host_transfer_cancel(x->xfer) == ESP_ERR_NOT_FINISHED) {
+                    usb_host_endpoint_halt(x->dev_hdl, x->endpoint_addr);
+                    usb_host_endpoint_flush(x->dev_hdl, x->endpoint_addr);
+                    usb_host_endpoint_clear(x->dev_hdl, x->endpoint_addr);
+                }
             }
             continue;
         }
@@ -1726,6 +1745,9 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
         sums.halt_noop = (int)ps.halt_noop;
     }
 
+    /* Leak detector (round 2m): transfers in flight now, and the peak since boot. */
+    sums.inflight_now = s_state.num_inflight;
+    sums.inflight_peak = s_state.inflight_peak;
     sums.heap_free = (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
     sums.heap_min = (int)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
     sums.dma_free = (int)heap_caps_get_free_size(MALLOC_CAP_DMA);

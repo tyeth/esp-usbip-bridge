@@ -988,6 +988,8 @@ static api_result_t core_usb_claims(void)
     cJSON_AddNumberToObject(tt, "heap_min", totals.heap_min);
     cJSON_AddNumberToObject(tt, "dma_free", totals.dma_free);
     cJSON_AddNumberToObject(tt, "dma_largest", totals.dma_largest);
+    cJSON_AddNumberToObject(tt, "inflight_now", totals.inflight_now);
+    cJSON_AddNumberToObject(tt, "inflight_peak", totals.inflight_peak);
     cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
     cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);
