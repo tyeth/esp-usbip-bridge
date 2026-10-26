@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "port_events.h"
 #include "sdkconfig.h"
 
 #ifndef CONFIG_USB_HOST_ENUM_CTRL_TIMEOUT_MS
@@ -369,6 +370,7 @@ static bool port_policy_cb(const usb_host_hub_port_path_t *path, void *arg)
 
 esp_err_t hub_ctl_init(void)
 {
+    port_events_init();
     s_nvs_lock = xSemaphoreCreateMutex();
     s_jobs_lock = xSemaphoreCreateMutex();
     if (s_nvs_lock == NULL || s_jobs_lock == NULL) {
@@ -805,6 +807,7 @@ esp_err_t hub_ctl_port_power(const char *port_path, bool on, bool force, bool *p
     bool queued = false;
     esp_err_t err = check_port_request(port_path, on, force, &hub_addr, &port, &flags, msg, msg_len);
     if (err == ESP_OK) {
+        port_events_note_action(port_path, PORT_EVENT_SRC_API);
         err = apply_or_queue(port_path, hub_addr, port, on, flags, &queued);
     }
     if (pending) {
@@ -834,6 +837,7 @@ esp_err_t hub_ctl_port_cycle(const char *port_path, uint32_t off_ms, bool force,
         set_msg(msg, msg_len, "off_ms is limited to %d", HUB_CTL_MAX_OFF_MS);
         return ESP_ERR_INVALID_ARG;
     }
+    port_events_note_action(port_path, PORT_EVENT_SRC_API);
     err = queue_job(port_path, JOB_CYCLE_OFF, false, off_ms, flags);
     if (err != ESP_OK) {
         set_msg(msg, msg_len, "too many port requests queued");
@@ -861,6 +865,7 @@ int hub_ctl_all_ports(bool on)
                 continue;
             }
             bool pending;
+            port_events_note_action(snap[h].ports[p].path, PORT_EVENT_SRC_API);
             if (apply_or_queue(snap[h].ports[p].path, snap[h].hub.addr, p + 1, on, 0, &pending) == ESP_OK) {
                 save_port_state(snap[h].ports[p].path, on);
                 switched++;
@@ -887,6 +892,7 @@ int hub_ctl_restore_now(void)
             }
             /* The saved state was accepted when it was set, so apply it as is */
             bool pending;
+            port_events_note_action(port->path, PORT_EVENT_SRC_RESTORE);
             if (apply_or_queue(port->path, snap[h].hub.addr, port->port, port->desired_on,
                                USB_HOST_HUB_PORT_POWER_FLAG_FORCE, &pending) == ESP_OK) {
                 ESP_LOGI(TAG, "Port %s restored %s%s", port->path, port->desired_on ? "on" : "off",

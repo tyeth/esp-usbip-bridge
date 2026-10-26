@@ -13,6 +13,7 @@ set(srcs
     "led_strip_encoder.c"
     "neopixel.c"
     "hub_control.c"
+    "port_events.c"
     "analog_mux.c"
     "controller_api.c"
 )

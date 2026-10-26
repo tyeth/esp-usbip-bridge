@@ -326,3 +326,23 @@ avahi-resolve-host-name usbip-xxxxxx.local
 
 - The USB/IP server supports real workloads (CDC consoles, mass storage, composite devices); see Status above for the current limits.
 - ESP-IDF version constraint is set in `main/idf_component.yml` to `>=6.0.0-beta2`.
+
+## Port event log
+
+`GET /api/ports/events` lists the last 64 port state changes, newest first. Each
+event has `when_ms` (bridge uptime), `port`, `what` (`power_on`, `power_off`,
+`connected`, `disconnected`, `enabled`, `disabled`, `overcurrent`,
+`overcurrent_cleared`), `from`/`to`, `attribution`, `via` (when `restore`) and
+`mismatch`. Attribution:
+
+- `api`: a power change the API commanded on that port within 15 s (a
+  saved-state restore is tagged `via: "restore"`, so it is never mistaken for a
+  manual change);
+- `device`: a connection or enable change with no commanded cause (a replug or drop);
+- `external`: a power change the API did not command (hand-toggled switch,
+  upstream glitch), or an over-current change.
+
+Counters since boot (`external_power_changes`, `device_replugs`) are returned
+with the events. Each port's `GET /api/ports` entry carries `last_change`
+(`when_ms`, `what`, `attribution`).
+

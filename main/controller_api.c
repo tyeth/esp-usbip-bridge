@@ -19,6 +19,7 @@
 #include "device_naming.h"
 #include "discovery_service.h"
 #include "hub_control.h"
+#include "port_events.h"
 #include "usb/usb_types_stack.h"
 #include "usb_backend.h"
 #include "virtual_device.h"
@@ -503,6 +504,13 @@ static cJSON *port_json(const hub_ctl_port_t *p)
     cJSON_AddStringToObject(o, "desired", p->desired_on ? "on" : "off");
     add_str_or_null(o, "pending", p->pending);
     cJSON_AddBoolToObject(o, "mismatch", p->mismatch);
+    port_last_change_t lc;
+    if (port_events_last_change(p->path, &lc)) {
+        cJSON *lcj = cJSON_AddObjectToObject(o, "last_change");
+        cJSON_AddNumberToObject(lcj, "when_ms", lc.t_ms);
+        cJSON_AddStringToObject(lcj, "what", lc.what);
+        cJSON_AddStringToObject(lcj, "attribution", lc.attribution);
+    }
     cJSON_AddNumberToObject(o, "enum_timeout_ms", p->enum_timeout_ms);
     cJSON_AddBoolToObject(o, "enum_timeout_override", p->enum_timeout_override);
     add_str_or_null(o, "speed", p->speed);
@@ -565,6 +573,40 @@ static api_result_t core_hubs(void)
         cJSON_AddItemToArray(arr, o);
     }
     free(snap);
+    return result(200, j);
+}
+
+/* GET /api/ports/events: the port state transition log, newest first, with attribution
+   (api / device / external; via restore for the saved-state policy) and counters. */
+static api_result_t core_port_events(void)
+{
+    port_event_t *ev = malloc(PORT_EVENT_LOG_LEN * sizeof(*ev));
+    if (ev == NULL) {
+        return fail(503, "out of memory");
+    }
+    const size_t n = port_events_get(ev, PORT_EVENT_LOG_LEN);
+    uint32_t ext = 0;
+    uint32_t replugs = 0;
+    port_events_counters(&ext, &replugs);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "external_power_changes", ext);
+    cJSON_AddNumberToObject(j, "device_replugs", replugs);
+    cJSON *arr = cJSON_AddArrayToObject(j, "events");
+    for (size_t i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "when_ms", ev[i].t_ms);
+        cJSON_AddStringToObject(e, "port", ev[i].port);
+        cJSON_AddStringToObject(e, "what", ev[i].what);
+        cJSON_AddStringToObject(e, "from", ev[i].from);
+        cJSON_AddStringToObject(e, "to", ev[i].to);
+        cJSON_AddStringToObject(e, "attribution", ev[i].attribution);
+        if (ev[i].via[0] != '\0') {
+            cJSON_AddStringToObject(e, "via", ev[i].via);
+        }
+        cJSON_AddBoolToObject(e, "mismatch", ev[i].mismatch);
+        cJSON_AddItemToArray(arr, e);
+    }
+    free(ev);
     return result(200, j);
 }
 
@@ -1320,6 +1362,7 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
     { "POST", "/api/usb/debug_dump_enum",           true,  "Arm the EPDUMP register dump for address 0, power-cycle the port so it re-enumerates, and dump the enumeration's first control reads to the console (diagnostics, issue #37)", "{\"busid\":str,\"all\":bool,\"count\":int(1-64, default 16)}" },
     { "POST", "/api/usb/debug_ctrl",                true,  "Submit one control transfer to a connected device through the same backend path as a forwarded usbip EP0 request (diagnostics, issue #37). OUT requests must have wlength 0", "{\"busid\":str,\"bm\":int,\"breq\":int,\"wvalue\":int,\"windex\":int,\"wlength\":int,\"dump\":bool,\"count\":int(1-64, default 4)}" },
+    { "GET",  "/api/ports/events",                  false, "Port state transition log, newest first: power, connection, enable and over-current changes with attribution (api = commanded here, via restore for the saved-state policy; device = replug or drop; external = power changed without a command, e.g. a hand-toggled switch) and mismatch, plus external_power_changes and device_replugs counters since boot", NULL },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
     { "POST", "/api/ports/{port}/on",               true,  "Power a hub port on (SetPortFeature PORT_POWER)", "{\"force\":bool}" },
@@ -1791,6 +1834,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         cJSON_AddBoolToObject(j, "ok", err == ESP_OK);
         cJSON_AddStringToObject(j, "note", "state logged to the console (UART0 and USB Serial/JTAG)");
         r = result(err == ESP_OK ? 200 : 503, j);
+    } else if (path_is(path, "/api/ports/events") && is_method(method, "GET")) {
+        r = core_port_events();
     } else if (path_is(path, "/api/ports")) {
         r = core_ports();
     } else if (path_is(path, "/api/ports/off") && is_method(method, "POST")) {
