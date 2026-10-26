@@ -2033,3 +2033,8 @@ int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *se
     *error_detail = d.error_detail;
     return d.status;
 }
+
+void usb_backend_arm_ep0_dump(int dev_addr, int count)
+{
+    (void)usb_host_debug_arm_ep0_dump((uint8_t)dev_addr, count);
+}

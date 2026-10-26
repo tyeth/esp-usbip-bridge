@@ -10,6 +10,8 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -951,6 +953,15 @@ static api_result_t core_debug_ctrl(const cJSON *json)
     }
     char bus[32] = {0};
     strlcpy(bus, busid, sizeof(bus));
+    /* "dump": arm the EPDUMP knob for this device's address (issue #37). */
+    bool dump_armed = false;
+    if (json_bool(json, "dump", false)) {
+        usbip_backend_device_t dev;
+        if (usb_backend_get_device_by_busid(bus, &dev)) {
+            usb_backend_arm_ep0_dump(dev.dev_addr, 4);
+            dump_armed = true;
+        }
+    }
     size_t in_len = 0;
     const char *detail = "none";
     const int status = usb_backend_debug_control(bus, &setup, in_buf, (size_t)wlength, &in_len, &detail);
@@ -965,7 +976,37 @@ static api_result_t core_debug_ctrl(const cJSON *json)
         snprintf(&hex[i * 2], 3, "%02x", in_buf[i]);
     }
     cJSON_AddStringToObject(j, "data_hex", hex);
+    cJSON_AddBoolToObject(j, "dump_armed", dump_armed);
     free(in_buf);
+    return result(200, j);
+}
+
+/* POST /api/usb/debug_dump_enum (issue #37): arm EPDUMP for address 0 (the enumeration's
+   first descriptor read, CHECK_SHORT_DEV_DESC) and power-cycle the port so the stack
+   enumerates again. The first 4 control executions on address 0 are dumped to the log. */
+static api_result_t core_debug_dump_enum(const cJSON *json)
+{
+    const char *busid = json_string(json, "busid");
+    if (busid == NULL || strlen(busid) == 0 || strlen(busid) > 31) {
+        return fail(400, "busid (port path, e.g. 1-1.3.3) required");
+    }
+    usb_backend_arm_ep0_dump(0, 4);
+    api_result_t off = core_port_power(busid, false, true);
+    if (off.json != NULL) {
+        cJSON_Delete(off.json);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    api_result_t on = core_port_power(busid, true, true);
+    if (on.json != NULL) {
+        cJSON_Delete(on.json);
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "busid", busid);
+    cJSON_AddNumberToObject(j, "armed_address", 0);
+    cJSON_AddNumberToObject(j, "armed_count", 4);
+    cJSON_AddNumberToObject(j, "off_status", off.status);
+    cJSON_AddNumberToObject(j, "on_status", on.status);
+    cJSON_AddStringToObject(j, "note", "EPDUMP lines appear on the console (prefix EPDUMP:)");
     return result(200, j);
 }
 
@@ -1262,6 +1303,7 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
     { "GET",  "/api/usb/claims",                    false, "Interface-claim and host-channel-pressure accounting per device, with claim-failure history and exhaustion events (estimated channel totals; the 16-channel HCD table itself is not exposed by the host library)", NULL },
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
+    { "POST", "/api/usb/debug_dump_enum",           true,  "Arm the EPDUMP register dump for address 0, power-cycle the port so it re-enumerates, and dump the enumeration's first control reads to the console (diagnostics, issue #37)", "{\"busid\":str}" },
     { "POST", "/api/usb/debug_ctrl",                true,  "Submit one control transfer to a connected device through the same backend path as a forwarded usbip EP0 request (diagnostics, issue #37). OUT requests must have wlength 0", "{\"busid\":str,\"bm\":int,\"breq\":int,\"wvalue\":int,\"windex\":int,\"wlength\":int}" },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
@@ -1725,6 +1767,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_usb_claims();
     } else if (path_is(path, "/api/usb/debug_ctrl") && is_method(method, "POST")) {
         r = core_debug_ctrl(json);
+    } else if (path_is(path, "/api/usb/debug_dump_enum") && is_method(method, "POST")) {
+        r = core_debug_dump_enum(json);
     } else if (path_is(path, "/api/usb/debug")) {
         /* Diagnostics: the USB host's hub/port/enumeration state goes to the console */
         esp_err_t err = usb_host_hub_debug_dump();

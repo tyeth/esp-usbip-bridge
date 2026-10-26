@@ -74,6 +74,8 @@ typedef struct {
 esp_err_t usb_backend_start(void);
 size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_devices);
 bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_t *out_device);
+/* Debug (issue #37): dump the next `count` control executions on device address dev_addr. */
+void usb_backend_arm_ep0_dump(int dev_addr, int count);
 
 /* An asynchronous transfer request.  The caller fills the public fields and
    submits it; the backend task calls done() exactly once, when the transfer
