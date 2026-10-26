@@ -1,6 +1,6 @@
 # ESP32-P4 USB/IP Bridge (ESP-IDF)
 
-This project is an ESP-IDF scaffold for ESP32-P4 / ESP32-S3 / ESP32-S31 USB dev boards that:
+This project is ESP-IDF firmware for ESP32-P4 / ESP32-S3 / ESP32-S31 USB dev boards that:
 
 - runs USB Host mode,
 - enumerates and exports multiple non-hub USB devices (including devices behind a USB hub),
@@ -8,17 +8,28 @@ This project is an ESP-IDF scaffold for ESP32-P4 / ESP32-S3 / ESP32-S31 USB dev 
 
 ## Status
 
-Implemented now:
+Implemented:
 
-- `OP_REQ_DEVLIST` (`usbip list -r <ip>` works when device is attached)
-- `OP_REQ_IMPORT` (`usbip attach -r <ip> -b <busid>`)
-- `USBIP_CMD_SUBMIT` for control endpoint `EP0` only
-- `USBIP_CMD_UNLINK`
+- `OP_REQ_DEVLIST` / `OP_REQ_IMPORT` (`usbip list|attach -r <ip> -b <busid>`),
+  multiple devices including behind cascaded hubs (busid = stable Linux-style
+  port path)
+- `USBIP_CMD_SUBMIT` for control, bulk and interrupt endpoints, with
+  concurrent URBs per device and on-demand interface claiming (interfaces are
+  released when a client's session ends)
+- `USBIP_CMD_UNLINK` with safe cancellation: a stuck transfer is cancelled and
+  its host transfer held until the controller retires it
+- URB status codes translated to Linux errno values; TCP keepalive reaps a
+  client that vanishes without a FIN and releases its claims
+- Hub port power control (per-port, saved desired state, restore), enumeration
+  diagnostics, and interface-claim / host-channel accounting via the HTTP
+  controller API (`GET /api/schema` lists every endpoint)
 
-Not implemented yet:
+Not implemented / known limits:
 
-- non-control endpoints (bulk/interrupt/isochronous)
-- robust recovery for all host and network edge cases
+- isochronous endpoints
+- the DWC OTG host has 16 channels shared by every open pipe (EP0s, hub
+  interrupt pipes, claimed endpoints); `GET /api/usb/claims` reports the live
+  authoritative ledger and attributes exhaustion to the claiming busid
 
 ## Protocol Basis
 
@@ -313,5 +324,5 @@ avahi-resolve-host-name usbip-xxxxxx.local
 
 ## Notes
 
-- USB/IP in this scaffold is intentionally minimal and aimed at incremental bring-up.
+- The USB/IP server supports real workloads (CDC consoles, mass storage, composite devices); see Status above for the current limits.
 - ESP-IDF version constraint is set in `main/idf_component.yml` to `>=6.0.0-beta2`.

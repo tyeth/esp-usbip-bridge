@@ -2,9 +2,10 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, s31-function-coreboard-ethernet]
   pull_request:
-    branches: [main]
+    branches: [main, s31-function-coreboard-ethernet]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -12,12 +13,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [p4-function-ev, m5stack-poe-p4, s3-usb-otg, s31-function-coreboard-1]
+        board: [p4-function-ev, m5stack-poe-p4, s3-usb-otg, s31-function-coreboard-1, p4hil]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Not recursive: esp-harness declares its own full ESP-IDF submodule the
+      # build never uses (see the README's Cloning section).
+      - name: Init submodules (without esp-harness's ESP-IDF)
+        run: |
+          git submodule update --init esp-idf esp-harness
+          git -C esp-harness submodule update --init components/scpi_parser/upstream
 
       - name: Install ESP-IDF dependencies
         run: |
