@@ -912,6 +912,63 @@ static api_result_t core_enum_events(void)
     return result(200, j);
 }
 
+/* POST /api/usb/debug_ctrl (issue #37): one control transfer through the forwarded-EP0
+   backend path, no usbip in the loop. Body: busid, bm, breq, wvalue, windex, wlength. */
+static api_result_t core_debug_ctrl(const cJSON *json)
+{
+    if (!cJSON_IsObject(json)) {
+        return fail(400, "body must be a JSON object");
+    }
+    const char *busid = json_string(json, "busid");
+    if (busid == NULL || strlen(busid) == 0 || strlen(busid) > 31) {
+        return fail(400, "busid (string) required");
+    }
+    int bm = 0, breq = 0, wvalue = 0, windex = 0, wlength = 0;
+    json_int(json, "bm", &bm);
+    json_int(json, "breq", &breq);
+    json_int(json, "wvalue", &wvalue);
+    json_int(json, "windex", &windex);
+    json_int(json, "wlength", &wlength);
+    if (bm < 0 || bm > 255 || breq < 0 || breq > 255 || wvalue < 0 || wvalue > 0xffff
+        || windex < 0 || windex > 0xffff || wlength < 0 || wlength > 4096) {
+        return fail(400, "bm/breq 0-255, wvalue/windex 0-65535, wlength 0-4096");
+    }
+    if (!(bm & 0x80) && wlength > 0) {
+        return fail(400, "OUT requests with data are not supported here; use wlength 0");
+    }
+
+    usb_setup_packet_t setup;
+    memset(&setup, 0, sizeof(setup));
+    setup.bmRequestType = (uint8_t)bm;
+    setup.bRequest = (uint8_t)breq;
+    setup.wValue = (uint16_t)wvalue;
+    setup.wIndex = (uint16_t)windex;
+    setup.wLength = (uint16_t)wlength;
+
+    uint8_t *in_buf = malloc(wlength > 0 ? (size_t)wlength : 1);
+    if (in_buf == NULL) {
+        return fail(503, "out of memory");
+    }
+    char bus[32] = {0};
+    strlcpy(bus, busid, sizeof(bus));
+    size_t in_len = 0;
+    const char *detail = "none";
+    const int status = usb_backend_debug_control(bus, &setup, in_buf, (size_t)wlength, &in_len, &detail);
+
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "status", status);
+    cJSON_AddNumberToObject(j, "actual_length", (double)in_len);
+    cJSON_AddStringToObject(j, "error_detail", detail != NULL ? detail : "none");
+    char hex[65] = {0};
+    const size_t show = in_len < 32 ? in_len : 32;
+    for (size_t i = 0; i < show; i++) {
+        snprintf(&hex[i * 2], 3, "%02x", in_buf[i]);
+    }
+    cJSON_AddStringToObject(j, "data_hex", hex);
+    free(in_buf);
+    return result(200, j);
+}
+
 /* GET /api/usb/claims: interface-claim and channel-pressure accounting.
    The DWC OTG host has 16 channels; EP0 of every connected device and each
    external hub's interrupt pipe hold one for good, and every claimed
@@ -1205,6 +1262,7 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
     { "GET",  "/api/usb/claims",                    false, "Interface-claim and host-channel-pressure accounting per device, with claim-failure history and exhaustion events (estimated channel totals; the 16-channel HCD table itself is not exposed by the host library)", NULL },
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
+    { "POST", "/api/usb/debug_ctrl",                true,  "Submit one control transfer to a connected device through the same backend path as a forwarded usbip EP0 request (diagnostics, issue #37). OUT requests must have wlength 0", "{\"busid\":str,\"bm\":int,\"breq\":int,\"wvalue\":int,\"windex\":int,\"wlength\":int}" },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
     { "POST", "/api/ports/{port}/on",               true,  "Power a hub port on (SetPortFeature PORT_POWER)", "{\"force\":bool}" },
@@ -1665,6 +1723,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_enum_events();
     } else if (path_is(path, "/api/usb/claims")) {
         r = core_usb_claims();
+    } else if (path_is(path, "/api/usb/debug_ctrl") && is_method(method, "POST")) {
+        r = core_debug_ctrl(json);
     } else if (path_is(path, "/api/usb/debug")) {
         /* Diagnostics: the USB host's hub/port/enumeration state goes to the console */
         esp_err_t err = usb_host_hub_debug_dump();

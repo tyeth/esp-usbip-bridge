@@ -101,6 +101,7 @@ struct usb_backend_req {
     struct usb_backend_req *next;
     uint32_t seq;
     int status;
+    const char *error_detail;       /* channel-level error of a failed transfer, or NULL (issue #37) */
 };
 
 /* Queue a transfer.  Never blocks; done() follows from the backend task,
@@ -111,6 +112,14 @@ void usb_backend_submit(usb_backend_req_t *req);
    or with the real result if the transfer completed first.  Safe to call
    more than once, and after done(). */
 void usb_backend_cancel(usb_backend_req_t *req);
+
+/* Diagnostics (issue #37): one control transfer to a connected device, submitted through
+   usb_backend_submit() exactly like a forwarded usbip EP0 request, and waited for. Returns
+   the errno status; in_buf holds the bytes received (in_len); error_detail is the channel
+   error behind a failure. */
+int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *setup,
+                              uint8_t *in_buf, size_t in_capacity,
+                              size_t *in_len, const char **error_detail);
 
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 

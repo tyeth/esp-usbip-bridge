@@ -1098,6 +1098,21 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
 /* Finish a transfer whose callback has fired: read the result, copy IN
    data to the request, free the host transfer, and return the errno for
    the caller. */
+static const char *usb_status_name(usb_transfer_status_t s)
+{
+    switch (s) {
+    case USB_TRANSFER_STATUS_COMPLETED: return "COMPLETED";
+    case USB_TRANSFER_STATUS_ERROR: return "ERROR";
+    case USB_TRANSFER_STATUS_TIMED_OUT: return "TIMED_OUT";
+    case USB_TRANSFER_STATUS_CANCELED: return "CANCELED";
+    case USB_TRANSFER_STATUS_STALL: return "STALL";
+    case USB_TRANSFER_STATUS_OVERFLOW: return "OVERFLOW";
+    case USB_TRANSFER_STATUS_SKIPPED: return "SKIPPED";
+    case USB_TRANSFER_STATUS_NO_DEVICE: return "NO_DEVICE";
+    default: return "?";
+    }
+}
+
 static int complete_transfer(xfer_t *pipe, size_t *in_len)
 {
     usb_transfer_t *transfer = pipe->xfer;
@@ -1106,8 +1121,19 @@ static int complete_transfer(xfer_t *pipe, size_t *in_len)
 
     *in_len = 0;
     if (status != 0) {
-        ESP_LOGD(TAG, "transfer failed: usb_status=%d errno=%d (ep=0x%02x)",
-                 transfer->status, status, pipe->endpoint_addr);
+        /* Error class visibility (issue #37): the transfer status plus the HCD's channel
+           error (XCS_XACT, BNA, PKT_BBL, STALL), read before the transfer is freed. */
+        const char *detail = usb_host_transfer_error_detail(transfer);
+        if (req != NULL) {
+            req->error_detail = detail;
+        }
+        if (transfer->status == USB_TRANSFER_STATUS_CANCELED) {
+            ESP_LOGD(TAG, "transfer cancelled (ep=0x%02x)", pipe->endpoint_addr);
+        } else {
+            ESP_LOGW(TAG, "%s ep 0x%02x%s: transfer failed usb_status=%s errno=%d channel_error=%s",
+                     pipe->busid, pipe->endpoint_addr, pipe->is_control ? " (control)" : "",
+                     usb_status_name(transfer->status), status, detail);
+        }
     }
 
     /* Copy IN data on success. */
@@ -1906,6 +1932,7 @@ void usb_backend_submit(usb_backend_req_t *req)
 
     req->next = NULL;
     req->status = 0;
+    req->error_detail = NULL;
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     req->seq = s_state.next_seq++;
     if (s_state.waiting_tail != NULL) {
@@ -1954,4 +1981,55 @@ bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uin
 
     xSemaphoreGive(s_state.state_mutex);
     return false;
+}
+
+/* Diagnostics (issue #37): submit one control transfer through the same backend request
+   path as a forwarded EP0 request (usb_backend_submit -> admit -> prepare/round/submit ->
+   complete) and wait for its completion. The request and buffers stay on this stack until
+   done() has run; a transfer the device never answers is cancelled and waited for. */
+typedef struct {
+    SemaphoreHandle_t done;
+    int status;
+    size_t in_len;
+    const char *error_detail;
+} debug_ctrl_t;
+
+static void debug_ctrl_done(usb_backend_req_t *req, int status, size_t in_len)
+{
+    debug_ctrl_t *d = (debug_ctrl_t *)req->ctx;
+    d->status = status;
+    d->in_len = in_len;
+    d->error_detail = req->error_detail;
+    xSemaphoreGive(d->done);
+}
+
+int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *setup,
+                              uint8_t *in_buf, size_t in_capacity,
+                              size_t *in_len, const char **error_detail)
+{
+    debug_ctrl_t d = {0};
+    d.done = xSemaphoreCreateBinary();
+    if (d.done == NULL) {
+        return -ENOMEM;
+    }
+    usb_backend_req_t req;
+    memset(&req, 0, sizeof(req));
+    strlcpy(req.busid, busid, sizeof(req.busid));
+    req.endpoint_addr = 0;
+    req.setup = *setup;
+    req.in_data = in_buf;
+    req.in_capacity = in_capacity;
+    req.done = debug_ctrl_done;
+    req.ctx = &d;
+
+    usb_backend_submit(&req);
+    const TickType_t wait = pdMS_TO_TICKS(CONFIG_USBIP_CTRL_XFER_TIMEOUT_MS + USB_BACKEND_CANCEL_WAIT_MS + 2000);
+    if (xSemaphoreTake(d.done, wait) != pdTRUE) {
+        usb_backend_cancel(&req);
+        xSemaphoreTake(d.done, portMAX_DELAY);     /* done() always follows a cancel */
+    }
+    vSemaphoreDelete(d.done);
+    *in_len = d.in_len;
+    *error_detail = d.error_detail;
+    return d.status;
 }
