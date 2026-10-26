@@ -1686,6 +1686,16 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     sums.yields_done = -1;
     sums.cap_refusals = -1;
     sums.reserve_refusals = -1;
+    sums.rot_passes = -1;
+    sums.rej_not_bound = -1;
+    sums.rej_not_parked = -1;
+    sums.rej_pause = -1;
+    sums.rej_halt_wait = -1;
+    sums.rej_state = -1;
+    sums.rej_not_exec = -1;
+    sums.rej_urb_null = -1;
+    sums.rej_too_big = -1;
+    sums.halt_noop = -1;
     usb_host_parked_stats_t ps;
     if (usb_host_parked_stats(&ps) == ESP_OK) {
         sums.parked_bound = ps.parked_bound;
@@ -1695,6 +1705,16 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
         sums.yields_done = (int)ps.yields_done;
         sums.cap_refusals = (int)ps.cap_refusals;
         sums.reserve_refusals = (int)ps.reserve_refusals;
+        sums.rot_passes = (int)ps.rot_passes;
+        sums.rej_not_bound = (int)ps.rej_not_bound;
+        sums.rej_not_parked = (int)ps.rej_not_parked;
+        sums.rej_pause = (int)ps.rej_pause;
+        sums.rej_halt_wait = (int)ps.rej_halt_wait;
+        sums.rej_state = (int)ps.rej_state;
+        sums.rej_not_exec = (int)ps.rej_not_exec;
+        sums.rej_urb_null = (int)ps.rej_urb_null;
+        sums.rej_too_big = (int)ps.rej_too_big;
+        sums.halt_noop = (int)ps.halt_noop;
     }
 
     if (totals != NULL) {

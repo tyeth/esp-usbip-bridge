@@ -163,6 +163,16 @@ typedef struct {
     int yields_done;
     int cap_refusals;
     int reserve_refusals;
+    int rot_passes;
+    int rej_not_bound;
+    int rej_not_parked;
+    int rej_pause;
+    int rej_halt_wait;
+    int rej_state;
+    int rej_not_exec;
+    int rej_urb_null;
+    int rej_too_big;
+    int halt_noop;
 } usb_backend_claims_totals_t;
 
 size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,

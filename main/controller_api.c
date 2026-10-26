@@ -972,6 +972,16 @@ static api_result_t core_usb_claims(void)
         cJSON_AddNumberToObject(tt, "yields_done", totals.yields_done);
         cJSON_AddNumberToObject(tt, "cap_refusals", totals.cap_refusals);
         cJSON_AddNumberToObject(tt, "reserve_refusals", totals.reserve_refusals);
+        cJSON_AddNumberToObject(tt, "rot_passes", totals.rot_passes);
+        cJSON_AddNumberToObject(tt, "rej_not_bound", totals.rej_not_bound);
+        cJSON_AddNumberToObject(tt, "rej_not_parked", totals.rej_not_parked);
+        cJSON_AddNumberToObject(tt, "rej_pause", totals.rej_pause);
+        cJSON_AddNumberToObject(tt, "rej_halt_wait", totals.rej_halt_wait);
+        cJSON_AddNumberToObject(tt, "rej_state", totals.rej_state);
+        cJSON_AddNumberToObject(tt, "rej_not_exec", totals.rej_not_exec);
+        cJSON_AddNumberToObject(tt, "rej_urb_null", totals.rej_urb_null);
+        cJSON_AddNumberToObject(tt, "rej_too_big", totals.rej_too_big);
+        cJSON_AddNumberToObject(tt, "halt_noop", totals.halt_noop);
     }
     cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
