@@ -958,6 +958,11 @@ static api_result_t core_usb_claims(void)
            EP0/hub/host-stack pipes the estimate cannot see. */
         cJSON_AddNumberToObject(tt, "channels_in_use", totals.hcd_channels_allocated);
     }
+    if (totals.hcd_channel_waiters >= 0) {
+        /* Dynamic channel binding: CTRL/BULK pipes queued for a free channel
+           (their transfers run as soon as one frees, instead of failing). */
+        cJSON_AddNumberToObject(tt, "channels_waiting", totals.hcd_channel_waiters);
+    }
     cJSON_AddNumberToObject(tt, "connected_devices", totals.connected_devices);
     cJSON_AddNumberToObject(tt, "external_hubs", totals.external_hubs);
     cJSON_AddNumberToObject(tt, "claimed_interfaces", totals.claimed_interfaces);

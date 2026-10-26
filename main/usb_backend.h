@@ -152,6 +152,8 @@ typedef struct {
        -1 when the running host library does not provide it. */
     int hcd_channels_total;
     int hcd_channels_allocated;
+    /* Pipes queued for a free channel under dynamic binding; -1 unknown. */
+    int hcd_channel_waiters;
 } usb_backend_claims_totals_t;
 
 size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,

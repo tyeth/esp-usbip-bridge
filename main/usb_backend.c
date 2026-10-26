@@ -1667,11 +1667,16 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     /* The HCD's own ledger (issue #20's authoritative accounting). */
     sums.hcd_channels_total = -1;
     sums.hcd_channels_allocated = -1;
+    sums.hcd_channel_waiters = -1;
     int hcd_total = 0;
     int hcd_allocated = 0;
     if (usb_host_channel_stats(&hcd_total, &hcd_allocated) == ESP_OK) {
         sums.hcd_channels_total = hcd_total;
         sums.hcd_channels_allocated = hcd_allocated;
+    }
+    int hcd_waiters = 0;
+    if (usb_host_channel_waiters(&hcd_waiters) == ESP_OK) {
+        sums.hcd_channel_waiters = hcd_waiters;
     }
 
     if (totals != NULL) {
