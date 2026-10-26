@@ -516,6 +516,11 @@ static esp_err_t ensure_endpoint_interface_claimed_locked(int slot, uint8_t endp
         return err;
     }
     s_state.devices[slot].claimed_interfaces[num] = true;
+    /* DMA footprint probe (round 2k): the next telemetry run attributes DMA pool loss to claims. */
+    ESP_LOGW(TAG, "claimed interface %d (slot %d): dma_free=%u dma_largest=%u",
+             (int)num, slot,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     return ESP_OK;
 }
 
