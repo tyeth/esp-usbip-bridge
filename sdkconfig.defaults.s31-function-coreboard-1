@@ -71,3 +71,9 @@ CONFIG_LWIP_MAX_ACTIVE_TCP=64
 
 # Parked-listener rotation period (phase 2j): tick-only yields, paced at 100 ms.
 CONFIG_USB_HOST_PARKED_IN_ROTATE_MS=100
+
+# LwIP TCP send buffer (round 2l): 2 x MSS instead of the 4 x MSS default. The receive window
+# stays at 4 x MSS (5760). This caps the send data queued per connection at 2.9 KB instead of
+# 5.8 KB. USB FS moves ~1 MB/s and the bench RTT is sub-millisecond, so about 1 KB in flight
+# keeps the link full.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880

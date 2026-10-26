@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 
@@ -228,6 +229,20 @@ static size_t urb_buf_seg_len(const urb_buf_t *buf, size_t i)
     return (rest < URB_SEG_SIZE) ? rest : URB_SEG_SIZE;
 }
 
+/* Create a per-connection task with its stack in PSRAM when the external-stack
+   option is on, else (or if PSRAM is full) in internal RAM. Each connection's
+   stacks were the largest per-attach internal-RAM cost (8 KiB each). */
+static BaseType_t create_task_prefer_psram(TaskFunction_t fn, const char *name,
+                                           uint32_t stack, void *arg, UBaseType_t prio)
+{
+#if defined(CONFIG_SPIRAM) && defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM)
+    if (xTaskCreateWithCaps(fn, name, stack, arg, prio, NULL, MALLOC_CAP_SPIRAM) == pdPASS) {
+        return pdPASS;
+    }
+#endif
+    return xTaskCreate(fn, name, stack, arg, prio, NULL);
+}
+
 static void urb_buf_free(urb_buf_t *buf)
 {
     for (size_t i = 0; i < URB_MAX_SEGS; i++) {
@@ -237,12 +252,22 @@ static void urb_buf_free(urb_buf_t *buf)
     buf->len = 0;
 }
 
+/* Per-connection memory is kept out of internal RAM where it can be (round 2l): a
+   tasks' stacks and URB staging segments are CPU-copied (the USB DMA buffers are
+   separate and stay internal), so they may live in PSRAM. Falls back to the
+   internal heap when no PSRAM is present or it is full. */
+static void *urb_seg_malloc(size_t n)
+{
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    return (p != NULL) ? p : malloc(n);
+}
+
 static bool urb_buf_alloc(urb_buf_t *buf, size_t len)
 {
     memset(buf, 0, sizeof(*buf));
     buf->len = len;
     for (size_t i = 0; i < urb_buf_nsegs(buf); i++) {
-        buf->seg[i] = malloc(urb_buf_seg_len(buf, i));
+        buf->seg[i] = urb_seg_malloc(urb_buf_seg_len(buf, i));
         if (buf->seg[i] == NULL) {
             ESP_LOGE(TAG, "URB segment alloc failed: %u bytes (urb %u bytes, segment %u of %u)",
                      (unsigned)urb_buf_seg_len(buf, i), (unsigned)len, (unsigned)i, (unsigned)urb_buf_nsegs(buf));
@@ -669,9 +694,9 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         urb_stream_ctx_free(ctx);
         return false;
     }
-    if (xTaskCreate(urb_writer_task, "urb_wr",
-                    CONFIG_USBIP_SERVER_TASK_STACK, ctx,
-                    CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
+    if (create_task_prefer_psram(urb_writer_task, "urb_wr",
+                                 CONFIG_USBIP_SERVER_TASK_STACK, ctx,
+                                 CONFIG_USBIP_SERVER_TASK_PRIORITY) != pdPASS) {
         urb_stream_ctx_free(ctx);
         return false;
     }
@@ -1101,9 +1126,9 @@ static void usbip_server_task(void *arg)
         }
         ctx->fd = client_fd;
 
-        if (xTaskCreate(client_task, "usbip_client",
-                        CONFIG_USBIP_SERVER_TASK_STACK, ctx,
-                        CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
+        if (create_task_prefer_psram(client_task, "usbip_client",
+                                     CONFIG_USBIP_SERVER_TASK_STACK, ctx,
+                                     CONFIG_USBIP_SERVER_TASK_PRIORITY) != pdPASS) {
             ESP_LOGD(TAG, "Failed to create client task");
             free(ctx);
             close(client_fd);
