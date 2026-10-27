@@ -1786,6 +1786,7 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     }
     /* Parked-listener and rotation counters (phase 2f). */
     sums.parked_bound = -1;
+    sums.parked_intr_bound = -1;
     sums.rotor_active = -1;
     sums.promotions = -1;
     sums.yields_req = -1;
@@ -1805,6 +1806,7 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     usb_host_parked_stats_t ps;
     if (usb_host_parked_stats(&ps) == ESP_OK) {
         sums.parked_bound = ps.parked_bound;
+        sums.parked_intr_bound = ps.parked_intr_bound;
         sums.rotor_active = ps.rotor_active ? 1 : 0;
         sums.promotions = (int)ps.promotions;
         sums.yields_req = (int)ps.yields_req;

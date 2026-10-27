@@ -77,3 +77,7 @@ CONFIG_USB_HOST_PARKED_IN_ROTATE_MS=100
 # 5.8 KB. USB FS moves ~1 MB/s and the bench RTT is sub-millisecond, so about 1 KB in flight
 # keeps the link full.
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+
+# Phase 3: parked interrupt listeners (cdc-acm notification endpoints, hub status pipes) bind
+# channels on demand, capped at 4 (bench opt-in; 0 keeps every interrupt channel static).
+CONFIG_USB_HOST_PARKED_INTR_BIND_CAP=4

@@ -1196,6 +1196,7 @@ static api_result_t core_usb_claims(void)
     /* Parked-listener and rotation counters (short flat keys, phase 2f/2g). */
     if (totals.parked_bound >= 0) {
         cJSON_AddNumberToObject(tt, "parked_bound", totals.parked_bound);
+        cJSON_AddNumberToObject(tt, "parked_intr_bound", totals.parked_intr_bound);
         cJSON_AddBoolToObject(tt, "rotor_active", totals.rotor_active == 1);
         cJSON_AddNumberToObject(tt, "promotions", totals.promotions);
         cJSON_AddNumberToObject(tt, "yields_req", totals.yields_req);

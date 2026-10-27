@@ -178,6 +178,7 @@ typedef struct {
     /* Parked bulk IN listener and rotation counters (usb_host_parked_stats());
        every field is -1 when unknown. rotor_active is 0/1. */
     int parked_bound;
+    int parked_intr_bound;          /* parked interrupt listeners holding channels (phase 3) */
     int rotor_active;
     int promotions;
     int yields_req;
