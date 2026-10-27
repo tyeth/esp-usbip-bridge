@@ -1,6 +1,7 @@
 #include "controller_api.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -956,6 +957,71 @@ static api_result_t core_enum_events(void)
     return result(200, j);
 }
 
+/* GET /api/ports/hwstatus: hub-class GetPortStatus for every downstream port of every hub the
+   bridge manages, issued to the hub itself. hw_mismatch is set when the bridge's claimed power
+   state for the port differs from the hub's reported power bit. */
+static api_result_t core_port_hwstatus(void)
+{
+    hub_ctl_hub_status_t *snap = malloc(USB_BACKEND_MAX_HUBS * sizeof(*snap));
+    if (snap == NULL) {
+        return fail(503, "out of memory");
+    }
+    const size_t nh = hub_ctl_snapshot(snap, USB_BACKEND_MAX_HUBS);
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "ports");
+    size_t mismatches = 0;
+    for (size_t h = 0; h < nh; h++) {
+        for (uint8_t p = 0; p < snap[h].num_ports && p < HUB_CTL_MAX_PORTS; p++) {
+            const hub_ctl_port_t *ps = &snap[h].ports[p];
+            usb_setup_packet_t setup;
+            memset(&setup, 0, sizeof(setup));
+            setup.bmRequestType = 0xA3;             /* device-to-host | class | other */
+            setup.bRequest = 0;                     /* GET_STATUS */
+            setup.wIndex = ps->port;
+            setup.wLength = 4;
+            uint8_t buf[4] = {0};
+            size_t len = 0;
+            const char *cls = "none";
+            const esp_err_t err = usb_backend_hub_control(snap[h].hub.addr, &setup, buf, sizeof(buf), &len, &cls);
+            cJSON *e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "hub", snap[h].hub.path);
+            cJSON_AddNumberToObject(e, "port", ps->port);
+            cJSON_AddStringToObject(e, "path", ps->path);
+            cJSON_AddBoolToObject(e, "claimed_power", ps->powered);
+            if (err == ESP_OK && len >= 4) {
+                const uint16_t st = (uint16_t)(buf[0] | (buf[1] << 8));
+                const uint16_t ch = (uint16_t)(buf[2] | (buf[3] << 8));
+                const bool hw_power = (st & 0x0100) != 0;
+                cJSON_AddStringToObject(e, "status_hex", "");
+                char hx[8];
+                snprintf(hx, sizeof(hx), "0x%04x", st);
+                cJSON_ReplaceItemInObject(e, "status_hex", cJSON_CreateString(hx));
+                snprintf(hx, sizeof(hx), "0x%04x", ch);
+                cJSON_AddStringToObject(e, "change_hex", hx);
+                cJSON_AddBoolToObject(e, "connected", (st & 0x0001) != 0);
+                cJSON_AddBoolToObject(e, "enabled", (st & 0x0002) != 0);
+                cJSON_AddBoolToObject(e, "suspended", (st & 0x0004) != 0);
+                cJSON_AddBoolToObject(e, "over_current", (st & 0x0008) != 0);
+                cJSON_AddBoolToObject(e, "power_hw", hw_power);
+                cJSON_AddBoolToObject(e, "high_speed", (st & 0x0400) != 0);
+                cJSON_AddBoolToObject(e, "low_speed", (st & 0x0200) != 0);
+                const bool mismatch = (ps->powered != hw_power);
+                cJSON_AddBoolToObject(e, "hw_mismatch", mismatch);
+                mismatches += mismatch ? 1 : 0;
+            } else {
+                ESP_LOGW(TAG, "hwstatus: GetPortStatus %s port %u failed: %s (%s)",
+                         snap[h].hub.path, (unsigned)ps->port, cls, esp_err_to_name(err));
+                cJSON_AddStringToObject(e, "error", cls);
+                cJSON_AddStringToObject(e, "error_name", esp_err_to_name(err));
+            }
+            cJSON_AddItemToArray(arr, e);
+        }
+    }
+    cJSON_AddNumberToObject(j, "hw_mismatches", (double)mismatches);
+    free(snap);
+    return result(200, j);
+}
+
 /* POST /api/usb/debug_ctrl (issue #37): one control transfer through the forwarded-EP0
    backend path, no usbip in the loop. Body: busid, bm, breq, wvalue, windex, wlength. */
 static api_result_t core_debug_ctrl(const cJSON *json)
@@ -1012,7 +1078,16 @@ static api_result_t core_debug_ctrl(const cJSON *json)
     }
     size_t in_len = 0;
     const char *detail = "none";
-    const int status = usb_backend_debug_control(bus, &setup, in_buf, (size_t)wlength, &in_len, &detail);
+    int status = 0;
+    uint8_t hub_addr = 0;
+    usbip_backend_device_t probe;
+    if (!usb_backend_get_device_by_busid(bus, &probe) && usb_backend_hub_addr_by_path(bus, &hub_addr)) {
+        /* A managed hub: control transfers only (this request is always ep 0) */
+        const esp_err_t herr = usb_backend_hub_control(hub_addr, &setup, in_buf, (size_t)wlength, &in_len, &detail);
+        status = (herr == ESP_OK) ? 0 : -EIO;
+    } else {
+        status = usb_backend_debug_control(bus, &setup, in_buf, (size_t)wlength, &in_len, &detail);
+    }
 
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "status", status);
@@ -1362,6 +1437,7 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
     { "POST", "/api/usb/debug_dump_enum",           true,  "Arm the EPDUMP register dump for address 0, power-cycle the port so it re-enumerates, and dump the enumeration's first control reads to the console (diagnostics, issue #37)", "{\"busid\":str,\"all\":bool,\"count\":int(1-64, default 16)}" },
     { "POST", "/api/usb/debug_ctrl",                true,  "Submit one control transfer to a connected device through the same backend path as a forwarded usbip EP0 request (diagnostics, issue #37). OUT requests must have wlength 0", "{\"busid\":str,\"bm\":int,\"breq\":int,\"wvalue\":int,\"windex\":int,\"wlength\":int,\"dump\":bool,\"count\":int(1-64, default 4)}" },
+    { "GET",  "/api/ports/hwstatus",                false, "Hardware-true hub port status: a real hub-class GetPortStatus to every downstream port of every managed hub, decoded (power, connection, enable, over-current), with the bridge's claimed power and hw_mismatch", NULL },
     { "GET",  "/api/ports/events",                  false, "Port state transition log, newest first: power, connection, enable and over-current changes with attribution (api = commanded here, via restore for the saved-state policy; device = replug or drop; external = power changed without a command, e.g. a hand-toggled switch) and mismatch, plus external_power_changes and device_replugs counters since boot", NULL },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
@@ -1836,6 +1912,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = result(err == ESP_OK ? 200 : 503, j);
     } else if (path_is(path, "/api/ports/events") && is_method(method, "GET")) {
         r = core_port_events();
+    } else if (path_is(path, "/api/ports/hwstatus") && is_method(method, "GET")) {
+        r = core_port_hwstatus();
     } else if (path_is(path, "/api/ports")) {
         r = core_ports();
     } else if (path_is(path, "/api/ports/off") && is_method(method, "POST")) {

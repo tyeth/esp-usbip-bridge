@@ -2038,3 +2038,98 @@ void usb_backend_arm_ep0_dump(int dev_addr, int count)
 {
     (void)usb_host_debug_arm_ep0_dump((uint8_t)dev_addr, count);
 }
+
+/* Hub-class control (issue: hardware-true hub port status). A hub is not exported, so it has
+   no entry in the export table; its handle is opened from the host library for the duration
+   of the request and closed afterwards. */
+static void hub_ctl_done_cb(usb_transfer_t *transfer)
+{
+    xSemaphoreGive((SemaphoreHandle_t)transfer->context);
+}
+
+esp_err_t usb_backend_hub_control(uint8_t hub_addr, const usb_setup_packet_t *setup,
+                                  uint8_t *in_buf, size_t in_capacity,
+                                  size_t *in_len, const char **err_class)
+{
+    *in_len = 0;
+    *err_class = "none";
+    usb_device_handle_t dev = NULL;
+    esp_err_t err = usb_host_device_open(s_state.client_hdl, hub_addr, &dev);
+    if (err != ESP_OK) {
+        *err_class = "open";
+        return err;
+    }
+    const uint16_t mps0 = ep0_mps_for(dev, NULL);
+    const bool is_in = (setup->bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
+    const size_t data_len = is_in ? setup->wLength : 0;
+    const size_t rounded = (data_len > 0) ? ((data_len + mps0 - 1) / mps0) * mps0 : 0;
+    usb_transfer_t *t = NULL;
+    err = usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE + rounded, 0, &t);
+    if (err != ESP_OK || t == NULL) {
+        *err_class = "alloc";
+        usb_host_device_close(s_state.client_hdl, dev);
+        return ESP_ERR_NO_MEM;
+    }
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (done == NULL) {
+        *err_class = "alloc";
+        usb_host_transfer_free(t);
+        usb_host_device_close(s_state.client_hdl, dev);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(t->data_buffer, setup, USB_SETUP_PACKET_SIZE);
+    t->device_handle = dev;
+    t->bEndpointAddress = 0;
+    t->num_bytes = USB_SETUP_PACKET_SIZE + rounded;
+    t->callback = hub_ctl_done_cb;
+    t->context = done;
+    t->timeout_ms = 0;
+    err = usb_host_transfer_submit_control(s_state.client_hdl, t);
+    if (err != ESP_OK) {
+        *err_class = "submit";
+        vSemaphoreDelete(done);
+        usb_host_transfer_free(t);
+        usb_host_device_close(s_state.client_hdl, dev);
+        return err;
+    }
+    if (xSemaphoreTake(done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        /* Retire it; the transfer must not be freed while the host still owns it. */
+        *err_class = "timeout";
+        usb_host_transfer_cancel_control(s_state.client_hdl, t);
+        xSemaphoreTake(done, portMAX_DELAY);
+    }
+    if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
+        size_t n = (t->actual_num_bytes > USB_SETUP_PACKET_SIZE) ? (t->actual_num_bytes - USB_SETUP_PACKET_SIZE) : 0;
+        if (n > in_capacity) {
+            n = in_capacity;
+        }
+        if (n > 0 && in_buf != NULL) {
+            memcpy(in_buf, t->data_buffer + USB_SETUP_PACKET_SIZE, n);
+        }
+        *in_len = n;
+        err = ESP_OK;
+    } else {
+        *err_class = usb_status_name(t->status);
+        err = ESP_FAIL;
+    }
+    vSemaphoreDelete(done);
+    usb_host_transfer_free(t);
+    usb_host_device_close(s_state.client_hdl, dev);
+    return err;
+}
+
+bool usb_backend_hub_addr_by_path(const char path[32], uint8_t *addr)
+{
+    usb_backend_hub_t hubs[USB_BACKEND_MAX_HUBS];
+    const size_t n = usb_backend_get_hubs(hubs, USB_BACKEND_MAX_HUBS);
+    for (size_t i = 0; i < n; i++) {
+        if (strncmp(hubs[i].path, path, sizeof(hubs[i].path)) == 0) {
+            if (addr != NULL) {
+                *addr = hubs[i].addr;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+

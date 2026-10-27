@@ -132,6 +132,16 @@ void usb_backend_session_ended(const char busid[32]);
 /* Snapshot of the external hubs currently attached. */
 size_t usb_backend_get_hubs(usb_backend_hub_t *out_hubs, size_t max_hubs);
 
+/* A control transfer to a hub that the bridge manages locally (not exported): the hub's own
+   default pipe through the host library, waited for. Setup/data are as on the wire. Returns
+   ESP_OK with the data stage in in_buf (in_len bytes), or an error with err_class naming
+   the failing step (open, submit, timeout, or the transfer status). */
+esp_err_t usb_backend_hub_control(uint8_t hub_addr, const usb_setup_packet_t *setup,
+                                  uint8_t *in_buf, size_t in_capacity,
+                                  size_t *in_len, const char **err_class);
+/* The hub-driver record whose port path is `path` (e.g. "1-1.3"). */
+bool usb_backend_hub_addr_by_path(const char path[32], uint8_t *addr);
+
 /* Claim accounting: which interfaces and endpoints each connected device
    holds (each claimed endpoint pins one DWC host channel; each connected
    device also holds one EP0 channel, and each external hub one interrupt
