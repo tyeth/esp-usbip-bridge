@@ -44,6 +44,13 @@ typedef struct {
     uint32_t cmds, slow_ms;     /* SCSI commands since open, and the slowest one */
     uint8_t slow_op;
     int slow_rc;
+    int inquiry_rc;
+    /* The last failed command: opcode, LBA, sectors, phase (cbw/data/csw), bytes into the data phase, errno. */
+    uint8_t fail_op;
+    uint32_t fail_lba, fail_count, fail_done;
+    const char *fail_phase;
+    int fail_rc;
+    uint32_t ms_unmount;        /* the last unmount, for the next caller's log */
 } msc_dev_t;
 
 static msc_dev_t s_dev;
@@ -109,6 +116,15 @@ static int bot(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *data,
     const int64_t t0 = esp_timer_get_time();
     const int rc = bot_once(d, cdb, cdb_len, data, len, in);
     const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    if (rc != 0) {
+        d->fail_op = cdb[0];
+        d->fail_rc = rc;
+        d->fail_lba = cdb_len >= 10 ? ((uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 | (uint32_t)cdb[4] << 8 | cdb[5]) : 0;
+        d->fail_count = cdb_len >= 10 ? ((uint32_t)cdb[7] << 8 | cdb[8]) : 0;
+        ESP_LOGW(TAG, "%s: SCSI 0x%02x lba %lu x%lu failed in %s after %lu bytes: %d (%lu ms)", d->busid, cdb[0],
+                 (unsigned long)d->fail_lba, (unsigned long)d->fail_count, d->fail_phase, (unsigned long)d->fail_done,
+                 rc, (unsigned long)ms);
+    }
     d->cmds++;
     if (ms >= d->slow_ms) {
         d->slow_ms = ms;
@@ -123,6 +139,8 @@ static int bot_once(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *
     uint8_t cbw[31];
     const uint32_t tag = ++d->tag;
     rescue_msc_cbw(tag, len, in, d->lun, cdb, cdb_len, cbw);
+    d->fail_phase = "cbw";
+    d->fail_done = 0;
     int rc = usb_backend_transfer_sync(d->busid, d->ep_out, NULL, cbw, sizeof(cbw), NULL, 0, MSC_TIMEOUT_MS, NULL, NULL);
     if (rc != 0) {
         d->last_err = rc;
@@ -132,7 +150,9 @@ static int bot_once(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *
         return rc;
     }
     uint32_t done = 0;
+    d->fail_phase = "data";
     while (done < len) {
+        d->fail_done = done;
         const uint32_t n = (len - done) > MSC_XFER_MAX ? MSC_XFER_MAX : len - done;
         size_t got = 0;
         rc = in ? usb_backend_transfer_sync(d->busid, d->ep_in, NULL, NULL, 0, data + done, n, MSC_TIMEOUT_MS, &got, NULL)
@@ -155,6 +175,7 @@ static int bot_once(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *
     }
     uint8_t csw[64];
     size_t got = 0;
+    d->fail_phase = "csw";
     for (int attempt = 0; attempt < 2; attempt++) {
         rc = usb_backend_transfer_sync(d->busid, d->ep_in, NULL, NULL, 0, csw, sizeof(csw), MSC_TIMEOUT_MS, &got, NULL);
         if (rc != -EPIPE) {
@@ -183,7 +204,9 @@ static int scsi_simple(msc_dev_t *d, uint8_t op, uint8_t alloc, uint8_t *data, b
 /* Find the mass storage interface and get the medium ready. */
 static int msc_open(msc_dev_t *d, const char *busid, char *msg, size_t msg_len)
 {
+    const uint32_t ms_unmount = d->ms_unmount;
     memset(d, 0, sizeof(*d));
+    d->ms_unmount = ms_unmount;
     strlcpy(d->busid, busid, sizeof(d->busid));
     usbip_backend_device_t dev;
     if (!usb_backend_get_device_by_busid(d->busid, &dev)) {
@@ -213,9 +236,16 @@ static int msc_open(msc_dev_t *d, const char *busid, char *msg, size_t msg_len)
         snprintf(msg, msg_len, "no mass storage (SCSI, bulk-only) interface on this device");
         return 409;
     }
+    /* Start both bulk toggles at DATA0.  The previous session's release
+       freed the host pipes, so this claim starts them at DATA0, while the
+       device's toggles carry on from that session: after an odd number of
+       packets its first CSW looked like a retransmission and the command
+       timed out (5 s) before the reset recovery resynchronised them. */
+    clear_halt(d, d->ep_in);
+    clear_halt(d, d->ep_out);
     uint8_t buf[36];
     int64_t ts = esp_timer_get_time();
-    if (scsi_simple(d, 0x12, 36, buf, true) == 0) {              /* INQUIRY */
+    if ((d->inquiry_rc = scsi_simple(d, 0x12, 36, buf, true)) == 0) {     /* INQUIRY */
         memcpy(d->vendor, &buf[8], 8);
         memcpy(d->product, &buf[16], 16);
         memcpy(d->revision, &buf[32], 4);
@@ -366,6 +396,7 @@ static int mount(const char *busid, mount_t *m, char *msg, size_t msg_len)
 
 static void unmount(mount_t *m)
 {
+    const int64_t t0 = esp_timer_get_time();
     if (m->fs != NULL) {
         f_mount(NULL, m->drive, 0);
         heap_caps_free(m->fs);
@@ -378,6 +409,7 @@ static void unmount(mount_t *m)
         usb_backend_session_ended(s_dev.busid);    /* release the claimed interface */
     }
     s_dev.open = false;
+    s_dev.ms_unmount = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 }
 
 static const char *fr_name(FRESULT fr)
@@ -642,18 +674,86 @@ int msc_mkdir(const char *busid, const cJSON *args, cJSON **out)
 
 /* A UF2 bootloader's drive has INFO_UF2.TXT; an app's drive (CIRCUITPY,
    WIPPER) does not, and a UF2 copied there would just sit in a file. */
-static bool volume_is_uf2_bootloader(const char *busid)
+static void log_open(rescue_job_t *job, const char *what)
+{
+    rescue_job_log(job, "%s: INQUIRY %d ms (rc %d), ready %u ms, capacity %u ms, f_mount %u ms; last unmount %u ms",
+                   what, (int)s_dev.ms_inquiry, s_dev.inquiry_rc, (unsigned)s_dev.ms_ready, (unsigned)s_dev.ms_capacity,
+                   (unsigned)s_dev.ms_mount, (unsigned)s_dev.ms_unmount);
+}
+
+static bool volume_is_uf2_bootloader(rescue_job_t *job, const char *busid)
 {
     lock();
     mount_t m = {0};
     char msg[128];
     char p[32];
     FILINFO fi;
-    const bool yes = mount(busid, &m, msg, sizeof(msg)) == 0 && make_path(&m, "/INFO_UF2.TXT", p, sizeof(p)) &&
-                     f_stat(p, &fi) == FR_OK;
+    const bool mounted = mount(busid, &m, msg, sizeof(msg)) == 0;
+    log_open(job, "checking for INFO_UF2.TXT");
+    const int64_t t0 = esp_timer_get_time();
+    const bool yes = mounted && make_path(&m, "/INFO_UF2.TXT", p, sizeof(p)) && f_stat(p, &fi) == FR_OK;
+    const uint32_t ms_stat = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     unmount(&m);
     unlock();
+    rescue_job_log(job, "f_stat %u ms, unmount %u ms", (unsigned)ms_stat, (unsigned)s_dev.ms_unmount);
     return yes;
+}
+
+/* A UF2 bootloader takes UF2 blocks written to any sector and keeps no FAT
+   of its own: the FAT it shows is synthetic, so FatFS loses a large file's
+   cluster chain as soon as it re-reads the FAT (TinyUF2: failed after ~120 KB).
+   Write the blocks straight into the data area, near the end of the volume,
+   in WRITE(10)s of up to MSC_CMD_SECTORS_MAX sectors. */
+static int write_uf2_raw(rescue_job_t *job, const mount_t *m, const char *busid, const uint8_t *data, size_t len,
+                         uint32_t devnum)
+{
+    const uint32_t nblocks = (uint32_t)(len / RESCUE_UF2_BLOCK);
+    uint32_t start = (uint32_t)m->fs->database;
+    if (s_dev.block_count > nblocks + 1 && s_dev.block_count - nblocks - 1 > start) {
+        start = s_dev.block_count - nblocks - 1;
+    }
+    rescue_job_log(job, "writing %u UF2 blocks straight to sectors %lu-%lu of %s %s (its FAT is synthetic)",
+                   (unsigned)nblocks, (unsigned long)start, (unsigned long)(start + nblocks - 1),
+                   s_dev.vendor, s_dev.product);
+    const int64_t t0 = esp_timer_get_time();
+    uint32_t done = 0;
+    bool dropped = false;
+    while (done < nblocks) {
+        if (rescue_job_cancelled(job)) {
+            return rescue_job_fail(job, "cancelled after %u of %u blocks", (unsigned)done, (unsigned)nblocks);
+        }
+        const uint32_t n = (nblocks - done) > MSC_CMD_SECTORS_MAX ? MSC_CMD_SECTORS_MAX : nblocks - done;
+        uint8_t cdb[10];
+        rescue_scsi_rw10(0x2A, start + done, (uint16_t)n, cdb);
+        const int rc = bot(&s_dev, cdb, 10, (uint8_t *)data + (size_t)done * RESCUE_UF2_BLOCK, n * RESCUE_UF2_BLOCK, false);
+        if (rc != 0) {
+            /* The bootloader may reboot on the last block, before the CSW. */
+            usbip_backend_device_t now;
+            if (done + n >= nblocks) {
+                device_rescue_wait_reenumeration(busid, devnum, 3000, &now, &dropped);
+            }
+            if (!dropped) {
+                return rescue_job_fail(job, "WRITE(10) at sector %lu failed after %u of %u blocks: %s",
+                                       (unsigned long)(start + done), (unsigned)done, (unsigned)nblocks,
+                                       serial_link_errno_name(rc));
+            }
+        }
+        done += n;
+        rescue_job_progress(job, 5 + (int)(90ull * done / nblocks), "copying");
+    }
+    const double secs = (double)(esp_timer_get_time() - t0) / 1e6;
+    if (!dropped) {
+        usbip_backend_device_t now;
+        device_rescue_wait_reenumeration(busid, devnum, 3000, &now, &dropped);
+    }
+    rescue_job_log(job, "%u blocks written in %.1f s%s", (unsigned)nblocks, secs,
+                   dropped ? "; the bootloader rebooted the board (flashed)" : "; the board has not rebooted (yet)");
+    cJSON *res = rescue_job_result(job);
+    cJSON_AddStringToObject(res, "path", "(raw sectors)");
+    cJSON_AddNumberToObject(res, "bytes", (double)len);
+    cJSON_AddBoolToObject(res, "device_rebooted", dropped);
+    cJSON_AddNumberToObject(res, "seconds", secs);
+    return 0;
 }
 
 static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, bool uf2)
@@ -695,7 +795,7 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
                 has_msc |= cfg.ifaces[i].cls == 0x08;
             }
             bool in_bootloader = has_msc;
-            if (has_msc && !volume_is_uf2_bootloader(busid)) {
+            if (has_msc && !volume_is_uf2_bootloader(job, busid)) {
                 rescue_job_log(job, "its drive is not a UF2 bootloader (no INFO_UF2.TXT)");
                 in_bootloader = false;
             }
@@ -746,11 +846,19 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
     char msg[128] = "";
     rescue_job_progress(job, 5, "mounting");
     int st = mount(busid, &m, msg, sizeof(msg));
+    log_open(job, "mounted");
     int rc = 0;
     if (st != 0) {
         rc = rescue_job_fail(job, "%s", msg);
     }
     const uint32_t devnum = s_dev.devnum;
+    if (rc == 0 && uf2 && s_dev.block_size == RESCUE_UF2_BLOCK && !cJSON_IsString(path)) {
+        rc = write_uf2_raw(job, &m, busid, data, len, devnum);
+        unmount(&m);
+        unlock();
+        blob_release(file->valuestring);
+        return rc;
+    }
     size_t written = 0;
     FIL *f = rc == 0 ? heap_caps_calloc(1, sizeof(FIL), MALLOC_CAP_DEFAULT) : NULL;
     char p[MSC_PATH_MAX];
@@ -799,8 +907,10 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
             cJSON_AddBoolToObject(res, "device_rebooted", dropped);
             cJSON_AddNumberToObject(res, "seconds", secs);
         } else {
-            rc = rescue_job_fail(job, "write failed after %u of %u bytes: %s (%s)", (unsigned)written, (unsigned)len,
-                                 fr_name(fc), serial_link_errno_name(s_dev.last_err));
+            rc = rescue_job_fail(job, "write failed after %u of %u bytes: %s (%s; SCSI 0x%02x lba %lu x%lu, %s phase after %lu bytes)",
+                                 (unsigned)written, (unsigned)len, fr_name(fc), serial_link_errno_name(s_dev.last_err),
+                                 s_dev.fail_op, (unsigned long)s_dev.fail_lba, (unsigned long)s_dev.fail_count,
+                                 s_dev.fail_phase ? s_dev.fail_phase : "?", (unsigned long)s_dev.fail_done);
         }
     }
     heap_caps_free(f);

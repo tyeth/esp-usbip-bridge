@@ -154,6 +154,10 @@ static int pb_begin(pb_t *p)
     if (ctrl(p, 0x41, 0x41, (uint16_t)p->caps.picoboot_if, NULL, 0) != 0) {
         return rescue_job_fail(p->job, "PICOBOOT interface reset failed");
     }
+    /* Bulk toggles to DATA0 on both sides: a new claim starts the host's at
+       DATA0, the device's continue from the last session. */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_in, NULL, 0);    /* CLEAR_FEATURE(ENDPOINT_HALT) */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_out, NULL, 0);
     uint8_t cmd[32];
     const uint8_t excl = 1;     /* EXCLUSIVE: the bootrom's mass storage goes away meanwhile */
     rescue_picoboot_cmd(RESCUE_PC_EXCLUSIVE_ACCESS, ++p->token, &excl, 1, 0, cmd);

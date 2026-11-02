@@ -24,7 +24,10 @@ extern "C" {
 #define MD5_SIZE_STUB 16
 
 // Maximum block sized for RAM and Flash writes, respectively.
-#define ESP_RAM_BLOCK 0x1800
+// esp-usbip-bridge: 0x800 (esptool's USB_RAM_BLOCK) instead of 0x1800: the
+// ESP32-S2/S3 ROM's USB-OTG download mode drops larger MEM_DATA blocks, and
+// the bridge cannot tell USB-OTG from a UART bridge before it uploads the stub.
+#define ESP_RAM_BLOCK 0x800
 
 #ifndef MAX
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))

@@ -385,7 +385,7 @@ capture is reading, so the freshly flashed board's first boot is recorded.
 | POST | `picoboot/info` | enter BOOTSEL and report the chip |
 | POST | `flash/samba` | bossac: `{"file": <.bin>, "offset": "0x2000" (default: 0x2000 SAMD21, 0x4000 SAMD51), "erase": true, "verify": true, "reset": true}` for SAM-BA bootloaders with the Arduino X/Y/Z extensions (Arduino and Adafruit SAMD bootloaders); 1200-baud touch first when the app is running; CRC16 verify per 4 KB |
 | POST | `samba/info` | bootloader version, chip, flash geometry |
-| POST | `flash/uf2` | copy a UF2 to the device's UF2 bootloader drive (`{"file", "path": "/FIRMWARE.UF2"}`); enters the bootloader first (RP2 reset interface or 1200-baud touch) when the device has no drive or its drive is an app's (no `INFO_UF2.TXT`: CIRCUITPY, WIPPER), and fails rather than copy onto an app's drive when `"enter_bootloader": false`; the bootloader rebooting after the last block counts as success |
+| POST | `flash/uf2` | write a UF2 to the device's UF2 bootloader drive (`{"file", "path"?}`): the blocks go straight to sectors near the end of the volume with WRITE(10), as a host's cache would send them (a UF2 bootloader's FAT is synthetic, so a file system copy of a large image loses its cluster chain); with `path` it is copied as a file instead; enters the bootloader first (RP2 reset interface or 1200-baud touch) when the device has no drive or its drive is an app's (no `INFO_UF2.TXT`: CIRCUITPY, WIPPER), and fails rather than copy onto an app's drive when `"enter_bootloader": false`; the bootloader rebooting after the last block counts as success |
 
 Erasing (old firmware, NVS secrets, file systems): `erase_all` on `flash/esp`
 erases the whole chip; on `flash/picoboot` it needs the board's `flash_size`
