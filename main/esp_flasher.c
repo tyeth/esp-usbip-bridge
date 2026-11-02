@@ -302,12 +302,15 @@ static const char *loader_err(esp_loader_error_t e)
  *  Connect
  * ======================================================================== */
 
-typedef struct {
+struct espf {
     bridge_port_t port;
     serial_link_t link;
     esp_loader_t loader;
     bool stub;
-} espf_t;
+    uint32_t flash_size;
+    const char *chip;
+    uint8_t *block;             /* esp_flasher_write: one write block (the loader pads it) */
+};
 
 static uint32_t parse_u32(const cJSON *v, bool *ok)
 {
@@ -385,6 +388,7 @@ static int espf_connect(espf_t *f, rescue_job_t *job, const char *busid, const c
         return rescue_job_fail(job, "could not connect to the ESP bootloader: %s", loader_err(err));
     }
     const target_chip_t chip = esp_loader_get_target(&f->loader);
+    f->chip = chip_name(chip);
     rescue_job_log(job, "connected: %s (%s)", chip_name(chip), f->stub ? "flasher stub" : "ROM loader");
     if (f->link.caps.esp_usb_jtag) {
         disable_watchdogs(&f->loader, job);
@@ -401,6 +405,7 @@ static int espf_connect(espf_t *f, rescue_job_t *job, const char *busid, const c
     }
     uint32_t flash_size = 0;
     if (esp_loader_flash_detect_size(&f->loader, &flash_size) == ESP_LOADER_SUCCESS) {
+        f->flash_size = flash_size;
         cJSON_AddNumberToObject(res, "flash_size", flash_size);
         rescue_job_log(job, "flash size %lu MB", (unsigned long)(flash_size >> 20));
     }
@@ -665,4 +670,89 @@ int esp_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args)
         blob_release(images[i].file);
     }
     return rc;
+}
+
+/* ===========================================================================
+ *  A connection for the DUT flash browser
+ * ======================================================================== */
+
+espf_t *esp_flasher_open(rescue_job_t *job, const char *busid, const cJSON *args, bool *encrypted)
+{
+    espf_t *f = heap_caps_calloc(1, sizeof(*f), MALLOC_CAP_DEFAULT);
+    if (f == NULL) {
+        rescue_job_fail(job, "out of memory");
+        return NULL;
+    }
+    f->block = heap_caps_malloc(ESPF_STUB_BLOCK, MALLOC_CAP_DEFAULT);
+    if (f->block == NULL || espf_connect(f, job, busid, args) != 0) {
+        if (f->block == NULL) {
+            rescue_job_fail(job, "out of memory");
+        }
+        serial_link_close(&f->link);
+        heap_caps_free(f->block);
+        heap_caps_free(f);
+        return NULL;
+    }
+    if (f->flash_size == 0) {
+        rescue_job_fail(job, "could not detect the flash size");
+        serial_link_close(&f->link);
+        heap_caps_free(f->block);
+        heap_caps_free(f);
+        return NULL;
+    }
+    esp_loader_target_security_info_t si;
+    *encrypted = esp_loader_get_security_info(&f->loader, &si) == ESP_LOADER_SUCCESS && si.flash_encryption_enabled;
+    if (!f->stub) {
+        rescue_job_log(job, "no flasher stub: reads go 64 bytes per command (slow)");
+    }
+    return f;
+}
+
+uint32_t esp_flasher_flash_size(const espf_t *f)
+{
+    return f->flash_size;
+}
+
+const char *esp_flasher_chip(const espf_t *f)
+{
+    return f->chip;
+}
+
+int esp_flasher_read(espf_t *f, uint32_t addr, uint8_t *buf, uint32_t len)
+{
+    const esp_loader_error_t e = esp_loader_flash_read(&f->loader, buf, addr, len);
+    return e == ESP_LOADER_SUCCESS ? 0 : -1;
+}
+
+int esp_flasher_write(espf_t *f, rescue_job_t *job, uint32_t addr, const uint8_t *buf, uint32_t len)
+{
+    const uint32_t block = f->stub ? ESPF_STUB_BLOCK : ESPF_ROM_BLOCK;
+    esp_loader_flash_cfg_t cfg = { .offset = addr, .image_size = len, .block_size = block, .skip_verify = false };
+    /* FLASH_BEGIN erases the sectors the image covers, then the data
+       follows in blocks the loader pads with 0xFF in place. */
+    esp_loader_error_t e = esp_loader_flash_start(&f->loader, &cfg);
+    for (uint32_t pos = 0; e == ESP_LOADER_SUCCESS && pos < len; pos += block) {
+        const uint32_t n = len - pos < block ? len - pos : block;
+        memcpy(f->block, buf + pos, n);
+        e = esp_loader_flash_write(&f->loader, &cfg, f->block, n);
+    }
+    if (e == ESP_LOADER_SUCCESS) {
+        e = esp_loader_flash_finish(&f->loader, &cfg);
+    }
+    if (e != ESP_LOADER_SUCCESS) {
+        rescue_job_log(job, "writing 0x%lx (+%lu): %s", (unsigned long)addr, (unsigned long)len, loader_err(e));
+        return -1;
+    }
+    return 0;
+}
+
+void esp_flasher_close(espf_t *f, rescue_job_t *job, const cJSON *args)
+{
+    if (f == NULL) {
+        return;
+    }
+    espf_after(f, job, args);
+    serial_link_close(&f->link);
+    heap_caps_free(f->block);
+    heap_caps_free(f);
 }

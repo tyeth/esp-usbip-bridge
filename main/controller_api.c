@@ -22,6 +22,7 @@
 #include "blob_store.h"
 #include "capture.h"
 #include "device_rescue.h"
+#include "dut_flash.h"
 #include "esp_flasher.h"
 #include "msc_host.h"
 #include "ota_update.h"
@@ -1412,7 +1413,13 @@ static api_result_t core_device_tools(const char *method, const char *busid, con
     if (post && strcmp(rest, "/msc/read") == 0) {
         return core_rescue_job("msc_read", busid, json, msc_read_job);
     }
-    if (get && strcmp(rest, "/msc") == 0) {
+    if (post && strcmp(rest, "/dutflash") == 0) {
+        st = dut_flash_request(busid, json, &j);
+    } else if (get && strcmp(rest, "/dutflash") == 0) {
+        st = dut_flash_status(busid, &j);
+    } else if (post && strcmp(rest, "/dutflash/close") == 0) {
+        st = dut_flash_close(busid, &j);
+    } else if (get && strcmp(rest, "/msc") == 0) {
         st = msc_info(busid, &j);
     } else if (get && strcmp(rest, "/msc/list") == 0) {
         char path[256] = "/";
@@ -1686,6 +1693,9 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/usb/devices/{busid}/msc/mkdir", true,  "Make a directory", "{\"path\":str}" },
     { "POST", "/api/usb/devices/{busid}/msc/write", true,  "Job: copy a staged file to the volume (replaces an existing file)", "{\"file\":str,\"path\":str}" },
     { "POST", "/api/usb/devices/{busid}/msc/read",  true,  "Job: copy a file off the volume into the staged files (then GET /api/rescue/files/{name})", "{\"path\":str,\"file\":str?}" },
+    { "POST", "/api/usb/devices/{busid}/dutflash",  true,  "Job: DUT flash session through the bootloader (ESP, RP2040/RP2350 PICOBOOT, SAMD SAM-BA read-only): map partitions/regions (result.regions), then ops: partitions, read_region {part|offset+size, file?}, fs_info/list {part, path}, read {part, path, file?}, write {part, path, file|text}, delete/mkdir {part, path}, rename {part, from, to}, format {part, fs: littlefs|fat|spiffs, confirm?}. FAT, LittleFS, SPIFFS; writes are read-modify-erase-write of 4 KB sectors. With keep_open_s the session waits for more: another POST adds ops to it. 202 {job}", "{\"ops\":[{\"op\":str,\"part\":str|int?,\"path\":str?,\"file\":str?}],\"platform\":\"auto|esp|rp2|samd\"?,\"keep_open_s\":int?,\"after\":\"hard_reset|no_reset\"?,\"flash_size\":str?}" },
+    { "GET",  "/api/usb/devices/{busid}/dutflash",  false, "The open DUT flash session on the device: {open, job}", NULL },
+    { "POST", "/api/usb/devices/{busid}/dutflash/close", true, "End the DUT flash session (writes are already on the flash; the device is reset unless after: no_reset)", NULL },
     { "POST", "/api/usb/devices/{busid}/capture/start", true, "Capture every serial function of the device into PSRAM (timestamped, follows resets / re-enumeration / port-count changes); arm: keep capturing it whenever it is present, across bridge reboots. baud: a rate, a list tried in order, or \"auto\" (UART bridges); dtr defaults on for native USB CDC (not UART bridges or the ESP USB-Serial/JTAG). source gpio_uart is planned (501)", "{\"size\":int?,\"baud\":int|[int|\"auto\"]|\"auto\",\"dtr\":bool?,\"rts\":bool?,\"arm\":bool?}" },
     { "POST", "/api/usb/devices/{busid}/capture/stop", true, "Stop capturing (the buffer stays readable); disarm stops re-arming, clear frees the buffer", "{\"disarm\":bool?,\"clear\":bool?}" },
     { "GET",  "/api/usb/devices/{busid}/capture",   false, "Captured output of one port: ?port=0&since=<cursor> | from=epoch|oldest|tail &max=<bytes>&format=lines (uptime timestamps). Answers carry next, epoch, epoch_cursor, uptime_ms", NULL },
@@ -1815,9 +1825,21 @@ static const mcp_tool_t k_tools[] = {
       "Start a device rescue job and return its id (poll with rescue_get_job). kind: esp_flash "
       "{images:[{file,offset}], before, after, baud, erase_all}, esp_info, picoboot_load {file, address?}, "
       "picoboot_info, samba_flash {file, offset?}, samba_info, uf2_copy {file}, msc_write {file, path}, "
-      "msc_read {path, file?}. Files are staged first with PUT /api/rescue/files/<name>.",
+      "msc_read {path, file?}, dut_flash {ops, platform?, keep_open_s?} (see rescue_dut_flash). Files are staged "
+      "first with PUT /api/rescue/files/<name>.",
       "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},"
       "\"args\":{\"type\":\"object\"}},\"required\":[\"busid\",\"kind\"]}" },
+    { "rescue_dut_flash",
+      "A device's own flash through its bootloader (ESP serial loader, RP2 PICOBOOT, SAMD SAM-BA read-only): "
+      "starts a session job (or adds ops to the open one) that maps partitions/regions and runs ops: partitions, "
+      "read_region {part|offset+size, file?} (to a staged file), fs_info/list {part, path}, read {part, path, file?}, "
+      "write {part, path, file|text}, delete/mkdir {part, path}, rename {part, from, to}, format {part, fs, confirm?}. "
+      "File systems: FAT, LittleFS, SPIFFS. Poll the returned job with rescue_get_job (result.regions, result.ops). "
+      "action close ends the session.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"action\":{\"type\":\"string\","
+      "\"description\":\"run (default) or close\"},\"ops\":{\"type\":\"array\"},\"platform\":{\"type\":\"string\"},"
+      "\"keep_open_s\":{\"type\":\"integer\"},\"after\":{\"type\":\"string\"},\"flash_size\":{\"type\":\"string\"}},"
+      "\"required\":[\"busid\"]}" },
     { "rescue_get_job", "A rescue job's state, progress, log and result (id 0 = the latest).",
       "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}" },
     { "rescue_list_files", "Files staged on the bridge for flashing / copying (PSRAM).", NO_ARGS },
@@ -1946,6 +1968,7 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
             { "picoboot_load", picoboot_flasher_job }, { "picoboot_info", picoboot_info_job },
             { "samba_flash", samba_flasher_job }, { "samba_info", samba_info_job },
             { "uf2_copy", msc_uf2_job }, { "msc_write", msc_write_job }, { "msc_read", msc_read_job },
+            { "dut_flash", dut_flash_job },
         };
         const char *kind = json_string(args, "kind");
         for (size_t i = 0; kind && i < sizeof(k_kinds) / sizeof(k_kinds[0]); i++) {
@@ -1955,6 +1978,14 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
             }
         }
         return fail(400, "unknown kind");
+    }
+    if (strcmp(name, "rescue_dut_flash") == 0) {
+        const char *busid = json_string(args, "busid");
+        const char *action = json_string(args, "action");
+        cJSON *j = NULL;
+        const int st = (action && strcmp(action, "close") == 0) ? dut_flash_close(busid, &j)
+                                                                : dut_flash_request(busid, args, &j);
+        return result(st, j);
     }
     if (strcmp(name, "rescue_get_job") == 0) {
         int id = 0;

@@ -20,14 +20,14 @@
 #define SAMBA_LONG_MS       30000       /* chip erase, CRC of a large range */
 #define SAMBA_BOOT_WAIT_MS  6000
 
-typedef struct {
+struct samba {
     serial_link_t link;
     rescue_job_t *job;
     char version[128];
     bool can_x, can_y, can_z;
     uint32_t cpuid, device_id, nvm_param, flash_size, page_size;
     rescue_samba_chip_t chip;
-} samba_t;
+};
 
 static int send_cmd(samba_t *s, const char *cmd)
 {
@@ -334,4 +334,68 @@ int samba_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args)
     free(buf);
     blob_release(file->valuestring);
     return rc;
+}
+
+/* ===========================================================================
+ *  A connection for the DUT flash browser
+ * ======================================================================== */
+
+samba_t *samba_open(rescue_job_t *job, const char *busid, const cJSON *args)
+{
+    samba_t *s = heap_caps_calloc(1, sizeof(*s), MALLOC_CAP_DEFAULT);
+    if (s == NULL) {
+        rescue_job_fail(job, "out of memory");
+        return NULL;
+    }
+    if (samba_connect(s, job, busid, args) != 0) {
+        serial_link_close(&s->link);
+        heap_caps_free(s);
+        return NULL;
+    }
+    return s;
+}
+
+void samba_geometry(const samba_t *s, uint32_t *flash_size, uint32_t *page_size, uint32_t *app_offset,
+                    const char **family)
+{
+    *flash_size = s->flash_size;
+    *page_size = s->page_size;
+    *app_offset = s->chip.app_offset;
+    *family = s->chip.family;
+}
+
+/* Samba::read: R<addr>,<size># answers the bytes.  The SAM-BA USB code
+   mishandles reads of a power of two above 32 bytes (BOSSA works around it
+   with a readByte first), so no chunk is one. */
+int samba_read(samba_t *s, uint32_t addr, uint8_t *buf, uint32_t len)
+{
+    char cmd[24];
+    while (len > 0) {
+        uint32_t n = len > SAMBA_CHUNK ? SAMBA_CHUNK : len;
+        if (n > 32 && (n & (n - 1)) == 0) {
+            n--;
+        }
+        snprintf(cmd, sizeof(cmd), "R%08lX,%08lX#", (unsigned long)addr, (unsigned long)n);
+        if (send_cmd(s, cmd) != 0 || read_n(s, buf, n, SAMBA_NORMAL_MS + n / 16) != 0) {
+            rescue_job_log(s->job, "SAM-BA read of 0x%08lx (+%lu) failed", (unsigned long)addr, (unsigned long)n);
+            return -1;
+        }
+        addr += n;
+        buf += n;
+        len -= n;
+    }
+    return 0;
+}
+
+void samba_close(samba_t *s, bool reset)
+{
+    if (s == NULL) {
+        return;
+    }
+    if (reset) {
+        rescue_job_log(s->job, "resetting the board");
+        send_cmd(s, "WE000ED0C,05FA0004#");
+    }
+    serial_link_close(&s->link);
+    heap_caps_free(s);
 }

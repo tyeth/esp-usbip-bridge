@@ -180,6 +180,7 @@ void rescue_picoboot_range_cmd(uint8_t cmd_id, uint32_t token, uint32_t addr, ui
 #define RESCUE_PC_READ             0x84
 #define RESCUE_PC_WRITE            0x05
 #define RESCUE_PC_EXIT_XIP         0x06
+#define RESCUE_PC_GET_INFO         0x8b  /* RP2350 */
 #define RESCUE_PICOBOOT_STATUS_REQ 0x42  /* IF_CMD_STATUS control request (16 bytes IN) */
 const char *rescue_picoboot_status_name(uint32_t status);
 

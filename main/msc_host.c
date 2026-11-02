@@ -451,9 +451,8 @@ static void unmount(mount_t *m)
         m->fs = NULL;
     }
     meta_cache_end();
-    if (s_pdrv != 0xFF) {
-        ff_diskio_unregister(s_pdrv);
-    }
+    /* The drive stays registered (NOINIT while closed) so the DUT flash
+       browser's FatFS drive (dut_fs.c) is never given the same number. */
     if (s_dev.busid[0]) {
         usb_backend_session_ended(s_dev.busid);    /* release the claimed interface */
     }
