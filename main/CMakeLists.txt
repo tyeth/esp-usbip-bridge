@@ -1,4 +1,5 @@
 set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns esp_driver_i2c
+                   fatfs esp-serial-flasher
                    harness_io harness_scpi harness_dut harness_io_expander)
 
 set(srcs
@@ -19,6 +20,14 @@ set(srcs
     "busid_owner.c"
     "rescue_logic.c"
     "device_rescue.c"
+    "serial_link.c"
+    "blob_store.c"
+    "rescue_job.c"
+    "serial_monitor.c"
+    "esp_flasher.c"
+    "picoboot_flasher.c"
+    "samba_flasher.c"
+    "msc_host.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)

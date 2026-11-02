@@ -1073,7 +1073,8 @@ static int prepare_and_submit_transfer(xfer_t *pipe)
     }
 
     usb_transfer_t *transfer = NULL;
-    esp_err_t err = usb_host_transfer_alloc(xfer_len, 0, &transfer);
+    /* A zero-length packet (e.g. the PICOBOOT ACK of an IN command) still needs a buffer. */
+    esp_err_t err = usb_host_transfer_alloc(xfer_len ? xfer_len : 4, 0, &transfer);
     if (err != ESP_OK || transfer == NULL) {
         /* Name the size: a silent -ENOMEM cost a debugging session. */
         ESP_LOGE(TAG, "usb_host_transfer_alloc(%u) failed: %s (ep=0x%02x)",

@@ -19,7 +19,14 @@
 #include "analog_mux.h"
 #include "busid_owner.h"
 #include "device_naming.h"
+#include "blob_store.h"
 #include "device_rescue.h"
+#include "esp_flasher.h"
+#include "msc_host.h"
+#include "picoboot_flasher.h"
+#include "rescue_job.h"
+#include "samba_flasher.h"
+#include "serial_monitor.h"
 #include "discovery_service.h"
 #include "hub_control.h"
 #include "port_events.h"
@@ -104,6 +111,8 @@ const char *controller_api_status_text(int status)
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 411: return "Length Required";
+    case 413: return "Payload Too Large";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
     default:  return "Internal Server Error";
@@ -283,6 +292,28 @@ static int query_int(const char *query, const char *name, int def)
         }
     }
     return def;
+}
+
+/* Percent-decoded value of name in the query string; false when absent. */
+static bool query_str(const char *query, const char *name, char *out, size_t out_size)
+{
+    if (query == NULL) {
+        return false;
+    }
+    size_t n = strlen(name);
+    for (const char *q = query; q && *q; ) {
+        if (strncmp(q, name, n) == 0 && q[n] == '=') {
+            const char *v = q + n + 1;
+            const char *e = strchr(v, '&');
+            url_decode(v, e ? (size_t)(e - v) : strlen(v), out, out_size);
+            return true;
+        }
+        q = strchr(q, '&');
+        if (q) {
+            q++;
+        }
+    }
+    return false;
 }
 
 static bool json_bool(const cJSON *obj, const char *key, bool def)
@@ -1323,6 +1354,128 @@ static api_result_t core_rescue_console(const char *busid, const cJSON *args)
     return result(st, j);
 }
 
+static bool is_method(const char *method, const char *m);
+
+/* Long rescue work runs as a job: 202 with its id. */
+static api_result_t core_rescue_job(const char *kind, const char *busid, const cJSON *args, rescue_job_fn_t fn)
+{
+    int status = 0;
+    char msg[128] = "";
+    const uint32_t id = rescue_job_start(kind, busid, args, fn, &status, msg, sizeof(msg));
+    if (id == 0) {
+        return fail(status, msg);
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddNumberToObject(j, "job", id);
+    char poll[48];
+    snprintf(poll, sizeof(poll), "/api/rescue/jobs/%lu", (unsigned long)id);
+    cJSON_AddStringToObject(j, "poll", poll);
+    return result(202, j);
+}
+
+/* /api/usb/devices/{busid}/<rest> beyond the basic rescue actions. */
+static api_result_t core_device_tools(const char *method, const char *busid, const char *rest,
+                                      const char *query, const cJSON *json)
+{
+    cJSON *j = NULL;
+    int st;
+    const bool post = is_method(method, "POST");
+    const bool get = is_method(method, "GET");
+    if (post && strcmp(rest, "/flash/esp") == 0) {
+        return core_rescue_job("esp_flash", busid, json, esp_flasher_job);
+    }
+    if (post && strcmp(rest, "/esp/info") == 0) {
+        return core_rescue_job("esp_info", busid, json, esp_flasher_info_job);
+    }
+    if (post && strcmp(rest, "/flash/picoboot") == 0) {
+        return core_rescue_job("picoboot_load", busid, json, picoboot_flasher_job);
+    }
+    if (post && strcmp(rest, "/picoboot/info") == 0) {
+        return core_rescue_job("picoboot_info", busid, json, picoboot_info_job);
+    }
+    if (post && strcmp(rest, "/flash/samba") == 0) {
+        return core_rescue_job("samba_flash", busid, json, samba_flasher_job);
+    }
+    if (post && strcmp(rest, "/samba/info") == 0) {
+        return core_rescue_job("samba_info", busid, json, samba_info_job);
+    }
+    if (post && strcmp(rest, "/flash/uf2") == 0) {
+        return core_rescue_job("uf2_copy", busid, json, msc_uf2_job);
+    }
+    if (post && strcmp(rest, "/msc/write") == 0) {
+        return core_rescue_job("msc_write", busid, json, msc_write_job);
+    }
+    if (post && strcmp(rest, "/msc/read") == 0) {
+        return core_rescue_job("msc_read", busid, json, msc_read_job);
+    }
+    if (get && strcmp(rest, "/msc") == 0) {
+        st = msc_info(busid, &j);
+    } else if (get && strcmp(rest, "/msc/list") == 0) {
+        char path[256] = "/";
+        query_str(query, "path", path, sizeof(path));
+        st = msc_list(busid, path, &j);
+    } else if (post && strcmp(rest, "/msc/delete") == 0) {
+        st = msc_delete(busid, json, &j);
+    } else if (post && strcmp(rest, "/msc/rename") == 0) {
+        st = msc_rename(busid, json, &j);
+    } else if (post && strcmp(rest, "/msc/mkdir") == 0) {
+        st = msc_mkdir(busid, json, &j);
+    } else if (get && strcmp(rest, "/monitor") == 0) {
+        char v[24] = "0";
+        query_str(query, "since", v, sizeof(v));
+        st = serial_monitor_poll(busid, strtoull(v, NULL, 10), query_int(query, "max", 8192), &j);
+    } else if (post && strcmp(rest, "/monitor/start") == 0) {
+        st = serial_monitor_start(busid, json, &j);
+    } else if (post && strcmp(rest, "/monitor/stop") == 0) {
+        st = serial_monitor_stop_api(busid, &j);
+    } else if (post && strcmp(rest, "/monitor/send") == 0) {
+        st = serial_monitor_send(busid, json, &j);
+    } else {
+        return fail(404, "unknown device action");
+    }
+    return result(st, j);
+}
+
+static api_result_t core_rescue_files(const char *method, const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return is_method(method, "GET") ? result(200, blob_list_json()) : fail(405, "use GET");
+    }
+    if (!is_method(method, "DELETE")) {
+        return fail(405, "PUT and GET of a file are streamed by the HTTP server; DELETE removes it");
+    }
+    const esp_err_t err = blob_delete(name);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return fail(404, "no such staged file");
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        return fail(409, "in use by a running job");
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    return result(200, j);
+}
+
+static api_result_t core_rescue_jobs(const char *method, const char *id_str)
+{
+    if (id_str == NULL || id_str[0] == '\0') {
+        return result(200, rescue_job_list_json());
+    }
+    const uint32_t id = strcmp(id_str, "latest") == 0 ? 0 : (uint32_t)strtoul(id_str, NULL, 10);
+    if (is_method(method, "DELETE")) {
+        if (!rescue_job_cancel(id)) {
+            return fail(409, "that job is not running");
+        }
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddBoolToObject(j, "ok", true);
+        cJSON_AddStringToObject(j, "note", "cancel requested; the job stops at its next block");
+        return result(200, j);
+    }
+    cJSON *j = rescue_job_json(id);
+    return j ? result(200, j) : fail(404, "no such job");
+}
+
 static api_result_t core_mux_status(void)
 {
     return result(200, analog_mux_describe());
@@ -1478,6 +1631,31 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/usb/devices/{busid}/serial",    true,  "Set line coding and/or DTR and RTS on the device's serial function (lines not given keep their last-set state). 409 while imported over USB/IP", "{\"baud\":int?,\"dtr\":bool?,\"rts\":bool?,\"port\":int?,\"allow_1200\":bool?}" },
     { "POST", "/api/usb/devices/{busid}/reset",     true,  "Run a reset sequence: esp_bootloader, esp_hard_reset (classic DTR/RTS circuit), esp_usb_jtag_bootloader, esp_usb_jtag_reset (303a:1001), touch_1200, rp_bootsel, rp_reboot (RP2 reset interface), picoboot_reboot, picoboot_bootsel (RP2350), or bootloader (pick the fitting one). Waits up to wait_ms for the device to re-enumerate and reports what came back. 409 while imported over USB/IP", "{\"mode\":str,\"port\":int?,\"wait_ms\":int?}" },
     { "POST", "/api/usb/devices/{busid}/console",   true,  "Console peek: set serial_baud (default 115200), optionally DTR/RTS, send pokes (enter, ctrl_c, ctrl_d or {hex}) settle_s apart, capture capture_s (max 10; the whole call max 12 s, blocking the bridge API) and return text (sanitised UTF-8), data_hex and the serial_probe classification. 409 while imported over USB/IP", "{\"serial_baud\":int?,\"pokes\":[str|{\"hex\":str}]?,\"settle_s\":num?,\"capture_s\":num?,\"dtr\":bool?,\"rts\":bool?,\"max_bytes\":int?,\"port\":int?}" },
+    { "POST", "/api/usb/devices/{busid}/flash/esp", true,  "Job: flash an ESP with esp-serial-flasher (stub, MD5 verify) over its USB serial: esptool write-flash without host tools. 202 {job}", "{\"images\":[{\"file\":str,\"offset\":int|str}],\"before\":\"default_reset|usb_reset|no_reset\",\"after\":\"hard_reset|no_reset\",\"baud\":int?,\"erase_all\":bool?,\"verify\":bool?,\"stub\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/esp/info",  true,  "Job: connect to the ESP bootloader and report chip, MAC, flash size and security info", "{\"before\":str?,\"after\":str?}" },
+    { "POST", "/api/usb/devices/{busid}/flash/picoboot", true, "Job: picotool load: write a UF2 or raw .bin to an RP2040/RP2350 over PICOBOOT (entering BOOTSEL first), verify by read-back, reboot", "{\"file\":str,\"address\":str?,\"verify\":bool?,\"reboot\":bool?,\"enter_bootsel\":bool?,\"force_family\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/picoboot/info", true, "Job: enter BOOTSEL if needed and report the RP2 chip", "{\"enter_bootsel\":bool?,\"reboot\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/flash/samba", true, "Job: bossac: write a .bin to a SAMD21/SAMD51 through its SAM-BA bootloader (Arduino X/Y/Z extensions), CRC16 verify, reset; 1200-baud touch first if needed", "{\"file\":str,\"offset\":str?,\"erase\":bool?,\"verify\":bool?,\"reset\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/samba/info", true, "Job: connect to SAM-BA and report the bootloader, chip and flash", NULL },
+    { "POST", "/api/usb/devices/{busid}/flash/uf2", true,  "Job: copy a staged UF2 to the device's UF2 bootloader drive (entering the bootloader first if it has no mass storage); a reboot after the last block counts as success", "{\"file\":str,\"path\":str?,\"enter_bootloader\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/monitor/start", true, "Start a serial monitor (64 KB ring, follows the device through resets); line and reset actions still work meanwhile", "{\"serial_baud\":int?,\"dtr\":bool?,\"rts\":bool?,\"port\":int?}" },
+    { "GET",  "/api/usb/devices/{busid}/monitor",   false, "Monitor output since a cursor: ?since=<next from the last call>&max=<bytes>", NULL },
+    { "POST", "/api/usb/devices/{busid}/monitor/send", true, "Send text or hex to the monitored device", "{\"text\":str}|{\"hex\":str}" },
+    { "POST", "/api/usb/devices/{busid}/monitor/stop", true, "Stop the monitor", NULL },
+    { "GET",  "/api/usb/devices/{busid}/msc",       false, "Mass storage: inquiry, capacity, FAT type, free space, root listing, whether it is a UF2 bootloader", NULL },
+    { "GET",  "/api/usb/devices/{busid}/msc/list",  false, "List a directory: ?path=/lib", NULL },
+    { "POST", "/api/usb/devices/{busid}/msc/delete", true, "Delete a file or empty directory", "{\"path\":str}" },
+    { "POST", "/api/usb/devices/{busid}/msc/rename", true, "Rename / move", "{\"from\":str,\"to\":str}" },
+    { "POST", "/api/usb/devices/{busid}/msc/mkdir", true,  "Make a directory", "{\"path\":str}" },
+    { "POST", "/api/usb/devices/{busid}/msc/write", true,  "Job: copy a staged file to the volume (replaces an existing file)", "{\"file\":str,\"path\":str}" },
+    { "POST", "/api/usb/devices/{busid}/msc/read",  true,  "Job: copy a file off the volume into the staged files (then GET /api/rescue/files/{name})", "{\"path\":str,\"file\":str?}" },
+    { "GET",  "/api/rescue/files",                  false, "Staged files (PSRAM, lost on reboot) with size and space left", NULL },
+    { "PUT",  "/api/rescue/files/{name}",           true,  "Upload a staged file: the raw body (streamed into PSRAM; POST also accepted). Names [A-Za-z0-9._-]", "raw bytes" },
+    { "GET",  "/api/rescue/files/{name}",           false, "Download a staged file", NULL },
+    { "DELETE", "/api/rescue/files/{name}",         true,  "Delete a staged file", NULL },
+    { "GET",  "/api/rescue/jobs",                   false, "Recent rescue jobs (one runs at a time)", NULL },
+    { "GET",  "/api/rescue/jobs/{id}",              false, "A job's state, progress, stage, log, result and error ({id} = latest for the newest)", NULL },
+    { "DELETE", "/api/rescue/jobs/{id}",            true,  "Cancel the running job", NULL },
     { "POST", "/api/devices/{busid}/name",          true,  "Set a friendly name for the device on a port", "{\"name\":str}" },
     { "GET",  "/api/usb/hubs",                      false, "Hubs with power switching mode and per-port status", NULL },
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
@@ -1582,6 +1760,27 @@ static const mcp_tool_t k_tools[] = {
       "\"pokes\":{\"type\":\"array\"},\"settle_s\":{\"type\":\"number\",\"default\":1},"
       "\"capture_s\":{\"type\":\"number\",\"default\":3},\"dtr\":{\"type\":\"boolean\"},\"rts\":{\"type\":\"boolean\"},"
       "\"max_bytes\":{\"type\":\"integer\"},\"port\":{\"type\":\"integer\"}},\"required\":[\"busid\"]}" },
+    { "rescue_start_job",
+      "Start a device rescue job and return its id (poll with rescue_get_job). kind: esp_flash "
+      "{images:[{file,offset}], before, after, baud, erase_all}, esp_info, picoboot_load {file, address?}, "
+      "picoboot_info, samba_flash {file, offset?}, samba_info, uf2_copy {file}, msc_write {file, path}, "
+      "msc_read {path, file?}. Files are staged first with PUT /api/rescue/files/<name>.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},"
+      "\"args\":{\"type\":\"object\"}},\"required\":[\"busid\",\"kind\"]}" },
+    { "rescue_get_job", "A rescue job's state, progress, log and result (id 0 = the latest).",
+      "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}" },
+    { "rescue_list_files", "Files staged on the bridge for flashing / copying (PSRAM).", NO_ARGS },
+    { "rescue_monitor",
+      "Serial monitor: action start {serial_baud, dtr?, rts?}, poll {since}, send {text|hex}, or stop.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"action\":{\"type\":\"string\"},"
+      "\"since\":{\"type\":\"integer\"},\"serial_baud\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"},"
+      "\"hex\":{\"type\":\"string\"},\"dtr\":{\"type\":\"boolean\"},\"rts\":{\"type\":\"boolean\"}},"
+      "\"required\":[\"busid\",\"action\"]}" },
+    { "rescue_msc",
+      "A device's mass storage (FAT): action info, list {path}, delete {path}, rename {from, to}, mkdir {path}.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"action\":{\"type\":\"string\"},"
+      "\"path\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},"
+      "\"required\":[\"busid\",\"action\"]}" },
     { "list_hubs",
       "List USB hubs with their power switching mode (per-port, ganged or none) and the state of every "
       "port: power, connection, speed, over-current and what is attached.", NO_ARGS },
@@ -1686,6 +1885,55 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
     }
     if (strcmp(name, "rescue_console_peek") == 0) {
         return core_rescue_console(json_string(args, "busid"), args);
+    }
+    if (strcmp(name, "rescue_start_job") == 0) {
+        static const struct { const char *kind; rescue_job_fn_t fn; } k_kinds[] = {
+            { "esp_flash", esp_flasher_job }, { "esp_info", esp_flasher_info_job },
+            { "picoboot_load", picoboot_flasher_job }, { "picoboot_info", picoboot_info_job },
+            { "samba_flash", samba_flasher_job }, { "samba_info", samba_info_job },
+            { "uf2_copy", msc_uf2_job }, { "msc_write", msc_write_job }, { "msc_read", msc_read_job },
+        };
+        const char *kind = json_string(args, "kind");
+        for (size_t i = 0; kind && i < sizeof(k_kinds) / sizeof(k_kinds[0]); i++) {
+            if (strcmp(kind, k_kinds[i].kind) == 0) {
+                return core_rescue_job(kind, json_string(args, "busid"),
+                                       cJSON_GetObjectItemCaseSensitive(args, "args"), k_kinds[i].fn);
+            }
+        }
+        return fail(400, "unknown kind");
+    }
+    if (strcmp(name, "rescue_get_job") == 0) {
+        int id = 0;
+        json_int(args, "id", &id);
+        cJSON *j = rescue_job_json((uint32_t)id);
+        return j ? result(200, j) : fail(404, "no such job");
+    }
+    if (strcmp(name, "rescue_list_files") == 0) {
+        return result(200, blob_list_json());
+    }
+    if (strcmp(name, "rescue_monitor") == 0 || strcmp(name, "rescue_msc") == 0) {
+        const char *busid = json_string(args, "busid");
+        const char *action = json_string(args, "action");
+        if (busid == NULL || action == NULL) {
+            return fail(400, "busid and action required");
+        }
+        char rest[32];
+        int since = 0;
+        json_int(args, "since", &since);
+        char query[48];
+        snprintf(query, sizeof(query), "since=%d&path=", since);
+        const char *path = json_string(args, "path");
+        if (strcmp(name, "rescue_monitor") == 0) {
+            snprintf(rest, sizeof(rest), strcmp(action, "poll") == 0 ? "/monitor" : "/monitor/%s", action);
+            return core_device_tools(strcmp(action, "poll") == 0 ? "GET" : "POST", busid, rest, query, args);
+        }
+        if (strcmp(action, "list") == 0) {
+            cJSON *j = NULL;
+            const int st = msc_list(busid, path ? path : "/", &j);
+            return result(st, j);
+        }
+        snprintf(rest, sizeof(rest), strcmp(action, "info") == 0 ? "/msc" : "/msc/%s", action);
+        return core_device_tools(strcmp(action, "info") == 0 ? "GET" : "POST", busid, rest, NULL, args);
     }
     if (strcmp(name, "set_port_power") == 0) {
         const char *port = json_string(args, "port");
@@ -1929,7 +2177,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
                        strncmp(path, "/api/groups/", 12) == 0 || path_is(path, "/api/topology") ||
                        path_is(path, "/api/probe") || strncmp(path, "/api/auth", 9) == 0 ||
                        strncmp(path, "/api/settings", 13) == 0 ||
-                       path_is(path, "/api/reboot");
+                       path_is(path, "/api/reboot") || strncmp(path, "/api/rescue/", 12) == 0 ||
+                       path_is(path, "/api/rescue/files") || path_is(path, "/api/rescue/jobs");
     if (!known) {
         return false;
     }
@@ -1983,6 +2232,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
             r = (is_method(method, "GET") || is_method(method, "HEAD")) ? core_device(seg) : fail(405, "use GET");
         } else if (strcmp(rest, "/rescue") == 0) {
             r = is_method(method, "GET") ? core_rescue_info(seg) : fail(405, "use GET");
+        } else if (is_method(method, "GET")) {
+            r = core_device_tools(method, seg, rest, query, json);
         } else if (!is_method(method, "POST")) {
             r = fail(405, "use POST");
         } else if (strcmp(rest, "/serial") == 0) {
@@ -1992,8 +2243,22 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         } else if (strcmp(rest, "/console") == 0) {
             r = core_rescue_console(seg, json);
         } else {
-            r = fail(404, "unknown device action (rescue, serial, reset, console)");
+            r = core_device_tools(method, seg, rest, query, json);
         }
+    } else if (path_is(path, "/api/rescue/files") || strncmp(path, "/api/rescue/files/", 18) == 0) {
+        if (path[17] == '/') {
+            take_segment(path + 18, seg, sizeof(seg));
+        } else {
+            seg[0] = '\0';
+        }
+        r = core_rescue_files(method, seg);
+    } else if (path_is(path, "/api/rescue/jobs") || strncmp(path, "/api/rescue/jobs/", 17) == 0) {
+        if (path[16] == '/') {
+            take_segment(path + 17, seg, sizeof(seg));
+        } else {
+            seg[0] = '\0';
+        }
+        r = core_rescue_jobs(method, seg);
     } else if (path_is(path, "/api/usb/hubs")) {
         r = core_hubs();
     } else if (path_is(path, "/api/usb/enum_events")) {

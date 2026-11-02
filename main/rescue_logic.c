@@ -625,6 +625,205 @@ void rescue_picoboot_reboot_cmd(rescue_rp_chip_t chip, bool to_bootsel, uint32_t
     /* dTransferLength (out[12..15]) stays 0: no data phase */
 }
 
+void rescue_picoboot_cmd(uint8_t cmd_id, uint32_t token, const uint8_t *args, uint8_t args_len,
+                         uint32_t transfer_len, uint8_t out[32])
+{
+    memset(out, 0, 32);
+    put_le32(&out[0], 0x431fd10bu);
+    put_le32(&out[4], token);
+    out[8] = cmd_id;
+    if (args_len > 16) {
+        args_len = 16;
+    }
+    out[9] = args_len;
+    put_le32(&out[12], transfer_len);
+    if (args != NULL && args_len) {
+        memcpy(&out[16], args, args_len);
+    }
+}
+
+void rescue_picoboot_range_cmd(uint8_t cmd_id, uint32_t token, uint32_t addr, uint32_t size,
+                               uint32_t transfer_len, uint8_t out[32])
+{
+    uint8_t a[8];
+    put_le32(&a[0], addr);
+    put_le32(&a[4], size);
+    rescue_picoboot_cmd(cmd_id, token, a, sizeof(a), transfer_len, out);
+}
+
+const char *rescue_picoboot_status_name(uint32_t status)
+{
+    static const char *const k_names[] = {
+        "OK", "UNKNOWN_CMD", "INVALID_CMD_LENGTH", "INVALID_TRANSFER_LENGTH", "INVALID_ADDRESS",
+        "BAD_ALIGNMENT", "INTERLEAVED_WRITE", "REBOOTING", "UNKNOWN_ERROR", "INVALID_STATE",
+        "NOT_PERMITTED", "INVALID_ARG", "BUFFER_TOO_SMALL", "PRECONDITION_NOT_MET", "MODIFIED_DATA",
+        "INVALID_DATA", "NOT_FOUND", "UNSUPPORTED_MODIFICATION",
+    };
+    return status < sizeof(k_names) / sizeof(k_names[0]) ? k_names[status] : "?";
+}
+
+/* ===========================================================================
+ *  UF2
+ * ======================================================================== */
+
+static uint32_t get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+bool rescue_uf2_block(const uint8_t *file, size_t len, size_t index, rescue_uf2_block_t *out)
+{
+    if ((index + 1) * RESCUE_UF2_BLOCK > len) {
+        return false;
+    }
+    const uint8_t *b = file + index * RESCUE_UF2_BLOCK;
+    if (get_le32(b) != 0x0A324655u || get_le32(b + 4) != 0x9E5D5157u || get_le32(b + 508) != 0x0AB16F30u) {
+        return false;
+    }
+    out->flags = get_le32(b + 8);
+    out->target_addr = get_le32(b + 12);
+    out->payload_size = get_le32(b + 16);
+    out->block_no = get_le32(b + 20);
+    out->num_blocks = get_le32(b + 24);
+    out->family_id = (out->flags & RESCUE_UF2_FLAG_FAMILY) ? get_le32(b + 28) : 0;
+    out->data = b + 32;
+    return out->payload_size <= 476;
+}
+
+const char *rescue_uf2_family_name(uint32_t family_id)
+{
+    switch (family_id) {
+    case 0xe48bff56: return "rp2040";
+    case 0xe48bff57: return "rp2xxx-absolute";
+    case 0xe48bff58: return "rp2xxx-data";
+    case 0xe48bff59: return "rp2350-arm-s";
+    case 0xe48bff5a: return "rp2350-riscv";
+    case 0xe48bff5b: return "rp2350-arm-ns";
+    case 0x68ed2b88: return "samd21";
+    case 0x55114460: return "samd51";
+    case 0x1851780a: return "saml21";
+    case 0xbfdd4eee: return "esp32s2";
+    case 0xc47e5767: return "esp32s3";
+    case 0xd42ba06c: return "esp32c3";
+    case 0x540ddf62: return "esp32c6";
+    case 0x332726f6: return "esp32h2";
+    case 0xada52840: return "nrf52840";
+    case 0x57755a57: return "stm32f4";
+    default: return NULL;
+    }
+}
+
+bool rescue_uf2_family_fits_rp(uint32_t family_id, rescue_rp_chip_t chip)
+{
+    switch (family_id) {
+    case 0:
+    case 0xe48bff57:            /* absolute: either chip */
+    case 0xe48bff58:            /* data */
+        return true;
+    case 0xe48bff56:
+        return chip == RESCUE_CHIP_RP2040;
+    case 0xe48bff59:
+    case 0xe48bff5a:
+    case 0xe48bff5b:
+        return chip == RESCUE_CHIP_RP2350;
+    default:
+        return false;
+    }
+}
+
+/* ===========================================================================
+ *  Mass storage (BOT + SCSI)
+ * ======================================================================== */
+
+void rescue_msc_cbw(uint32_t tag, uint32_t data_len, bool data_in, uint8_t lun,
+                    const uint8_t *cdb, uint8_t cdb_len, uint8_t out[31])
+{
+    memset(out, 0, 31);
+    put_le32(&out[0], 0x43425355u);     /* "USBC" */
+    put_le32(&out[4], tag);
+    put_le32(&out[8], data_len);
+    out[12] = data_in ? 0x80 : 0x00;
+    out[13] = lun & 0x0F;
+    if (cdb_len > 16) {
+        cdb_len = 16;
+    }
+    out[14] = cdb_len;
+    memcpy(&out[15], cdb, cdb_len);
+}
+
+bool rescue_msc_csw(const uint8_t *csw, size_t len, uint32_t tag, uint32_t *residue, uint8_t *status)
+{
+    if (len < 13 || get_le32(csw) != 0x53425355u || get_le32(csw + 4) != tag) {     /* "USBS" */
+        return false;
+    }
+    *residue = get_le32(csw + 8);
+    *status = csw[12];
+    return true;
+}
+
+void rescue_scsi_rw10(uint8_t op, uint32_t lba, uint16_t count, uint8_t cdb[10])
+{
+    memset(cdb, 0, 10);
+    cdb[0] = op;
+    cdb[2] = (uint8_t)(lba >> 24);
+    cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);
+    cdb[5] = (uint8_t)lba;
+    cdb[7] = (uint8_t)(count >> 8);
+    cdb[8] = (uint8_t)count;
+}
+
+void rescue_scsi_capacity(const uint8_t data[8], uint32_t *blocks, uint32_t *block_size)
+{
+    const uint32_t last = (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 | (uint32_t)data[2] << 8 | data[3];
+    *blocks = last + 1;
+    *block_size = (uint32_t)data[4] << 24 | (uint32_t)data[5] << 16 | (uint32_t)data[6] << 8 | data[7];
+}
+
+/* ===========================================================================
+ *  SAM-BA (BOSSA src/Samba.cpp, Device.cpp)
+ * ======================================================================== */
+
+uint16_t rescue_crc16_xmodem(const uint8_t *data, size_t len, uint16_t crc)
+{
+    while (len-- > 0) {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (int i = 0; i < 8; i++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+void rescue_samba_chip(uint32_t cpuid, uint32_t device_id, uint32_t flash_size, rescue_samba_chip_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const uint32_t part = cpuid & 0x0000fff0;
+    const uint32_t fam = device_id & 0xffff0000;
+    if (part == 0xC600 && fam == 0x10010000) {          /* Cortex-M0+ SAMD21 */
+        out->family = "SAMD21";
+        out->app_offset = 0x2000;
+        /* BOSSA's D2xNvmFlash user RAM per flash size (x15 .. x18). */
+        out->user_ram = flash_size <= 32768 ? 0x20000800 : flash_size <= 65536 ? 0x20001000
+                      : flash_size <= 131072 ? 0x20002000 : 0x20004000;
+    } else if (part == 0xC240 && (fam == 0x60060000 || fam == 0x61810000 || fam == 0x61830000 || fam == 0x61840000)) {
+        out->family = fam == 0x60060000 ? "SAMD51" : fam == 0x61810000 ? "SAME51"
+                    : fam == 0x61830000 ? "SAME53" : "SAME54";
+        out->app_offset = 0x4000;
+        out->user_ram = 0x20004000;
+    }
+}
+
+uint32_t rescue_samba_flash_size(uint32_t nvm_param, uint32_t *page_size)
+{
+    const uint32_t pages = nvm_param & 0xffff;
+    const uint32_t psz = 8u << ((nvm_param >> 16) & 0x7);
+    if (page_size != NULL) {
+        *page_size = psz;
+    }
+    return pages * psz;
+}
+
 /* ===========================================================================
  *  Console helpers
  * ======================================================================== */

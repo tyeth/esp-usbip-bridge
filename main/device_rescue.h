@@ -1,7 +1,14 @@
 #ifndef DEVICE_RESCUE_H
 #define DEVICE_RESCUE_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "cJSON.h"
+
+#include "rescue_logic.h"
+#include "serial_link.h"
+#include "usb_backend.h"
 
 /*
  * Per-device "interrogate and rescue" tools, run by the bridge itself with
@@ -31,5 +38,12 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out);
 /* POST {port?, serial_baud?, pokes?, settle_s?, capture_s?, dtr?, rts?,
    max_bytes?}: open the serial function, send pokes, capture the output. */
 int device_rescue_console(const char *busid, const cJSON *args, cJSON **out);
+
+/* For the flashing jobs: run a DTR/RTS reset table on an open link (failures
+   from its commit step on set *dropped instead of failing), and wait up to
+   wait_ms for busid to come back with a new devnum (*now is what came back). */
+int device_rescue_run_line_seq(serial_link_t *l, rescue_mode_t mode, bool *dropped);
+bool device_rescue_wait_reenumeration(const char *busid, uint32_t devnum, int wait_ms,
+                                      usbip_backend_device_t *now, bool *dropped);
 
 #endif

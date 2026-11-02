@@ -15,7 +15,10 @@
 #include "busid_owner.h"
 #include "device_naming.h"
 #include "hub_control.h"
+#include "rescue_job.h"
 #include "rescue_logic.h"
+#include "serial_link.h"
+#include "serial_monitor.h"
 #include "usb_backend.h"
 #include "virtual_device.h"
 
@@ -24,8 +27,6 @@ static const char *TAG = "rescue";
 #define RESCUE_CFG_MAX          1024    /* configuration descriptor copy */
 #define RESCUE_CTRL_TIMEOUT_MS  1000
 #define RESCUE_BULK_TIMEOUT_MS  1000
-#define RESCUE_IN_CHUNK         512     /* a multiple of every FS bulk MPS */
-#define RESCUE_MAX_REQS         4
 #define RESCUE_CAPTURE_MAX_MS   10000
 #define RESCUE_SESSION_MAX_MS   12000   /* pokes + settle + capture: the HTTP task is blocked meanwhile */
 #define RESCUE_MAX_POKES        8
@@ -36,30 +37,15 @@ static const char *TAG = "rescue";
 #define RESCUE_DROP_WAIT_MS     3000    /* default re-enumeration wait after a reset that drops the device */
 #define RESCUE_DEFAULT_BAUD     115200
 
-/* What this bridge last set on a device's serial function (lines cannot be
-   read back on most chips).  Reset when the device re-enumerates. */
-typedef struct {
-    bool used;
-    char busid[32];
-    uint32_t devnum;
-    bool lines_known;
-    bool dtr, rts;
-    uint32_t baud;              /* 0 = not set by the bridge */
-    bool ch34x_ready;           /* version read and serial init done */
-    uint8_t ch34x_version;
-    bool ch34x_limited;
-} shadow_t;
-
-/* Only the HTTP task touches the shadows. */
-static shadow_t s_shadow[CONFIG_USBIP_MAX_DEVICES];
-
+/* A device being worked on: identity and classification.  Serial actions
+   use `link`; the RP2 requests go straight to EP0. */
 typedef struct {
     char busid[32];
     usbip_backend_device_t dev;
     rescue_config_t cfg;
     rescue_caps_t caps;
-    shadow_t *sh;
     cJSON *log;                 /* requests sent, for the response */
+    bool shared_with_monitor;   /* the monitor holds the device; do not release it */
 } rctx_t;
 
 /* ===========================================================================
@@ -125,45 +111,6 @@ static int arg_tristate(const cJSON *args, const char *key)
     return -1;
 }
 
-static shadow_t *shadow_for(const usbip_backend_device_t *dev)
-{
-    shadow_t *free_slot = NULL;
-    for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES; i++) {
-        shadow_t *s = &s_shadow[i];
-        if (s->used && strcmp(s->busid, dev->busid) == 0) {
-            if (s->devnum != dev->devnum) {     /* re-enumerated: forget what we set */
-                memset(s, 0, sizeof(*s));
-                s->used = true;
-                strlcpy(s->busid, dev->busid, sizeof(s->busid));
-                s->devnum = dev->devnum;
-            }
-            return s;
-        }
-        if (!s->used && free_slot == NULL) {
-            free_slot = s;
-        }
-    }
-    if (free_slot == NULL) {
-        /* Recycle a shadow whose device is gone. */
-        for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES && free_slot == NULL; i++) {
-            usbip_backend_device_t probe;
-            char key[32] = {0};
-            strlcpy(key, s_shadow[i].busid, sizeof(key));
-            if (!usb_backend_get_device_by_busid(key, &probe)) {
-                free_slot = &s_shadow[i];
-            }
-        }
-        if (free_slot == NULL) {
-            free_slot = &s_shadow[0];
-        }
-    }
-    memset(free_slot, 0, sizeof(*free_slot));
-    free_slot->used = true;
-    strlcpy(free_slot->busid, dev->busid, sizeof(free_slot->busid));
-    free_slot->devnum = dev->devnum;
-    return free_slot;
-}
-
 /* Look the device up and classify it.  Returns 0, or an HTTP status with *out set. */
 static int load(const char *busid, int port, rctx_t *c, cJSON **out)
 {
@@ -186,13 +133,22 @@ static int load(const char *busid, int port, rctx_t *c, cJSON **out)
     rescue_parse_config(cfg, n, &c->cfg);
     free(cfg);
     rescue_classify(c->dev.id_vendor, c->dev.id_product, c->dev.bcd_device, &c->cfg, port, &c->caps);
-    c->sh = shadow_for(&c->dev);
     return 0;
 }
 
-/* Take the device for a rescue action: 409 while a USB/IP client has it. */
-static int take(const rctx_t *c, const char *what, cJSON **out)
+/* Take the device for a rescue action: 409 while a USB/IP client or a job
+   has it.  A running serial monitor is shared for EP0-only actions (lines,
+   resets: watch the boot log) and stopped for the others. */
+static int take(rctx_t *c, const char *what, bool share_with_monitor, cJSON **out)
 {
+    if (rescue_job_busy(c->busid)) {
+        return fail(out, 409, "a rescue job is running on this device");
+    }
+    if (share_with_monitor && serial_monitor_active(c->busid)) {
+        c->shared_with_monitor = true;
+        return 0;
+    }
+    serial_monitor_stop(c->busid);
     busid_owner_info_t owner;
     if (busid_owner_try_begin(c->busid, BUSID_OWNER_RESCUE, what, &owner)) {
         return 0;
@@ -209,187 +165,107 @@ static int take(const rctx_t *c, const char *what, cJSON **out)
 
 static void give(const rctx_t *c)
 {
-    busid_owner_end(c->busid, BUSID_OWNER_RESCUE);
+    if (!c->shared_with_monitor) {
+        busid_owner_end(c->busid, BUSID_OWNER_RESCUE);
+    }
 }
 
-static int do_ctrl(rctx_t *c, const rescue_ctrl_t *r, uint8_t *in, size_t in_cap, size_t *in_len)
+/* One control request to EP0 (RP2 reset interface, PICOBOOT). */
+static int do_ctrl(rctx_t *c, const rescue_ctrl_t *r)
 {
     usb_setup_packet_t setup = {
         .bmRequestType = r->bm,
         .bRequest = r->req,
         .wValue = r->value,
         .wIndex = r->index,
-        .wLength = (r->bm & 0x80) ? (uint16_t)in_cap : r->len,
+        .wLength = r->len,
     };
-    size_t got = 0;
     const char *detail = NULL;
-    const int st = usb_backend_transfer_sync(c->busid, 0, &setup,
-                                             (r->bm & 0x80) ? NULL : r->data,
-                                             (r->bm & 0x80) ? 0 : r->len,
-                                             in, (r->bm & 0x80) ? in_cap : 0,
-                                             RESCUE_CTRL_TIMEOUT_MS, &got, &detail);
-    if (in_len != NULL) {
-        *in_len = got;
-    }
+    const int st = usb_backend_transfer_sync(c->busid, 0, &setup, r->data, r->len, NULL, 0,
+                                             RESCUE_CTRL_TIMEOUT_MS, NULL, &detail);
     if (c->log != NULL) {
         char line[96];
         snprintf(line, sizeof(line), "ctrl %02x %02x %04x %04x len=%u -> %d%s%s",
-                 r->bm, r->req, r->value, r->index, (unsigned)setup.wLength, st,
+                 r->bm, r->req, r->value, r->index, (unsigned)r->len, st,
                  detail ? " " : "", detail ? detail : "");
         cJSON_AddItemToArray(c->log, cJSON_CreateString(line));
     }
     return st;
 }
 
-/* CH34x: version, quirk probe and serial init, once per enumeration (what
-   the Linux driver does at probe; nothing has configured the chip here). */
-static int ch34x_prepare(rctx_t *c)
+/* Open the device's serial function on top of a loaded context. */
+static int open_link(rctx_t *c, int port, serial_link_t **out_link, cJSON **out)
 {
-    if (c->caps.serial != RESCUE_SERIAL_CH34X || c->sh->ch34x_ready) {
-        return 0;
+    serial_link_t *l = calloc(1, sizeof(*l));
+    if (l == NULL) {
+        return fail(out, 503, "out of memory");
     }
-    uint8_t buf[2] = {0};
-    size_t n = 0;
-    rescue_ctrl_t r = { .bm = 0xC0, .req = RESCUE_CH341_REQ_READ_VERSION };
-    int st = do_ctrl(c, &r, buf, sizeof(buf), &n);
+    char msg[128];
+    const int st = serial_link_open(l, c->busid, port, msg, sizeof(msg));
     if (st != 0) {
-        return st;
+        free(l);
+        return fail(out, st, msg);
     }
-    c->sh->ch34x_version = buf[0];
-    r = (rescue_ctrl_t){ .bm = 0xC0, .req = RESCUE_CH341_REQ_READ_REG, .value = RESCUE_CH341_REG_BREAK };
-    st = do_ctrl(c, &r, buf, sizeof(buf), &n);
-    c->sh->ch34x_limited = (st == -EPIPE);      /* no break control: limited prescaler */
-    r = (rescue_ctrl_t){ .bm = 0x40, .req = RESCUE_CH341_REQ_SERIAL_INIT };
-    st = do_ctrl(c, &r, NULL, 0, NULL);
-    if (st != 0) {
-        return st;
-    }
-    c->sh->ch34x_ready = true;
+    l->log = c->log;
+    *out_link = l;
     return 0;
 }
 
-/* Before any line or baud request: CP210x needs its UART enabled; CH34x its
-   one-time setup. */
-static int serial_prepare(rctx_t *c)
+static void close_link(serial_link_t *l)
 {
-    rescue_ctrl_t r;
-    if (rescue_cp210x_enable_request(&c->caps, &r)) {
-        return do_ctrl(c, &r, NULL, 0, NULL);
+    if (l != NULL) {
+        serial_link_close(l);
+        free(l);
     }
-    return ch34x_prepare(c);
 }
 
-static int set_lines(rctx_t *c, bool dtr, bool rts)
-{
-    rescue_ctrl_t reqs[RESCUE_MAX_REQS];
-    const int n = rescue_lines_requests(&c->caps, dtr, rts, reqs, RESCUE_MAX_REQS);
-    if (n <= 0) {
-        return -EOPNOTSUPP;
-    }
-    for (int i = 0; i < n; i++) {
-        const int st = do_ctrl(c, &reqs[i], NULL, 0, NULL);
-        if (st != 0) {
-            return st;
-        }
-    }
-    c->sh->lines_known = true;
-    c->sh->dtr = dtr;
-    c->sh->rts = rts;
-    return 0;
-}
+/* ===========================================================================
+ *  Shared with the jobs (esp_flasher.c etc.)
+ * ======================================================================== */
 
-static int set_baud(rctx_t *c, uint32_t baud)
+int device_rescue_run_line_seq(serial_link_t *l, rescue_mode_t mode, bool *dropped)
 {
-    rescue_ctrl_t reqs[RESCUE_MAX_REQS];
-    const int n = rescue_baud_requests(&c->caps, baud, c->sh->ch34x_version, c->sh->ch34x_limited,
-                                       reqs, RESCUE_MAX_REQS);
-    if (n < 0) {
+    const rescue_line_seq_t *seq = rescue_mode_line_seq(mode);
+    if (seq == NULL) {
         return -EINVAL;
     }
-    for (int i = 0; i < n; i++) {
-        const int st = do_ctrl(c, &reqs[i], NULL, 0, NULL);
+    *dropped = false;
+    for (int i = 0; i < seq->num_steps; i++) {
+        const rescue_line_step_t *s = &seq->steps[i];
+        const int st = serial_link_set_lines(l, s->dtr, s->rts);
         if (st != 0) {
+            /* From the commit step on, failing is the device leaving the bus. */
+            if (seq->commit_step >= 0 && i >= seq->commit_step) {
+                *dropped = true;
+                return 0;
+            }
             return st;
         }
+        if (s->delay_ms) {
+            vTaskDelay(pdMS_TO_TICKS(s->delay_ms));
+        }
     }
-    c->sh->baud = baud;
     return 0;
 }
 
-static const char *errno_name(int st)
+bool device_rescue_wait_reenumeration(const char *busid, uint32_t devnum, int wait_ms,
+                                      usbip_backend_device_t *now, bool *dropped)
 {
-    switch (st) {
-    case 0: return "ok";
-    case -ENODEV: return "ENODEV (device gone)";
-    case -ETIMEDOUT: return "ETIMEDOUT";
-    case -ECONNRESET: return "ECONNRESET (cancelled: no answer in time)";
-    case -EPIPE: return "EPIPE (stall)";
-    case -EPROTO: return "EPROTO";
-    case -EIO: return "EIO";
-    case -ENOMEM: return "ENOMEM";
-    case -EINVAL: return "EINVAL";
-    case -EOPNOTSUPP: return "EOPNOTSUPP";
-    default: return "error";
-    }
-}
-
-/* A failed bulk transfer: name channel exhaustion when that is what it was. */
-static void explain_bulk_failure(const char *busid, uint32_t failures_before, char *msg, size_t len,
-                                 int st, const char *what)
-{
-    usb_backend_claims_device_t *devs = calloc(CONFIG_USBIP_MAX_DEVICES, sizeof(*devs));
-    usb_backend_claims_totals_t totals;
-    bool exhausted = false;
-    if (devs != NULL) {
-        const size_t n = usb_backend_get_claims(devs, CONFIG_USBIP_MAX_DEVICES, &totals);
-        for (size_t i = 0; i < n; i++) {
-            if (strncmp(devs[i].busid, busid, 31) == 0) {
-                exhausted = devs[i].claim_failures > failures_before && devs[i].last_claim_was_exhaustion;
-            }
+    const int64_t t0 = now_ms();
+    char key[32] = {0};
+    strlcpy(key, busid, sizeof(key));
+    *dropped = false;
+    while (now_ms() - t0 < wait_ms) {
+        const bool present = usb_backend_get_device_by_busid(key, now);
+        if (!present || now->devnum != devnum) {
+            *dropped = true;
         }
-        free(devs);
-    }
-    if (exhausted) {
-        snprintf(msg, len, "%s: interface claim failed: no free USB host channel (see /api/usb/claims)", what);
-    } else {
-        snprintf(msg, len, "%s failed: %s (%d)", what, errno_name(st), st);
-    }
-}
-
-static uint32_t claim_failures(const char *busid)
-{
-    usb_backend_claims_device_t *devs = calloc(CONFIG_USBIP_MAX_DEVICES, sizeof(*devs));
-    usb_backend_claims_totals_t totals;
-    uint32_t f = 0;
-    if (devs != NULL) {
-        const size_t n = usb_backend_get_claims(devs, CONFIG_USBIP_MAX_DEVICES, &totals);
-        for (size_t i = 0; i < n; i++) {
-            if (strncmp(devs[i].busid, busid, 31) == 0) {
-                f = devs[i].claim_failures;
-            }
+        if (present && now->devnum != devnum) {
+            return true;
         }
-        free(devs);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    return f;
-}
-
-static cJSON *lines_json(const shadow_t *sh)
-{
-    cJSON *o = cJSON_CreateObject();
-    if (sh->baud) {
-        cJSON_AddNumberToObject(o, "baud", sh->baud);
-    } else {
-        cJSON_AddNullToObject(o, "baud");
-    }
-    if (sh->lines_known) {
-        cJSON_AddBoolToObject(o, "dtr", sh->dtr);
-        cJSON_AddBoolToObject(o, "rts", sh->rts);
-    } else {
-        cJSON_AddNullToObject(o, "dtr");
-        cJSON_AddNullToObject(o, "rts");
-    }
-    cJSON_AddStringToObject(o, "note", "last set by this bridge since the device enumerated (null = never)");
-    return o;
+    return false;
 }
 
 /* ===========================================================================
@@ -442,6 +318,16 @@ static void add_port_power(cJSON *j, const char *busid)
     }
     cJSON_AddBoolToObject(o, "read_only", true);
     free(snap);
+}
+
+static bool has_msc(const rescue_config_t *cfg)
+{
+    for (int i = 0; i < cfg->num_ifaces; i++) {
+        if (cfg->ifaces[i].cls == 0x08 && cfg->ifaces[i].subclass == 0x06 && cfg->ifaces[i].protocol == 0x50) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int device_rescue_info(const char *busid, cJSON **out)
@@ -507,6 +393,8 @@ int device_rescue_info(const char *busid, cJSON **out)
         cJSON_AddNullToObject(j, "owner");
         cJSON_AddBoolToObject(j, "imported", false);
     }
+    cJSON_AddBoolToObject(j, "monitor", serial_monitor_active(d->busid));
+    cJSON_AddBoolToObject(j, "job_running", rescue_job_busy(d->busid));
     add_port_power(j, d->busid);
 
     const rescue_caps_t *k = &c->caps;
@@ -524,7 +412,7 @@ int device_rescue_info(const char *busid, cJSON **out)
             cJSON_AddBoolToObject(s, "ftdi_hispeed", k->ftdi_hispeed);
             cJSON_AddBoolToObject(s, "baud_supported", k->ftdi_baud_supported);
         }
-        cJSON_AddItemToObject(s, "last_set", lines_json(c->sh));
+        cJSON_AddItemToObject(s, "last_set", serial_link_last_set_json(d->busid, d->devnum));
     }
     cJSON *rp = cJSON_AddObjectToObject(j, "rp");
     cJSON_AddNumberToObject(rp, "reset_interface", k->rp_reset_if);
@@ -549,6 +437,20 @@ int device_rescue_info(const char *busid, cJSON **out)
         cJSON_AddNullToObject(j, "bootloader_mode");
     }
     cJSON_AddBoolToObject(j, "console", k->serial != RESCUE_SERIAL_NONE);
+    /* What can program this device from here. */
+    cJSON *fl = cJSON_AddArrayToObject(j, "flashers");
+    if (k->serial != RESCUE_SERIAL_NONE) {
+        cJSON_AddItemToArray(fl, cJSON_CreateString("esp"));
+        cJSON_AddItemToArray(fl, cJSON_CreateString("samba"));
+    }
+    if (k->picoboot_if >= 0) {
+        cJSON_AddItemToArray(fl, cJSON_CreateString("picoboot"));
+    }
+    const bool msc = has_msc(&c->cfg);
+    if (msc) {
+        cJSON_AddItemToArray(fl, cJSON_CreateString("uf2"));
+    }
+    cJSON_AddBoolToObject(j, "mass_storage", msc);
     cJSON *lim = cJSON_AddObjectToObject(j, "limits");
     cJSON_AddNumberToObject(lim, "capture_s_max", RESCUE_CAPTURE_MAX_MS / 1000);
     cJSON_AddNumberToObject(lim, "session_s_max", RESCUE_SESSION_MAX_MS / 1000);
@@ -566,54 +468,62 @@ int device_rescue_serial(const char *busid, const cJSON *args, cJSON **out)
 {
     int port = 0;
     arg_int(args, "port", &port);
-    rctx_t *c = calloc(1, sizeof(*c));
-    if (c == NULL) {
-        return fail(out, 503, "out of memory");
-    }
-    int st = load(busid, port, c, out);
-    if (st != 0) {
-        free(c);
-        return st;
-    }
-    if (c->caps.serial == RESCUE_SERIAL_NONE) {
-        free(c);
-        return fail(out, 409, "no serial function (CDC-ACM, CP210x, CH34x or FTDI) on this device/port");
-    }
     int baud = 0;
     const bool has_baud = arg_int(args, "baud", &baud);
     const int dtr = arg_tristate(args, "dtr");
     const int rts = arg_tristate(args, "rts");
     if (!has_baud && dtr < 0 && rts < 0) {
-        free(c);
         return fail(out, 400, "give baud and/or dtr / rts");
     }
     if (has_baud && (baud < 50 || baud > 12000000)) {
-        free(c);
         return fail(out, 400, "baud 50-12000000");
     }
     if (has_baud && baud == 1200 && !cJSON_IsTrue(arg(args, "allow_1200"))) {
-        free(c);
         return fail(out, 400, "1200 baud is the bootloader touch on many boards: use reset mode touch_1200, "
                               "or pass allow_1200: true");
     }
-    st = take(c, "rescue:serial", out);
+    rctx_t *c = calloc(1, sizeof(*c));
+    if (c == NULL) {
+        return fail(out, 503, "out of memory");
+    }
+    int st = load(busid, port, c, out);
+    if (st == 0) {
+        st = take(c, "rescue:serial", true, out);
+    }
     if (st != 0) {
         free(c);
         return st;
     }
     c->log = cJSON_CreateArray();
+    serial_link_t *l = NULL;
+    st = open_link(c, port, &l, out);
+    if (st != 0) {
+        give(c);
+        cJSON_Delete(c->log);
+        free(c);
+        return st;
+    }
     const char *step = "prepare";
-    st = serial_prepare(c);
+    st = serial_link_prepare(l);
     if (st == 0 && has_baud) {
         step = "baud";
-        st = set_baud(c, (uint32_t)baud);
+        st = serial_link_set_baud(l, (uint32_t)baud);
     }
     if (st == 0 && (dtr >= 0 || rts >= 0)) {
         step = "lines";
         /* Lines not given keep what the bridge last set (deasserted if never). */
-        const bool d = dtr >= 0 ? dtr == 1 : (c->sh->lines_known && c->sh->dtr);
-        const bool r = rts >= 0 ? rts == 1 : (c->sh->lines_known && c->sh->rts);
-        st = set_lines(c, d, r);
+        bool d, r;
+        serial_link_get_lines(l, &d, &r);
+        st = serial_link_set_lines(l, dtr >= 0 ? dtr == 1 : d, rts >= 0 ? rts == 1 : r);
+    }
+    /* Only control transfers here: nothing claimed to release while a monitor reads. */
+    if (c->shared_with_monitor) {
+        vSemaphoreDelete(l->in_sem);
+        l->in_sem = NULL;
+        free(l->tx);
+        free(l);
+    } else {
+        close_link(l);
     }
     give(c);
 
@@ -621,13 +531,13 @@ int device_rescue_serial(const char *busid, const cJSON *args, cJSON **out)
     cJSON_AddBoolToObject(j, "ok", st == 0);
     if (st != 0) {
         char msg[96];
-        snprintf(msg, sizeof(msg), "%s request failed: %s (%d)", step, errno_name(st), st);
+        snprintf(msg, sizeof(msg), "%s request failed: %s (%d)", step, serial_link_errno_name(st), st);
         cJSON_AddStringToObject(j, "error", msg);
     }
     cJSON_AddStringToObject(j, "busid", c->busid);
     cJSON_AddStringToObject(j, "serial_kind", rescue_serial_kind_name(c->caps.serial));
     cJSON_AddNumberToObject(j, "port", port);
-    cJSON_AddItemToObject(j, "lines", lines_json(c->sh));
+    cJSON_AddItemToObject(j, "lines", serial_link_last_set_json(c->busid, c->dev.devnum));
     cJSON_AddItemToObject(j, "requests", c->log);
     free(c);
     *out = j;
@@ -638,80 +548,18 @@ int device_rescue_serial(const char *busid, const cJSON *args, cJSON **out)
  *  POST .../reset
  * ======================================================================== */
 
-/* After a reset that drops the device: wait for it to leave and come back
-   on the same busid, and report what came back (a bootloader often has a
-   different VID:PID, e.g. 2e8a:0003 for RP2040 BOOTSEL). */
-static void wait_reenumeration(cJSON *j, const char *busid, uint32_t devnum, int wait_ms)
+static int run_touch_1200(serial_link_t *l, bool *dropped)
 {
-    const int64_t t0 = now_ms();
-    bool gone = false;
-    usbip_backend_device_t d;
-    char key[32] = {0};
-    strlcpy(key, busid, sizeof(key));
-    while (now_ms() - t0 < wait_ms) {
-        const bool present = usb_backend_get_device_by_busid(key, &d);
-        if (!present || d.devnum != devnum) {
-            gone = true;
-        }
-        if (present && d.devnum != devnum) {
-            cJSON *o = cJSON_AddObjectToObject(j, "reenumerated");
-            add_hex(o, "vid", d.id_vendor, 4);
-            add_hex(o, "pid", d.id_product, 4);
-            cJSON_AddStringToObject(o, "product", d.product);
-            cJSON_AddNumberToObject(o, "address", d.dev_addr);
-            cJSON_AddBoolToObject(j, "dropped", true);
-            cJSON_AddNumberToObject(j, "waited_ms", (double)(now_ms() - t0));
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    cJSON_AddNullToObject(j, "reenumerated");
-    cJSON_AddBoolToObject(j, "dropped", gone);
-    cJSON_AddNumberToObject(j, "waited_ms", (double)(now_ms() - t0));
-}
-
-/* Run the DTR/RTS table; failures from the commit step on are the device
-   leaving the bus.  Returns 0, or the errno of a real failure. */
-static int run_line_seq(rctx_t *c, const rescue_line_seq_t *seq, bool *dropped)
-{
-    for (int i = 0; i < seq->num_steps; i++) {
-        const rescue_line_step_t *s = &seq->steps[i];
-        const int st = set_lines(c, s->dtr, s->rts);
-        if (st != 0) {
-            if (seq->commit_step >= 0 && i >= seq->commit_step) {
-                *dropped = true;
-                return 0;
-            }
-            return st;
-        }
-        if (s->delay_ms) {
-            vTaskDelay(pdMS_TO_TICKS(s->delay_ms));
-        }
-    }
-    return 0;
-}
-
-static int run_touch_1200(rctx_t *c, bool *dropped)
-{
-    int st = set_lines(c, true, true);
+    int st = serial_link_set_lines(l, true, true);
     if (st != 0) {
         return st;
     }
-    rescue_ctrl_t r;
-    memset(&r, 0, sizeof(r));
-    r.bm = 0x21;
-    r.req = 0x20;                   /* SET_LINE_CODING 1200 8N1 */
-    r.index = (uint16_t)c->caps.serial_ctrl_if;
-    r.len = 7;
-    rescue_cdc_line_coding(1200, r.data);
-    st = do_ctrl(c, &r, NULL, 0, NULL);
-    if (st != 0) {
+    if (serial_link_set_baud(l, 1200) != 0) {
         *dropped = true;            /* pico-sdk resets on the line coding itself */
         return 0;
     }
-    c->sh->baud = 1200;
     vTaskDelay(pdMS_TO_TICKS(50));
-    if (set_lines(c, false, false) != 0) {
+    if (serial_link_set_lines(l, false, false) != 0) {
         *dropped = true;
     }
     return 0;
@@ -721,20 +569,20 @@ static int run_picoboot(rctx_t *c, bool to_bootsel, bool *dropped, char *msg, si
 {
     rescue_ctrl_t r;
     rescue_picoboot_if_reset_request(c->caps.picoboot_if, &r);
-    int st = do_ctrl(c, &r, NULL, 0, NULL);
+    int st = do_ctrl(c, &r);
     if (st != 0) {
-        snprintf(msg, msg_len, "PICOBOOT interface reset failed: %s (%d)", errno_name(st), st);
+        snprintf(msg, msg_len, "PICOBOOT interface reset failed: %s (%d)", serial_link_errno_name(st), st);
         return st;
     }
     uint8_t cmd[32];
     rescue_picoboot_reboot_cmd(c->caps.rp_chip, to_bootsel, (uint32_t)now_ms(), 500, cmd);
-    const uint32_t failures = claim_failures(c->busid);
     st = usb_backend_transfer_sync(c->busid, c->caps.picoboot_ep_out, NULL, cmd, sizeof(cmd),
                                    NULL, 0, RESCUE_BULK_TIMEOUT_MS, NULL, NULL);
-    cJSON_AddItemToArray(c->log, cJSON_CreateString(st == 0 ? "bulk out picoboot reboot cmd -> 0"
-                                                            : "bulk out picoboot reboot cmd -> failed"));
+    char line[64];
+    snprintf(line, sizeof(line), "bulk out picoboot reboot cmd -> %d", st);
+    cJSON_AddItemToArray(c->log, cJSON_CreateString(line));
     if (st != 0) {
-        explain_bulk_failure(c->busid, failures, msg, msg_len, st, "PICOBOOT command");
+        snprintf(msg, msg_len, "PICOBOOT command failed: %s (%d)", serial_link_errno_name(st), st);
         usb_backend_session_ended(c->busid);
         return st;
     }
@@ -743,7 +591,6 @@ static int run_picoboot(rctx_t *c, bool to_bootsel, bool *dropped, char *msg, si
     size_t n = 0;
     st = usb_backend_transfer_sync(c->busid, c->caps.picoboot_ep_in, NULL, NULL, 0,
                                    ack, sizeof(ack), RESCUE_BULK_TIMEOUT_MS, &n, NULL);
-    char line[48];
     snprintf(line, sizeof(line), "bulk in picoboot ack -> %d", st);
     cJSON_AddItemToArray(c->log, cJSON_CreateString(line));
     *dropped = true;                /* reboots after its 500 ms delay */
@@ -785,6 +632,7 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
     /* Any DTR/RTS sequence may be sent to any serial function (the user may
        know the wiring better); the others need their interface. */
     const rescue_line_seq_t *seq = rescue_mode_line_seq(mode);
+    const bool needs_serial = seq != NULL || mode == RESCUE_MODE_TOUCH_1200;
     const bool ok_here = seq ? c->caps.serial != RESCUE_SERIAL_NONE : rescue_mode_applicable(&c->caps, mode);
     if (!ok_here) {
         char msg[96];
@@ -792,7 +640,9 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
         free(c);
         return fail(out, 409, msg);
     }
-    st = take(c, "rescue:reset", out);
+    /* Line sequences share the device with a monitor (the boot log is the point);
+       PICOBOOT claims an interface, so it does not. */
+    st = take(c, "rescue:reset", needs_serial, out);
     if (st != 0) {
         free(c);
         return st;
@@ -803,18 +653,31 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
     char msg[128] = "";
     ESP_LOGI(TAG, "%s: reset mode %s", c->busid, rescue_mode_name(mode));
 
-    if (seq != NULL) {
-        st = serial_prepare(c);
-        if (st == 0) {
-            st = run_line_seq(c, seq, &dropped);
+    if (needs_serial) {
+        serial_link_t *l = NULL;
+        st = open_link(c, port, &l, out);
+        if (st != 0) {
+            give(c);
+            cJSON_Delete(c->log);
+            free(c);
+            return st;
         }
-    } else if (mode == RESCUE_MODE_TOUCH_1200) {
-        st = run_touch_1200(c, &dropped);
+        st = serial_link_prepare(l);
+        if (st == 0) {
+            st = (seq != NULL) ? device_rescue_run_line_seq(l, mode, &dropped) : run_touch_1200(l, &dropped);
+        }
+        if (c->shared_with_monitor) {
+            vSemaphoreDelete(l->in_sem);
+            free(l->tx);
+            free(l);
+        } else {
+            close_link(l);
+        }
     } else if (mode == RESCUE_MODE_RP_BOOTSEL || mode == RESCUE_MODE_RP_REBOOT) {
         rescue_ctrl_t r;
         rescue_rp_reset_request(c->caps.rp_reset_if, mode == RESCUE_MODE_RP_BOOTSEL, &r);
         /* The device reboots from the SETUP stage: no status stage is normal. */
-        (void)do_ctrl(c, &r, NULL, 0, NULL);
+        (void)do_ctrl(c, &r);
         dropped = true;
         st = 0;
     } else {
@@ -826,7 +689,7 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
     cJSON_AddBoolToObject(j, "ok", st == 0);
     if (st != 0) {
         if (msg[0] == '\0') {
-            snprintf(msg, sizeof(msg), "request failed: %s (%d)", errno_name(st), st);
+            snprintf(msg, sizeof(msg), "request failed: %s (%d)", serial_link_errno_name(st), st);
         }
         cJSON_AddStringToObject(j, "error", msg);
     }
@@ -842,7 +705,20 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
         } else if (wait_ms > RESCUE_WAIT_MAX_MS) {
             wait_ms = RESCUE_WAIT_MAX_MS;
         }
-        wait_reenumeration(j, c->busid, devnum, wait_ms);
+        const int64_t t0 = now_ms();
+        usbip_backend_device_t d;
+        bool gone = dropped;
+        if (wait_ms > 0 && device_rescue_wait_reenumeration(c->busid, devnum, wait_ms, &d, &gone)) {
+            cJSON *o = cJSON_AddObjectToObject(j, "reenumerated");
+            add_hex(o, "vid", d.id_vendor, 4);
+            add_hex(o, "pid", d.id_product, 4);
+            cJSON_AddStringToObject(o, "product", d.product);
+            cJSON_AddNumberToObject(o, "address", d.dev_addr);
+        } else {
+            cJSON_AddNullToObject(j, "reenumerated");
+        }
+        cJSON_AddBoolToObject(j, "dropped", gone || dropped);
+        cJSON_AddNumberToObject(j, "waited_ms", (double)(now_ms() - t0));
     }
     free(c);
     *out = j;
@@ -852,20 +728,6 @@ int device_rescue_reset(const char *busid, const cJSON *args, cJSON **out)
 /* ===========================================================================
  *  POST .../console
  * ======================================================================== */
-
-typedef struct {
-    SemaphoreHandle_t sem;
-    int status;
-    size_t len;
-} in_wait_t;
-
-static void console_in_done(usb_backend_req_t *req, int status, size_t in_len)
-{
-    in_wait_t *w = (in_wait_t *)req->ctx;
-    w->status = status;
-    w->len = in_len;
-    xSemaphoreGive(w->sem);
-}
 
 typedef struct {
     char label[24];
@@ -955,67 +817,57 @@ int device_rescue_console(const char *busid, const cJSON *args, cJSON **out)
 
     rctx_t *c = calloc(1, sizeof(*c));
     uint8_t *data = malloc((size_t)max_bytes);
-    uint8_t *chunk = malloc(RESCUE_IN_CHUNK);
-    in_wait_t w = { .sem = xSemaphoreCreateBinary() };
-    if (c == NULL || data == NULL || chunk == NULL || w.sem == NULL) {
+    serial_link_t *l = NULL;
+    if (c == NULL || data == NULL) {
         st = fail(out, 503, "out of memory");
         goto free_all;
     }
     st = load(busid, port, c, out);
-    if (st != 0) {
-        goto free_all;
+    if (st == 0) {
+        st = take(c, "rescue:console", false, out);     /* stops a monitor */
     }
-    if (c->caps.serial == RESCUE_SERIAL_NONE) {
-        st = fail(out, 409, "no serial function (CDC-ACM, CP210x, CH34x or FTDI) on this device/port");
-        goto free_all;
-    }
-    st = take(c, "rescue:console", out);
     if (st != 0) {
         goto free_all;
     }
     c->log = cJSON_CreateArray();
+    st = open_link(c, port, &l, out);
+    if (st != 0) {
+        give(c);
+        cJSON_Delete(c->log);
+        goto free_all;
+    }
 
     char err[128] = "";
-    st = serial_prepare(c);
+    st = serial_link_prepare(l);
     if (st == 0) {
-        st = set_baud(c, (uint32_t)baud);
+        st = serial_link_set_baud(l, (uint32_t)baud);
     }
     /* Lines are only touched when asked: on 303a:1001 some transitions reset the chip. */
     if (st == 0 && (dtr >= 0 || rts >= 0)) {
-        const bool d = dtr >= 0 ? dtr == 1 : (c->sh->lines_known && c->sh->dtr);
-        const bool r = rts >= 0 ? rts == 1 : (c->sh->lines_known && c->sh->rts);
-        st = set_lines(c, d, r);
+        bool d, r;
+        serial_link_get_lines(l, &d, &r);
+        st = serial_link_set_lines(l, dtr >= 0 ? dtr == 1 : d, rts >= 0 ? rts == 1 : r);
     }
     if (st != 0) {
-        snprintf(err, sizeof(err), "serial setup failed: %s (%d)", errno_name(st), st);
+        snprintf(err, sizeof(err), "serial setup failed: %s (%d)", serial_link_errno_name(st), st);
     }
 
     size_t total = 0;
     bool truncated = false;
     int read_status = 0, write_errors = 0;
-    const uint32_t failures_before = claim_failures(c->busid);
     const int64_t t0 = now_ms();
     if (st == 0) {
-        usb_backend_req_t req;
-        memset(&req, 0, sizeof(req));
-        strlcpy(req.busid, c->busid, sizeof(req.busid));
-        req.endpoint_addr = c->caps.ep_in;
-        req.in_data = chunk;
-        req.in_capacity = RESCUE_IN_CHUNK;
-        req.done = console_in_done;
-        req.ctx = &w;
-        usb_backend_submit(&req);
-        bool in_active = true;
-
         int64_t next_poke = t0 + poke_lead_ms;
         int poke_i = 0;
         const int64_t end = t0 + span_ms;
+        bool reading = true;
         while (true) {
             const int64_t now = now_ms();
             if (poke_i < npokes && now >= next_poke) {
-                const int ws = usb_backend_transfer_sync(c->busid, c->caps.ep_out, NULL,
-                                                         pokes[poke_i].data, (size_t)pokes[poke_i].len,
-                                                         NULL, 0, RESCUE_BULK_TIMEOUT_MS, NULL, NULL);
+                int ws = serial_link_write(l, pokes[poke_i].data, (size_t)pokes[poke_i].len);
+                if (ws == 0) {
+                    ws = serial_link_flush(l, RESCUE_BULK_TIMEOUT_MS);
+                }
                 char line[64];
                 snprintf(line, sizeof(line), "poke %s -> %d", pokes[poke_i].label, ws);
                 cJSON_AddItemToArray(c->log, cJSON_CreateString(line));
@@ -1030,57 +882,26 @@ int device_rescue_console(const char *busid, const cJSON *args, cJSON **out)
                 break;
             }
             const int64_t deadline = (poke_i < npokes && next_poke < end) ? next_poke : end;
-            if (!in_active) {
+            if (!reading) {
                 vTaskDelay(pdMS_TO_TICKS(deadline - now < 50 ? deadline - now + 1 : 50));
                 continue;
             }
-            if (xSemaphoreTake(w.sem, pdMS_TO_TICKS(deadline - now) + 1) != pdTRUE) {
-                continue;
-            }
-            if (w.status != 0) {
-                read_status = w.status;
-                in_active = false;
-                explain_bulk_failure(c->busid, failures_before, err, sizeof(err), w.status, "serial read");
-                continue;
-            }
-            size_t n = w.len;
-            if (c->caps.serial == RESCUE_SERIAL_FTDI) {
-                n = rescue_ftdi_strip_status(chunk, n, c->caps.mps_in ? c->caps.mps_in : 64);
-            }
-            const size_t room = (size_t)max_bytes - total;
-            if (n > room) {
-                n = room;
-                truncated = true;
-            }
-            memcpy(&data[total], chunk, n);
-            total += n;
-            if (total >= (size_t)max_bytes) {
-                truncated = true;
-                in_active = false;
-                continue;
-            }
-            req.cancel = false;
-            usb_backend_submit(&req);
-        }
-        if (in_active) {
-            usb_backend_cancel(&req);
-            xSemaphoreTake(w.sem, portMAX_DELAY);       /* done() always follows a cancel */
-            if (w.status == 0 && w.len > 0) {
-                size_t n = w.len;
-                if (c->caps.serial == RESCUE_SERIAL_FTDI) {
-                    n = rescue_ftdi_strip_status(chunk, n, c->caps.mps_in ? c->caps.mps_in : 64);
-                }
-                if (n > (size_t)max_bytes - total) {
-                    n = (size_t)max_bytes - total;
+            const int n = serial_link_read(l, &data[total], (size_t)max_bytes - total, (uint32_t)(deadline - now));
+            if (n < 0) {
+                read_status = n;
+                reading = false;
+                serial_link_explain(l, n, "serial read", err, sizeof(err));
+            } else {
+                total += (size_t)n;
+                if (total >= (size_t)max_bytes) {
                     truncated = true;
+                    reading = false;
                 }
-                memcpy(&data[total], chunk, n);
-                total += n;
             }
         }
     }
-    /* Free the data interface's host channels for USB/IP sessions. */
-    usb_backend_session_ended(c->busid);
+    close_link(l);
+    l = NULL;
     give(c);
 
     cJSON *j = cJSON_CreateObject();
@@ -1111,16 +932,13 @@ int device_rescue_console(const char *busid, const cJSON *args, cJSON **out)
     }
     free(text);
     free(hex);
-    cJSON_AddItemToObject(j, "lines", lines_json(c->sh));
+    cJSON_AddItemToObject(j, "lines", serial_link_last_set_json(c->busid, c->dev.devnum));
     cJSON_AddItemToObject(j, "requests", c->log);
     *out = j;
     st = ok ? 200 : 502;
 
 free_all:
-    if (w.sem != NULL) {
-        vSemaphoreDelete(w.sem);
-    }
-    free(chunk);
+    close_link(l);
     free(data);
     free(c);
     free(pokes);

@@ -23,6 +23,7 @@
 #include "driver/gpio.h"
 
 #include "board_pins.h"
+#include "blob_store.h"
 #include "cJSON.h"
 #include "controller_api.h"
 #include "device_naming.h"
@@ -1375,6 +1376,126 @@ static void handle_post_config(int fd, const char *body, size_t body_len)
     send_json_ok(fd, resp, rlen);
 }
 
+static void send_status_json(int fd, int status, const char *msg)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", status < 300);
+    if (status >= 300) {
+        cJSON_AddStringToObject(j, "error", msg);
+    }
+    api_response_t r = { .status = status };
+    r.body = cJSON_PrintUnformatted(j);
+    r.len = r.body ? strlen(r.body) : 0;
+    send_api_response(fd, &r);
+    cJSON_free(r.body);
+    cJSON_Delete(j);
+}
+
+/* PUT/POST /api/rescue/files/{name}: the raw body into PSRAM.
+   GET /api/rescue/files/{name}: the bytes back. */
+static void handle_rescue_file(int fd, const http_request_t *req, const char *head, size_t head_len)
+{
+    char name[BLOB_NAME_MAX];
+    const char *n = req->url + 18;
+    size_t nl = strcspn(n, "?");
+    if (nl >= sizeof(name)) {
+        send_status_json(fd, 400, "name too long");
+        return;
+    }
+    memcpy(name, n, nl);
+    name[nl] = '\0';
+    if (!blob_name_valid(name)) {
+        send_status_json(fd, 400, "file names are [A-Za-z0-9._-], not starting with '.'");
+        return;
+    }
+    if (strcmp(req->method, "GET") == 0 || strcmp(req->method, "HEAD") == 0) {
+        const uint8_t *data;
+        size_t len;
+        if (!blob_acquire(name, &data, &len)) {
+            send_status_json(fd, 404, "no such staged file");
+            return;
+        }
+        char hdr[384];
+        const int hn = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %u\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n", (unsigned)len, name);
+        int err = 0;
+        send_all(fd, hdr, hn, &err);
+        if (strcmp(req->method, "GET") == 0) {
+            for (size_t off = 0; off < len && err == 0; off += 4096) {
+                send_all(fd, (const char *)data + off, (len - off) < 4096 ? (int)(len - off) : 4096, &err);
+            }
+        }
+        blob_release(name);
+        return;
+    }
+    if (!controller_api_authorized(req->auth[0] ? req->auth : NULL)) {
+        http_401(fd);
+        return;
+    }
+    if (req->content_length <= 0) {
+        send_status_json(fd, 411, "Content-Length required (the file is the raw request body)");
+        return;
+    }
+    const size_t size = (size_t)req->content_length;
+    if (size > blob_space()) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "too large: %u bytes free for staged files", (unsigned)blob_space());
+        send_status_json(fd, 413, msg);
+        return;
+    }
+    uint8_t *dst = NULL;
+    const esp_err_t err = blob_begin(name, size, &dst);
+    if (err != ESP_OK) {
+        send_status_json(fd, err == ESP_ERR_INVALID_STATE ? 409 : 413,
+                         err == ESP_ERR_INVALID_STATE ? "a file of that name is in use by a running job"
+                                                      : "not enough PSRAM");
+        return;
+    }
+    size_t got = 0;
+    const char *start = memmem(head, head_len, "\r\n\r\n", 4);
+    if (start != NULL) {
+        start += 4;
+        size_t already = head + head_len - start;
+        if (already > size) {
+            already = size;
+        }
+        memcpy(dst, start, already);
+        got = already;
+    }
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (got < size) {
+        const int r = read(fd, dst + got, size - got);
+        if (r <= 0) {
+            break;
+        }
+        got += (size_t)r;
+    }
+    if (got != size) {
+        blob_abort(name);
+        send_status_json(fd, 400, "upload ended early");
+        return;
+    }
+    blob_commit(name, size);
+    ESP_LOGI(TAG, "staged %s (%u bytes)", name, (unsigned)size);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddStringToObject(j, "name", name);
+    cJSON_AddNumberToObject(j, "size", (double)size);
+    api_response_t r = { .status = 200 };
+    r.body = cJSON_PrintUnformatted(j);
+    r.len = r.body ? strlen(r.body) : 0;
+    send_api_response(fd, &r);
+    cJSON_free(r.body);
+    cJSON_Delete(j);
+}
+
 static void handle_connection(int fd)
 {
     char *buf = malloc(HTTP_BUF_SIZE);
@@ -1402,6 +1523,16 @@ static void handle_connection(int fd)
 
     http_request_t req;
     if (!parse_request(buf, total, &req)) { free(buf); http_400(fd, "Bad request"); return; }
+
+    /* Staged rescue files are streamed straight into and out of PSRAM:
+       they are megabytes, the request buffers here are kilobytes. */
+    if (strncmp(req.url, "/api/rescue/files/", 18) == 0 &&
+            (strcmp(req.method, "PUT") == 0 || strcmp(req.method, "POST") == 0 ||
+             strcmp(req.method, "GET") == 0 || strcmp(req.method, "HEAD") == 0)) {
+        handle_rescue_file(fd, &req, buf, total);
+        free(buf);
+        return;
+    }
 
     /* Read body if present.  Grows up to 8 KiB so the config import
        endpoint (which may carry the full pin→wire mapping) is not

@@ -168,6 +168,70 @@ void rescue_picoboot_if_reset_request(int iface, rescue_ctrl_t *out);
 void rescue_picoboot_reboot_cmd(rescue_rp_chip_t chip, bool to_bootsel, uint32_t token,
                                 uint32_t delay_ms, uint8_t out[32]);
 
+/* Any PICOBOOT command: 32 bytes with args (at most 16 bytes) and the data
+   phase length.  Bit 7 of cmd_id marks an IN (device-to-host) data phase. */
+void rescue_picoboot_cmd(uint8_t cmd_id, uint32_t token, const uint8_t *args, uint8_t args_len,
+                         uint32_t transfer_len, uint8_t out[32]);
+/* PC_FLASH_ERASE / PC_READ / PC_WRITE range arguments. */
+void rescue_picoboot_range_cmd(uint8_t cmd_id, uint32_t token, uint32_t addr, uint32_t size,
+                               uint32_t transfer_len, uint8_t out[32]);
+#define RESCUE_PC_EXCLUSIVE_ACCESS 0x01
+#define RESCUE_PC_FLASH_ERASE      0x03
+#define RESCUE_PC_READ             0x84
+#define RESCUE_PC_WRITE            0x05
+#define RESCUE_PC_EXIT_XIP         0x06
+#define RESCUE_PICOBOOT_STATUS_REQ 0x42  /* IF_CMD_STATUS control request (16 bytes IN) */
+const char *rescue_picoboot_status_name(uint32_t status);
+
+/* UF2 (https://github.com/microsoft/uf2) */
+#define RESCUE_UF2_BLOCK          512
+#define RESCUE_UF2_FLAG_NOT_MAIN  0x00000001u
+#define RESCUE_UF2_FLAG_FAMILY    0x00002000u
+
+typedef struct {
+    uint32_t flags;
+    uint32_t target_addr;
+    uint32_t payload_size;
+    uint32_t block_no;
+    uint32_t num_blocks;
+    uint32_t family_id;         /* 0 when the block carries none */
+    const uint8_t *data;        /* payload_size bytes */
+} rescue_uf2_block_t;
+
+/* Parse the index-th 512-byte block.  False when the magic numbers or the
+   payload size are wrong. */
+bool rescue_uf2_block(const uint8_t *file, size_t len, size_t index, rescue_uf2_block_t *out);
+/* Family name for a UF2 family id ("rp2040", "rp2350-arm-s", "samd21", ...), NULL if unknown. */
+const char *rescue_uf2_family_name(uint32_t family_id);
+/* Whether a UF2 family can be loaded into this RP2 chip over PICOBOOT. */
+bool rescue_uf2_family_fits_rp(uint32_t family_id, rescue_rp_chip_t chip);
+
+/* USB mass storage, Bulk-Only Transport + SCSI */
+void rescue_msc_cbw(uint32_t tag, uint32_t data_len, bool data_in, uint8_t lun,
+                    const uint8_t *cdb, uint8_t cdb_len, uint8_t out[31]);
+/* Parse a 13-byte CSW: true when the signature and tag match. */
+bool rescue_msc_csw(const uint8_t *csw, size_t len, uint32_t tag, uint32_t *residue, uint8_t *status);
+/* READ(10) (0x28) / WRITE(10) (0x2A) */
+void rescue_scsi_rw10(uint8_t op, uint32_t lba, uint16_t count, uint8_t cdb[10]);
+/* READ CAPACITY(10) data: last LBA and block length (big endian). */
+void rescue_scsi_capacity(const uint8_t data[8], uint32_t *blocks, uint32_t *block_size);
+
+/* SAM-BA (BOSSA) */
+/* CRC-16/XMODEM as SAM-BA's Z command computes it (poly 0x1021, init 0). */
+uint16_t rescue_crc16_xmodem(const uint8_t *data, size_t len, uint16_t crc);
+
+typedef struct {
+    const char *family;         /* "SAMD21", "SAMD51", "SAME51", ... or NULL when unsupported */
+    uint32_t app_offset;        /* the usual bootloader size (Arduino/Adafruit bootloaders) */
+    uint32_t user_ram;          /* RAM BOSSA uses for its buffers */
+} rescue_samba_chip_t;
+
+/* From CPUID (0xE000ED00) and the DSU device id (0x41002018); flash_size
+   (from NVMCTRL PARAM) picks the SAMD21 RAM layout. */
+void rescue_samba_chip(uint32_t cpuid, uint32_t device_id, uint32_t flash_size, rescue_samba_chip_t *out);
+/* Flash size from NVMCTRL PARAM (0x41004008): NVMP pages of 8 << PSZ bytes. */
+uint32_t rescue_samba_flash_size(uint32_t nvm_param, uint32_t *page_size);
+
 /* Console helpers */
 /* A named poke ("enter", "ctrl_c", "ctrl_d") into out; returns its length, -1 if unknown. */
 int rescue_named_poke(const char *name, uint8_t *out, size_t cap);
