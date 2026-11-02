@@ -115,20 +115,21 @@ const char *dpl_esp_subtype_name(uint8_t type, uint8_t subtype, char *buf, size_
  *  RP2040 / RP2350
  * ======================================================================== */
 
-bool dpl_arduino_pico_layout(const uint8_t words[16], uint32_t *fs_start, uint32_t *fs_end,
+bool dpl_arduino_pico_layout(const uint8_t words[16], bool rp2350, uint32_t *fs_start, uint32_t *fs_end,
                              uint32_t *eeprom_start, uint32_t *flash_size)
 {
     const uint32_t fs = le32(&words[0]), fe = le32(&words[4]), ee = le32(&words[8]), len = le32(&words[12]);
+    const uint32_t tail = rp2350 ? 0x2000u : 0x1000u;
     if (fs < DPL_RP_FLASH_BASE || fs > fe || fe > ee || (fs & 0xfff) || (fe & 0xfff) || (ee & 0xfff)) {
         return false;
     }
-    if (ee + 0x1000u - DPL_RP_FLASH_BASE > DPL_RP_FLASH_MAX || len == 0 || len > ee - DPL_RP_FLASH_BASE) {
+    if (ee - DPL_RP_FLASH_BASE + tail > DPL_RP_FLASH_MAX || len == 0 || len > ee - DPL_RP_FLASH_BASE) {
         return false;
     }
     *fs_start = fs;
     *fs_end = fe;
     *eeprom_start = ee;
-    *flash_size = ee + 0x1000u - DPL_RP_FLASH_BASE;
+    *flash_size = ee - DPL_RP_FLASH_BASE + tail;
     return true;
 }
 
@@ -188,7 +189,7 @@ int dpl_rp2350_pt_info(const uint32_t *w, size_t nw, uint32_t requested, bool *h
             if (pos + words > nw) {
                 break;
             }
-            for (uint8_t k = 0; k < len && k + 1 < sizeof(p.name); k++) {
+            for (size_t k = 0; k < len && k + 1 < sizeof(p.name); k++) {
                 const size_t b = 1u + k;
                 p.name[k] = (char)((w[pos + b / 4] >> (8 * (b % 4))) & 0xff);
             }

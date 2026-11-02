@@ -50,8 +50,9 @@ const char *dpl_esp_subtype_name(uint8_t type, uint8_t subtype, char *buf, size_
 
 /* arduino-pico links four words at flash + 0x2ff0 (all XIP addresses).
    Returns false when they are not a plausible layout.  fs_start == fs_end
-   means no file system; the flash ends one sector after eeprom_start. */
-bool dpl_arduino_pico_layout(const uint8_t words[16], uint32_t *fs_start, uint32_t *fs_end,
+   means no file system.  The flash ends 4 KB (RP2040) or 8 KB (RP2350)
+   after eeprom_start (tools/makeboards.py: delta). */
+bool dpl_arduino_pico_layout(const uint8_t words[16], bool rp2350, uint32_t *fs_start, uint32_t *fs_end,
                              uint32_t *eeprom_start, uint32_t *flash_size);
 
 /* PICOBOOT GET_INFO (0x8b) for the partition table, bType 2. */

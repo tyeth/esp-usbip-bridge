@@ -642,7 +642,7 @@ static void map_rp2(df_t *df, const cJSON *args)
     uint32_t fs_start = 0, fs_end = 0, eeprom = 0, size = 0;
     uint8_t w[16];
     const bool ap = dev_read(df, DPL_RP_LAYOUT_ADDR - DPL_RP_FLASH_BASE, w, sizeof(w)) == 0 &&
-                    dpl_arduino_pico_layout(w, &fs_start, &fs_end, &eeprom, &size);
+                    dpl_arduino_pico_layout(w, picoboot_is_rp2350(df->pb), &fs_start, &fs_end, &eeprom, &size);
     uint32_t asked = 0;
     if (parse_u32(cJSON_GetObjectItemCaseSensitive(args, "flash_size"), &asked) && asked >= 0x40000 &&
             asked <= DPL_RP_FLASH_MAX) {
