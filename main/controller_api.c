@@ -1682,12 +1682,14 @@ static api_result_t core_device_release(const char *busid, const cJSON *json)
     cJSON *j = cJSON_CreateObject();
     cJSON *done = cJSON_AddArrayToObject(j, "released");
     cJSON *tmp = NULL;
-    int st = dut_flash_close(busid, &tmp);
-    if (st == 200) {
+    /* A DUT flash session closes cleanly (pending writes flushed, device
+       reset); any other job is cancelled. */
+    const bool closed = dut_flash_close(busid, &tmp) == 200;
+    if (closed) {
         cJSON_AddItemToArray(done, cJSON_CreateString("dut_flash session"));
     }
     cJSON_Delete(tmp);
-    const uint32_t id = rescue_job_running_on(busid);
+    const uint32_t id = closed ? 0 : rescue_job_running_on(busid);
     if (id != 0 && rescue_job_cancel(id)) {
         char s[32];
         snprintf(s, sizeof(s), "job %" PRIu32, id);

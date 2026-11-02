@@ -51,7 +51,7 @@ extern const char _binary_web_app_js_start[];
    server handles one at a time; a console peek holds it up to 12 s).  With
    4, a browser's pollers overflowed it during a peek: the extra SYNs were
    dropped, retried after 3 + 6 s by the client, and failed after ~21 s. */
-#define HTTP_MAX_CLIENTS       10
+#define HTTP_MAX_CLIENTS       10      /* <= CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE (12) */
 #define HTTP_BUF_SIZE          2048
 #define HTTP_TASK_STACK        16384
 #define HTTP_TASK_PRIORITY     3
