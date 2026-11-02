@@ -86,6 +86,13 @@ void app_main(void)
 #endif
     ESP_ERROR_CHECK(discovery_service_start());
     ESP_ERROR_CHECK(usbip_server_start());
+    /* The optional Wi-Fi station and its console commands, only now: nothing
+       may reach usb_backend before usb_backend_start(), and Wi-Fi must not
+       delay it.  mDNS picks the station up when it gets an address. */
+    err = network_init_start_secondary();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "secondary network: %s", esp_err_to_name(err));
+    }
     /* Serial capture: armed ports, the watcher and the TCP stream server. */
     capture_init();
 

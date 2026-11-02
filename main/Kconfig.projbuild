@@ -203,6 +203,18 @@ endif # USBIP_ETH_INTERFACE_RGMII
 
 endif
 
+config USBIP_WIFI_STA
+    bool "Also join Wi-Fi as a station (credentials in NVS)"
+    depends on USBIP_TRANSPORT_ETHERNET && SOC_WIFI_SUPPORTED
+    default y
+    help
+        Bring up a Wi-Fi station next to Ethernet, which stays the primary
+        transport.  Credentials live in NVS (namespace "wifi", keys "ssid"
+        and "pass") and are set from the serial console (wifi set), over
+        HTTP (PUT /api/network/wifi) or on the web page; without them the
+        radio stays idle.  Every service answers on both interfaces.  Boot
+        never waits for Wi-Fi.
+
 if USBIP_TRANSPORT_WIFI
 
 config USBIP_WIFI_SSID
@@ -218,10 +230,18 @@ config USBIP_WIFI_MAX_RETRY
     range 1 50
     default 10
 
+endif
+
+if USBIP_TRANSPORT_WIFI || USBIP_WIFI_STA
+
 config USBIP_WIFI_AUTHMODE
     int "Minimum AP auth mode (0=OPEN, 1=WPA, 2=WPA2, 3=WPA2/WPA3)"
     range 0 3
+    default 2 if USBIP_WIFI_STA
     default 3
+    help
+        The weakest security the station accepts.  With USBIP_WIFI_STA an
+        empty password always joins an open network.
 
 config USBIP_WIFI_DISABLE_MODEM_SLEEP
     bool "Disable Wi-Fi modem sleep (WIFI_PS_NONE)"
