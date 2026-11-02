@@ -142,6 +142,7 @@ static int samba_connect(samba_t *s, rescue_job_t *job, const char *busid, const
         return rescue_job_fail(job, "SAM-BA needs the board's native USB CDC (this is a %s)",
                                rescue_serial_kind_name(s->link.caps.serial));
     }
+    serial_link_sync_toggles(&s->link);
     serial_link_set_baud(&s->link, 921600);
     serial_link_set_lines(&s->link, true, true);
     rescue_job_progress(job, 2, "connecting to SAM-BA");

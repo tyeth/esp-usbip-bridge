@@ -838,6 +838,8 @@ int device_rescue_console(const char *busid, const cJSON *args, cJSON **out)
     }
 
     char err[128] = "";
+    /* A toggle that failed to sync is not fatal: the data may still get through. */
+    serial_link_sync_toggles(l);
     st = serial_link_prepare(l);
     if (st == 0) {
         st = serial_link_set_baud(l, (uint32_t)baud);

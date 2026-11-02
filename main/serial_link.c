@@ -325,6 +325,25 @@ int serial_link_prepare(serial_link_t *l)
     return 0;
 }
 
+int serial_link_sync_toggles(serial_link_t *l)
+{
+    int first = 0;
+    const uint8_t eps[2] = { l->caps.ep_in, l->caps.ep_out };
+    for (int i = 0; i < 2; i++) {
+        if (eps[i] == 0) {
+            continue;
+        }
+        /* The backend mirrors an accepted CLEAR_FEATURE(ENDPOINT_HALT) onto a
+           claimed host pipe; an unclaimed one starts at DATA0 when claimed. */
+        const rescue_ctrl_t r = { .bm = 0x02, .req = 0x01, .value = 0, .index = eps[i] };
+        const int st = serial_link_ctrl(l, &r, NULL, 0, NULL);
+        if (st != 0 && first == 0) {
+            first = st;
+        }
+    }
+    return first;
+}
+
 int serial_link_set_lines(serial_link_t *l, bool dtr, bool rts)
 {
     rescue_ctrl_t reqs[4];

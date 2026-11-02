@@ -352,6 +352,7 @@ static int espf_connect(espf_t *f, rescue_job_t *job, const char *busid, const c
     if (serial_link_open(&f->link, busid, port, msg, sizeof(msg)) != 0) {
         return rescue_job_fail(job, "%s", msg);
     }
+    serial_link_sync_toggles(&f->link);
     const int st = serial_link_prepare(&f->link);
     if (st != 0) {
         return rescue_job_fail(job, "serial setup failed: %s", serial_link_errno_name(st));

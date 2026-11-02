@@ -341,6 +341,7 @@ static uint32_t probe_baud(cap_dev_t *d, cap_link_t *cl, int port)
 
 static void configure_link(cap_dev_t *d, cap_link_t *cl, int port)
 {
+    serial_link_sync_toggles(&cl->link);    /* before this port's first IN */
     serial_link_prepare(&cl->link);
     /* Native USB CDC (TinyUSB, Arduino, CircuitPython) holds its output until
        the host asserts DTR, as a terminal does.  UART bridges and the ESP
