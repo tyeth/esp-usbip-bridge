@@ -1,25 +1,37 @@
 dependencies:
   idf:
     version: ">=6.0.0-beta2"
+  # adafruit/esp-usb fsls-only + hub port power API, hub handling fixes and dynamic
+  # HCD channels (tyeth/esp-usb branch codex/hcd-dynamic-channels)
   espressif/usb:
-    git: https://github.com/adafruit/esp-usb.git
+    git: https://github.com/tyeth/esp-usb.git
     path: host/usb
-    version: fsls-only
+    version: 2b7cf4c8451a700c115b76c8117bdaa5fd0b8514
   espressif/mdns:
     version: ">=1.9.1"
+  espressif/cjson:
+    version: ">=1.7.17"
   logic_capture:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/logic_capture
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   perfetto_trace:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/perfetto_trace
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   sump:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/sump
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   sump_io:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/sump_io
     version: main
+    rules:
+      - if: "target in [esp32p4]"

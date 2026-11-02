@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -22,6 +23,8 @@
 #include "driver/gpio.h"
 
 #include "board_pins.h"
+#include "cJSON.h"
+#include "controller_api.h"
 #include "device_naming.h"
 #include "discovery_service.h"
 #include "usb_backend.h"
@@ -526,7 +529,35 @@ typedef struct {
     char method[16];
     char url[256];
     int  content_length;
+    char auth[160];             /* Authorization header value, "" if absent */
 } http_request_t;
+
+/* Find a header (case-insensitive name) in the request head and copy its
+   value.  Returns false if absent. */
+static bool header_value(const char *buf, size_t len, const char *name, char *out, size_t out_size)
+{
+    size_t nlen = strlen(name);
+    const char *end = buf + len;
+    const char *line = memchr(buf, '\n', len);   /* skip the request line */
+    while (line != NULL && line + 1 < end) {
+        line++;
+        if (*line == '\r' || *line == '\n') {
+            break;                                /* end of headers */
+        }
+        if ((size_t)(end - line) > nlen && strncasecmp(line, name, nlen) == 0 && line[nlen] == ':') {
+            const char *v = line + nlen + 1;
+            while (v < end && *v == ' ') v++;
+            size_t o = 0;
+            while (v < end && *v != '\r' && *v != '\n' && o + 1 < out_size) {
+                out[o++] = *v++;
+            }
+            out[o] = '\0';
+            return true;
+        }
+        line = memchr(line, '\n', end - line);
+    }
+    return false;
+}
 
 static bool parse_request(const char *buf, size_t len, http_request_t *req)
 {
@@ -534,10 +565,11 @@ static bool parse_request(const char *buf, size_t len, http_request_t *req)
     const char *eol = (const char *)memchr(buf, '\n', len);
     if (!eol) return false;
     if (sscanf(buf, "%15s %255s", req->method, req->url) < 2) return false;
-    const char *cl = strstr(buf, "Content-Length:");
-    if (cl) sscanf(cl, "Content-Length: %d", &req->content_length);
-    cl = strstr(buf, "content-length:");
-    if (cl) sscanf(cl, "content-length: %d", &req->content_length);
+    char cl[16];
+    if (header_value(buf, len, "Content-Length", cl, sizeof(cl))) {
+        req->content_length = atoi(cl);
+    }
+    header_value(buf, len, "Authorization", req->auth, sizeof(req->auth));
     return true;
 }
 
@@ -553,6 +585,63 @@ static const char *path_after(const char *url, const char *prefix)
    NULL if the key is not found or its value is not a quoted string.  Used
    for the small config import format (ad-hoc, like the rest of this
    file's JSON parsing). */
+/* Escape a string for embedding inside a JSON string literal: ", \\ and
+   control characters (issue #4 — a friendly name or wire label with a quote
+   previously produced invalid JSON). Truncates to fit; returns out. */
+static const char *json_escape(const char *s, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (const char *q = s; *q && o + 7 < out_size; q++) {
+        unsigned char ch = (unsigned char)*q;
+        switch (ch) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (ch < 0x20) {
+                    o += (size_t)snprintf(out + o, out_size - o, "\\u%04x", ch);
+                } else {
+                    out[o++] = (char)ch;
+                }
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* Unescape a raw JSON string span (as returned by json_str_after) into out.
+   Handles \" \\ \/ \n \r \t \b \f; a \uXXXX sequence is kept literally.
+   Returns false when the result does not fit (out is still terminated). */
+static bool json_unescape(char *out, size_t out_size, const char *src, size_t len)
+{
+    size_t o = 0;
+    bool ok = true;
+    for (size_t i = 0; i < len; i++) {
+        char ch = src[i];
+        if (ch == '\\' && i + 1 < len) {
+            char e = src[++i];
+            switch (e) {
+                case 'n': ch = '\n'; break;
+                case 'r': ch = '\r'; break;
+                case 't': ch = '\t'; break;
+                case 'b': ch = '\b'; break;
+                case 'f': ch = '\f'; break;
+                case '"': case '\\': case '/': ch = e; break;
+                default:
+                    if (o + 1 < out_size) out[o++] = '\\';
+                    ch = e;
+                    break;
+            }
+        }
+        if (o + 1 >= out_size) { ok = false; break; }
+        out[o++] = ch;
+    }
+    out[o] = '\0';
+    return ok;
+}
+
 static const char *json_str_after(const char *from, const char *key, size_t *vlen)
 {
     const char *k = strstr(from, key);
@@ -561,8 +650,14 @@ static const char *json_str_after(const char *from, const char *key, size_t *vle
     if (!c) return NULL;
     const char *q1 = strchr(c, '"');
     if (!q1) return NULL;
-    const char *q2 = strchr(q1 + 1, '"');
-    if (!q2) return NULL;
+    /* Find the closing quote, skipping backslash escapes (issue #4: the old
+       strchr cut an escaped-quote value short). */
+    const char *q2 = q1 + 1;
+    while (*q2 && *q2 != '"') {
+        if (*q2 == '\\' && q2[1] != '\0') q2++;
+        q2++;
+    }
+    if (*q2 != '"') return NULL;
     *vlen = (size_t)(q2 - q1 - 1);
     return q1 + 1;
 }
@@ -577,11 +672,12 @@ static void build_pins_json(char *buf, size_t buf_size)
         if (!harness_dut_get_wire(s_dut_pins[i].label, wire_name, sizeof(wire_name))) {
             wire_name[0] = '\0';
         }
+        char wesc[2 * sizeof(wire_name) + 1];
         off += snprintf(buf + off, buf_size - off,
             "%c{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"dir\":\"%s\",\"wire\":\"%s\"}",
             (i > 0) ? ',' : ' ',
             s_dut_pins[i].label, s_dut_pins[i].gpio, val,
-            pin_direction_str(&s_dut_pins[i]), wire_name);
+            pin_direction_str(&s_dut_pins[i]), json_escape(wire_name, wesc, sizeof(wesc)));
         if ((size_t)off >= buf_size) break;
     }
     /* Pull-resistor state for every header pin that has one, so the page's
@@ -614,8 +710,9 @@ static void build_devices_json(char *buf, size_t buf_size)
             char friendly_name[DEVICE_NAME_MAX_LEN] = "";
             esp_err_t name_err = device_naming_get_device_name(devs[i].busid,
                                     friendly_name, sizeof(friendly_name));
+            char nesc[2 * DEVICE_NAME_MAX_LEN + 1];
             const char *name = (name_err == ESP_OK && strlen(friendly_name) > 0)
-                               ? friendly_name : "";
+                               ? json_escape(friendly_name, nesc, sizeof(nesc)) : "";
             off += snprintf(buf + off, buf_size - off,
                 "%c{\"busid\":\"%s\",\"vendor\":\"0x%04x\",\"product\":\"0x%04x\","
                 "\"bcdDevice\":\"0x%04x\",\"speed\":%lu,\"class\":\"0x%02x\","
@@ -648,26 +745,69 @@ static void send_json_ok(int fd, const char *body, size_t len)
     send_all(fd, body, len, &err);
 }
 
+/* Send a controller API response with its real status code. */
+static void send_api_response(int fd, const api_response_t *r)
+{
+    int err = 0;
+    char hdr[512];
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %u\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type, Mcp-Protocol-Version\r\n"
+        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+        "\r\n",
+        r->status, controller_api_status_text(r->status),
+        r->content_type ? r->content_type : k_json_ct, (unsigned)r->len);
+    send_all(fd, hdr, n, &err);
+    if (r->body && r->len) {
+        send_all(fd, r->body, r->len, &err);
+    }
+}
+
+static void http_401(int fd)
+{
+    static const char body[] = "{\"error\":\"unauthorized\"}";
+    api_response_t r = { .status = 401, .body = (char *)body, .len = sizeof(body) - 1 };
+    send_api_response(fd, &r);
+}
+
+/* Issue #3: the legacy error helpers went through send_json_ok(), so every
+   failure arrived as HTTP 200 (and with a short Content-Length that cut the
+   closing brace off the body). Send the real status code. */
+static void send_json_status(int fd, int status, const char *body, size_t len)
+{
+    api_response_t r = { .status = status, .body = (char *)body, .len = len };
+    send_api_response(fd, &r);
+}
+
 static void http_404(int fd)
 {
-    send_json_ok(fd, "{\"error\":\"Not Found\"}", 20);
+    static const char body[] = "{\"error\":\"Not Found\"}";
+    send_json_status(fd, 404, body, sizeof(body) - 1);
 }
 
 static void http_400(int fd, const char *msg)
 {
-    char body[256];
-    int n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
-    send_json_ok(fd, body, n);
+    char esc[160];
+    char body[224];
+    int n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}",
+                     json_escape(msg, esc, sizeof(esc)));
+    send_json_status(fd, 400, body, (size_t)n);
 }
 
 static void http_405(int fd)
 {
-    send_json_ok(fd, "{\"error\":\"Method Not Allowed\"}", 28);
+    static const char body[] = "{\"error\":\"Method Not Allowed\"}";
+    send_json_status(fd, 405, body, sizeof(body) - 1);
 }
 
 static void http_500(int fd)
 {
-    send_json_ok(fd, "{\"error\":\"Internal Server Error\"}", 30);
+    static const char body[] = "{\"error\":\"Internal Server Error\"}";
+    send_json_status(fd, 500, body, sizeof(body) - 1);
 }
 
 /* ─────────────────────────────────────────────
@@ -739,6 +879,13 @@ static void stream_html_page(stream_t *s)
         ".sec.on{display:block}\n"
         "input.dut-wire{background:#0f3460;color:#eee;border:1px solid #555;"
         "padding:2px 4px;border-radius:3px;font-size:0.75rem;width:80px}\n"
+        "input.txt,textarea{background:#0f3460;color:#eee;border:1px solid #555;"
+        "padding:2px 6px;border-radius:3px;font-size:0.75rem}\n"
+        "textarea{width:100%%;height:160px;font-family:monospace}\n"
+        ".hub{color:#aaa;font-size:0.8rem;margin:8px 0 2px}\n"
+        ".warn{color:#fbbf24}\n"
+        ".muted{color:#888}\n"
+        "button.act{border-color:#4ade80}\n"
         "footer{text-align:center;color:#555;margin-top:20px;font-size:0.7rem}\n"
         "@media(max-width:600px){th,td{padding:3px 5px;font-size:0.7rem}}\n"
         "</style>\n"
@@ -784,9 +931,17 @@ static void stream_html_page(stream_t *s)
         "Clear Config</button>"
         " <button onclick=\"cfgImport()\" style=\"font-size:0.7rem\">Import Config</button>"
         "</p>\n"
+        "<p class=\"sub\">API token: <input id=\"tok\" class=\"txt\" type=\"password\" size=\"16\">"
+        " <button onclick=\"tokSave()\" style=\"font-size:0.7rem\">Use</button>"
+        " <button onclick=\"tokSet()\" style=\"font-size:0.7rem\">Set on bridge</button>"
+        " <span id=\"authst\" class=\"muted\"></span>"
+        " &mdash; <a href=\"/api/schema\" style=\"color:#888\">API</a>"
+        " &middot; MCP at <code>/mcp</code></p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
+        "<button id=\"th\" onclick=\"st('h')\">Hubs &amp; Power</button>\n"
+        "<button id=\"tm\" onclick=\"st('m')\">I2C Mux</button>\n"
         "</div>\n"
         "<div id=\"sp\" class=\"sec on\">\n"
         "<h2>DUT Header Pins</h2>\n"
@@ -889,41 +1044,17 @@ static void stream_html_page(stream_t *s)
         }
     }
 
-    stream_printf(s,
+    /* USB devices, hubs and the mux are rendered client-side from the
+       controller API (see web_app.js) so they stay live. */
+    stream_write(s,
         "</tbody></table></div>\n"
         "<div id=\"su\" class=\"sec\">\n"
         "<h2>USB Devices</h2>\n"
-        "<table><thead><tr><th>BusID</th><th>Vendor</th><th>Product</th>"
-        "<th>Speed</th><th>Class</th></tr></thead><tbody>\n");
-
-    /* Stream USB devices (heap-allocated to avoid ~5KB stack pressure) */
-    {
-        size_t devs_max = CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX;
-        usbip_backend_device_t *devs = malloc(devs_max * sizeof(usbip_backend_device_t));
-        size_t dc = 0;
-        if (devs) {
-            dc = usb_backend_get_devices(devs, devs_max);
-            for (size_t i = 0; i < dc; i++) {
-                const char *sp = "?";
-                switch (devs[i].speed) {
-                    case 1: sp = "Low";  break;
-                    case 2: sp = "Full"; break;
-                    case 3: sp = "High"; break;
-                }
-                stream_printf(s,
-                    "<tr><td>%s</td><td>%04x</td><td>%04x</td>"
-                    "<td>%s</td><td>0x%02x</td></tr>\n",
-                    devs[i].busid, devs[i].id_vendor, devs[i].id_product,
-                    sp, devs[i].device_class);
-            }
-            free(devs);
-        }
-        if (dc == 0) {
-            stream_printf(s,
-                "<tr><td colspan=\"5\" style=\"text-align:center;color:#888\">"
-                "No USB devices</td></tr>\n");
-        }
-    }
+        "<p class=\"sub\">Attach from Linux: <code>usbip attach -r &lt;bridge&gt; -b &lt;busid&gt;</code>."
+        " <label><input type=\"checkbox\" id=\"force\"> force (ganged / non-switching hubs)</label></p>\n"
+        "<table><thead><tr><th>BusID</th><th>Name</th><th>VID:PID</th><th>Device</th>"
+        "<th>Serial</th><th>Speed</th><th>mA</th><th>Port power</th></tr></thead>"
+        "<tbody id=\"ud\"><tr><td colspan=\"8\" class=\"muted\">Loading&hellip;</td></tr>\n", -1);
 
     /* Close the USB-devices section, then emit the page's <script> from
        the embedded web_app.js (see EMBED_TXTFILES in main/CMakeLists.txt).
@@ -932,6 +1063,34 @@ static void stream_html_page(stream_t *s)
        escaped C string literals that the compiler can't validate. */
     stream_write(s,
         "</tbody></table></div>\n"
+        "<div id=\"sh\" class=\"sec\">\n"
+        "<h2>Hubs &amp; Port Power</h2>\n"
+        "<p class=\"sub\"><label><input type=\"checkbox\" id=\"setEnf\" onchange=\"saveSettings()\">"
+        " Enforce per-port switching</label> <span class=\"muted\">(refuse ganged / non-switching hubs"
+        " unless forced; ganged hubs switch all ports or none)</span><br>"
+        "<label><input type=\"checkbox\" id=\"setRst\" onchange=\"saveSettings()\">"
+        " Restore port power on hub reset</label> <span class=\"muted\">(ports switched off stay off when"
+        " their hub re-enumerates: hub reset, power loss, bridge reboot)</span><br>"
+        "Enumeration timeout <input id=\"setTo\" class=\"txt\" type=\"number\" min=\"0\" max=\"60000\""
+        " style=\"width:80px\" onchange=\"saveTimeout(null, this.value)\"> ms"
+        " <span class=\"muted\">(0 = none; a device that does not answer in time has its port disabled"
+        " so others can enumerate; hubs and ports can override it below)</span></p>\n"
+        "<div id=\"hubs\" class=\"muted\">Loading&hellip;</div>"
+        "<p class=\"sub\"><button onclick=\"allPorts('off')\">All ports off</button>"
+        " <button onclick=\"allPorts('on')\">All ports on</button>"
+        " <button onclick=\"restorePorts()\">Restore saved states</button>"
+        " <span id=\"rstst\" class=\"muted\"></span></p></div>\n"
+        "<div id=\"sm\" class=\"sec\">\n"
+        "<h2>I2C Strand Mux</h2>\n"
+        "<p class=\"sub\">Active: <strong id=\"mact\">&hellip;</strong> <span id=\"mman\"></span>"
+        " <button onclick=\"muxIso()\">Isolate all</button>"
+        " <button onclick=\"muxProbe()\">Probe bus</button> <span id=\"mprobe\" class=\"muted\"></span></p>\n"
+        "<div id=\"mduts\"></div><div id=\"mgroups\"></div>\n"
+        "<h2>Topology</h2>\n"
+        "<textarea id=\"mtopo\"></textarea>\n"
+        "<p class=\"sub\"><button onclick=\"topoLoad()\">Reload</button>"
+        " <button onclick=\"topoSave()\">Validate &amp; save</button> <span id=\"mtst\" class=\"muted\"></span></p>"
+        "</div>\n"
         "<footer>USB/IP Bridge &mdash; <a href=\"/\" style=\"color:#555\">refresh</a></footer>\n"
         "<script>\n", -1);
     stream_write(s, _binary_web_app_js_start, -1);
@@ -978,10 +1137,11 @@ static void handle_get_pin(int fd, const char *pin_name)
     if (!harness_dut_get_wire(pin->label, wire_name, sizeof(wire_name))) {
         wire_name[0] = '\0';
     }
-    char resp[256];
+    char wesc[2 * sizeof(wire_name) + 1];
+    char resp[320];
     int rlen = snprintf(resp, sizeof(resp),
         "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"wire\":\"%s\"}",
-        pin->label, pin->gpio, level, wire_name);
+        pin->label, pin->gpio, level, json_escape(wire_name, wesc, sizeof(wesc)));
     send_json_ok(fd, resp, rlen);
 }
 
@@ -1007,35 +1167,16 @@ static void handle_post_pin(int fd, const char *pin_name,
         }
     }
 
-    const char *dk = strstr(body, "\"direction\"");
-    if (dk) {
-        const char *c = strchr(dk, ':');
-        if (c) {
-            const char *q1 = strchr(c, '"');
-            if (q1) {
-                const char *q2 = strchr(q1 + 1, '"');
-                if (q2 && (size_t)(q2 - q1 - 1) < sizeof(direction)) {
-                    memcpy(direction, q1 + 1, q2 - q1 - 1);
-                    direction[q2 - q1 - 1] = '\0';
-                }
-            }
-        }
+    size_t dlen;
+    const char *dv = json_str_after(body, "\"direction\"", &dlen);
+    if (dv) {
+        json_unescape(direction, sizeof(direction), dv, dlen);
     }
 
-    const char *wk = strstr(body, "\"wire\"");
-    if (wk) {
-        const char *c = strchr(wk, ':');
-        if (c) {
-            const char *q1 = strchr(c, '"');
-            if (q1) {
-                const char *q2 = strchr(q1 + 1, '"');
-                if (q2 && (size_t)(q2 - q1 - 1) < sizeof(wire)) {
-                    memcpy(wire, q1 + 1, q2 - q1 - 1);
-                    wire[q2 - q1 - 1] = '\0';
-                    has_wire = true;
-                }
-            }
-        }
+    size_t wlen2;
+    const char *wv = json_str_after(body, "\"wire\"", &wlen2);
+    if (wv && json_unescape(wire, sizeof(wire), wv, wlen2)) {
+        has_wire = true;
     }
 
     if (direction[0]) {
@@ -1063,10 +1204,11 @@ static void handle_post_pin(int fd, const char *pin_name,
     if (!harness_dut_get_wire(pin->label, wire_name, sizeof(wire_name))) {
         wire_name[0] = '\0';
     }
-    char resp[256];
+    char wesc2[2 * sizeof(wire_name) + 1];
+    char resp[320];
     int rlen = snprintf(resp, sizeof(resp),
         "{\"name\":\"%s\",\"gpio\":%d,\"value\":%d,\"wire\":\"%s\"}",
-        pin->label, pin->gpio, level, wire_name);
+        pin->label, pin->gpio, level, json_escape(wire_name, wesc2, sizeof(wesc2)));
     send_json_ok(fd, resp, rlen);
 }
 
@@ -1109,8 +1251,11 @@ static void handle_get_config(int fd)
 
     stream_t s;
     stream_begin(&s, fd, "application/json; charset=utf-8");
+    char hesc[2 * DEVICE_NAME_MAX_LEN + 1];
+    char besc[2 * DEVICE_NAME_MAX_LEN + 1];
     stream_printf(&s, "{\"version\":%d,\"hostname\":\"%s\",\"board_id\":\"%s\",\"board\":\"%s\",\"wires\":[",
-                  CONFIG_EXPORT_VERSION, hostname, board_id, board_get_name());
+                  CONFIG_EXPORT_VERSION, json_escape(hostname, hesc, sizeof(hesc)),
+                  json_escape(board_id, besc, sizeof(besc)), board_get_name());
     bool first = true;
     for (int i = 0; i < s_dut_pin_count; i++) {
         char wire[HARNESS_DUT_MAX_LABEL_LEN + 1];
@@ -1118,8 +1263,10 @@ static void handle_get_config(int fd)
             continue;
         if (wire[0] == '\0')
             continue;
+        char wesc[2 * sizeof(wire) + 1];
         stream_printf(&s, "%s{\"pin\":\"%s\",\"wire\":\"%s\"}",
-                      first ? "" : ",", s_dut_pins[i].label, wire);
+                      first ? "" : ",", s_dut_pins[i].label,
+                      json_escape(wire, wesc, sizeof(wesc)));
         first = false;
     }
     stream_write(&s, "]}", -1);
@@ -1139,31 +1286,27 @@ static void handle_post_config(int fd, const char *body, size_t body_len)
         char resp[128];
         int rlen = snprintf(resp, sizeof(resp),
             "{\"error\":\"unsupported config version %d\"}", version);
-        send_json_ok(fd, resp, rlen);
+        send_json_status(fd, 400, resp, (size_t)rlen);
         return;
     }
 
     /* Optional hostname. */
     size_t hn_len;
     const char *hn = json_str_after(body, "\"hostname\"", &hn_len);
-    if (hn && hn_len > 0 && hn_len < DEVICE_NAME_MAX_LEN) {
+    if (hn && hn_len > 0) {
         char hostname[DEVICE_NAME_MAX_LEN];
-        memcpy(hostname, hn, hn_len);
-        hostname[hn_len] = '\0';
-        device_naming_set_hostname(hostname);
+        if (json_unescape(hostname, sizeof(hostname), hn, hn_len)) {
+            device_naming_set_hostname(hostname);
+        }
     }
 
     /* Optional board_id. */
     size_t bi_len;
     const char *bi = json_str_after(body, "\"board_id\"", &bi_len);
-    if (bi && bi_len < DEVICE_NAME_MAX_LEN) {
+    if (bi) {
         char board_id[DEVICE_NAME_MAX_LEN];
-        if (bi_len > 0) {
-            memcpy(board_id, bi, bi_len);
-            board_id[bi_len] = '\0';
+        if (json_unescape(board_id, sizeof(board_id), bi, bi_len)) {
             device_naming_set_board_id(board_id);
-        } else {
-            device_naming_set_board_id("");
         }
     }
 
@@ -1194,11 +1337,10 @@ static void handle_post_config(int fd, const char *body, size_t body_len)
                 p = next_pin ? next_pin : (pin + plen + 1);
                 continue;
             }
-            if (plen < HARNESS_DUT_MAX_LABEL_LEN && wlen < HARNESS_DUT_MAX_LABEL_LEN) {
-                char pb[HARNESS_DUT_MAX_LABEL_LEN + 1];
-                char wb[HARNESS_DUT_MAX_LABEL_LEN + 1];
-                memcpy(pb, pin, plen);   pb[plen] = '\0';
-                memcpy(wb, wire, wlen);   wb[wlen] = '\0';
+            char pb[HARNESS_DUT_MAX_LABEL_LEN + 1];
+            char wb[HARNESS_DUT_MAX_LABEL_LEN + 1];
+            if (json_unescape(pb, sizeof(pb), pin, plen) &&
+                json_unescape(wb, sizeof(wb), wire, wlen)) {
                 if (dut_pin_index_with_label(pb) >= 0 &&
                     harness_dut_set_wire(pb, wb) == ESP_OK)
                     applied++;
@@ -1236,7 +1378,10 @@ static void handle_connection(int fd)
         }
         if (n == 0) break;
         total += (size_t)n;
-        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0) break;
+        /* Stop at the end of the headers.  Clients usually send the body in
+           the same segment, so the terminator need not be at the end of what
+           was read; waiting for more would block until SO_RCVTIMEO (2 s). */
+        if (memmem(buf, total, "\r\n\r\n", 4) != NULL) break;
     }
     if (total == 0) { free(buf); return; }
 
@@ -1247,14 +1392,14 @@ static void handle_connection(int fd)
        endpoint (which may carry the full pin→wire mapping) is not
        truncated. */
     size_t body_cap = 512;
-    if (req.content_length > 0 && (size_t)req.content_length > body_cap)
-        body_cap = (size_t)req.content_length;
+    if (req.content_length > 0 && (size_t)req.content_length + 1 > body_cap)
+        body_cap = (size_t)req.content_length + 1;   /* + NUL terminator */
     if (body_cap > 8192) body_cap = 8192;
     char *body_buf = malloc(body_cap);
     size_t body_read = 0;
     if (!body_buf) { free(buf); http_500(fd); return; }
     if (req.content_length > 0) {
-        const char *start = strstr(buf, "\r\n\r\n");
+        const char *start = memmem(buf, total, "\r\n\r\n", 4);   /* buf is not NUL-terminated */
         if (start) {
             start += 4;
             size_t already = buf + total - start;
@@ -1273,6 +1418,24 @@ static void handle_connection(int fd)
     body_buf[body_read] = '\0';  /* NUL-terminate for strstr-based parsers */
 
     const char *url = req.url;
+
+    /* Controller API: devices, hub port power, analog mux, MCP */
+    api_response_t ar;
+    if (controller_api_handle(req.method, url, req.auth[0] ? req.auth : NULL,
+                              body_buf, body_read, &ar)) {
+        send_api_response(fd, &ar);
+        cJSON_free(ar.body);
+        free(body_buf); free(buf);
+        return;
+    }
+
+    /* With an API token set, every other mutating request needs it too */
+    if (strcmp(req.method, "GET") != 0 && strcmp(req.method, "HEAD") != 0 &&
+            !controller_api_authorized(req.auth[0] ? req.auth : NULL)) {
+        free(body_buf); free(buf);
+        http_401(fd);
+        return;
+    }
 
     /* GET / — stream the HTML page */
     if (strcmp(url, "/") == 0 && strcmp(req.method, "GET") == 0) {
@@ -1298,9 +1461,10 @@ static void handle_connection(int fd)
 
     /* GET /api/devices */
     if (strcmp(url, "/api/devices") == 0 && strcmp(req.method, "GET") == 0) {
-        char *resp = malloc(4096);
+        const size_t devs_cap = 1024 + 256 * (CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX);
+        char *resp = malloc(devs_cap);
         if (!resp) { free(body_buf); free(buf); http_500(fd); return; }
-        build_devices_json(resp, 4096);
+        build_devices_json(resp, devs_cap);
         send_json_ok(fd, resp, strlen(resp));
         free(resp);
         free(body_buf); free(buf);
@@ -1311,9 +1475,10 @@ static void handle_connection(int fd)
     if (strcmp(url, "/api/hostname") == 0 && strcmp(req.method, "GET") == 0) {
         char hostname[DEVICE_NAME_MAX_LEN];
         device_naming_get_hostname(hostname, sizeof(hostname));
-        char resp[256];
+        char hesc[2 * DEVICE_NAME_MAX_LEN + 1];
+        char resp[320];
         int rlen = snprintf(resp, sizeof(resp),
-            "{\"hostname\":\"%s\"}", hostname);
+            "{\"hostname\":\"%s\"}", json_escape(hostname, hesc, sizeof(hesc)));
         send_json_ok(fd, resp, rlen);
         free(body_buf); free(buf);
         return;
@@ -1322,26 +1487,19 @@ static void handle_connection(int fd)
     /* POST /api/hostname - set the bridge hostname */
     if (strcmp(url, "/api/hostname") == 0 && strcmp(req.method, "POST") == 0) {
         char hostname[DEVICE_NAME_MAX_LEN] = {0};
-        const char *hk = strstr(body_buf, "\"hostname\"");
-        if (hk) {
-            const char *c = strchr(hk, ':');
-            if (c) {
-                const char *q1 = strchr(c, '"');
-                if (q1) {
-                    const char *q2 = strchr(q1 + 1, '"');
-                    if (q2 && (size_t)(q2 - q1 - 1) < sizeof(hostname)) {
-                        memcpy(hostname, q1 + 1, q2 - q1 - 1);
-                        hostname[q2 - q1 - 1] = '\0';
-                    }
-                }
-            }
+        size_t hlen;
+        const char *hv = json_str_after(body_buf, "\"hostname\"", &hlen);
+        if (hv) {
+            json_unescape(hostname, sizeof(hostname), hv, hlen);
         }
         esp_err_t err = device_naming_set_hostname(hostname);
         if (err == ESP_OK) {
             discovery_service_notify_config_changed();
-            char resp[128];
+            char hesc[2 * DEVICE_NAME_MAX_LEN + 1];
+            char resp[256];
             int rlen = snprintf(resp, sizeof(resp),
-                "{\"status\":\"ok\",\"hostname\":\"%s\"}", hostname);
+                "{\"status\":\"ok\",\"hostname\":\"%s\"}",
+                json_escape(hostname, hesc, sizeof(hesc)));
             send_json_ok(fd, resp, rlen);
         } else {
             http_500(fd);
@@ -1354,9 +1512,10 @@ static void handle_connection(int fd)
     if (strcmp(url, "/api/board_id") == 0 && strcmp(req.method, "GET") == 0) {
         char board_id[DEVICE_NAME_MAX_LEN];
         device_naming_get_board_id(board_id, sizeof(board_id));
-        char resp[256];
+        char besc[2 * DEVICE_NAME_MAX_LEN + 1];
+        char resp[320];
         int rlen = snprintf(resp, sizeof(resp),
-            "{\"board_id\":\"%s\"}", board_id);
+            "{\"board_id\":\"%s\"}", json_escape(board_id, besc, sizeof(besc)));
         send_json_ok(fd, resp, rlen);
         free(body_buf); free(buf);
         return;
@@ -1365,26 +1524,19 @@ static void handle_connection(int fd)
     /* POST /api/board_id - set the DUT board ID */
     if (strcmp(url, "/api/board_id") == 0 && strcmp(req.method, "POST") == 0) {
         char board_id[DEVICE_NAME_MAX_LEN] = {0};
-        const char *bk = strstr(body_buf, "\"board_id\"");
-        if (bk) {
-            const char *c = strchr(bk, ':');
-            if (c) {
-                const char *q1 = strchr(c, '"');
-                if (q1) {
-                    const char *q2 = strchr(q1 + 1, '"');
-                    if (q2 && (size_t)(q2 - q1 - 1) < sizeof(board_id)) {
-                        memcpy(board_id, q1 + 1, q2 - q1 - 1);
-                        board_id[q2 - q1 - 1] = '\0';
-                    }
-                }
-            }
+        size_t blen;
+        const char *bv = json_str_after(body_buf, "\"board_id\"", &blen);
+        if (bv) {
+            json_unescape(board_id, sizeof(board_id), bv, blen);
         }
         esp_err_t err = device_naming_set_board_id(board_id);
         if (err == ESP_OK) {
             discovery_service_notify_config_changed();
-            char resp[128];
+            char besc[2 * DEVICE_NAME_MAX_LEN + 1];
+            char resp[256];
             int rlen = snprintf(resp, sizeof(resp),
-                "{\"status\":\"ok\",\"board_id\":\"%s\"}", board_id);
+                "{\"status\":\"ok\",\"board_id\":\"%s\"}",
+                json_escape(board_id, besc, sizeof(besc)));
             send_json_ok(fd, resp, rlen);
         } else {
             http_500(fd);
@@ -1440,26 +1592,18 @@ static void handle_connection(int fd)
 
                 /* Parse name from body */
                 char device_name[DEVICE_NAME_MAX_LEN] = {0};
-                const char *nk = strstr(body_buf, "\"name\"");
-                if (nk) {
-                    const char *c = strchr(nk, ':');
-                    if (c) {
-                        const char *q1 = strchr(c, '"');
-                        if (q1) {
-                            const char *q2 = strchr(q1 + 1, '"');
-                            if (q2 && (size_t)(q2 - q1 - 1) < sizeof(device_name)) {
-                                memcpy(device_name, q1 + 1, q2 - q1 - 1);
-                                device_name[q2 - q1 - 1] = '\0';
-                            }
-                        }
-                    }
+                size_t nlen;
+                const char *nv = json_str_after(body_buf, "\"name\"", &nlen);
+                if (nv) {
+                    json_unescape(device_name, sizeof(device_name), nv, nlen);
                 }
                 esp_err_t err = device_naming_set_device_name(busid, device_name);
                 if (err == ESP_OK) {
-                    char resp[256];
+                    char nesc[2 * DEVICE_NAME_MAX_LEN + 1];
+                    char resp[384];
                     int rlen = snprintf(resp, sizeof(resp),
                         "{\"status\":\"ok\",\"busid\":\"%s\",\"name\":\"%s\"}",
-                        busid, device_name);
+                        busid, json_escape(device_name, nesc, sizeof(nesc)));
                     send_json_ok(fd, resp, rlen);
                 } else {
                     http_500(fd);

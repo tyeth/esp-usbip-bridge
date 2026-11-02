@@ -1,0 +1,83 @@
+CONFIG_IDF_TARGET="esp32s31"
+CONFIG_USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1=y
+CONFIG_USBIP_TRANSPORT_ETHERNET=y
+
+# The board's UART USB-C connector goes through a CP2102N to UART0
+# (GPIO58/59). USB Serial/JTAG is kept as a secondary console.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# The esp-perfetto-logic components are only pulled in on esp32p4
+# (main/idf_component.yml).
+# CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER is not set
+
+# Motorcomm YT8531 gigabit PHY over RGMII, with its own 25 MHz crystal (so no
+# reference clock out of the S31). Pins are from the board schematic and match
+# ETH_ESP32_EMAC_DEFAULT_CONFIG() for the ESP32-S31. The base sdkconfig.defaults
+# carries P4HIL SMI pins, so every Ethernet pin is set explicitly here.
+# PHYAD straps are left at their defaults (address 0); -1 auto-detects.
+CONFIG_USBIP_ETH_INTERFACE_RGMII=y
+CONFIG_USBIP_ETH_PHY_YT8531_INIT=y
+CONFIG_USBIP_ETH_MDC_GPIO=5
+CONFIG_USBIP_ETH_MDIO_GPIO=6
+CONFIG_USBIP_ETH_PHY_ADDR=-1
+CONFIG_USBIP_ETH_PHY_RST_GPIO=7
+CONFIG_USBIP_ETH_RGMII_TX_CLK_GPIO=13
+CONFIG_USBIP_ETH_RGMII_RX_CLK_GPIO=14
+CONFIG_USBIP_ETH_RGMII_PHY_REF_CLK_GPIO=-1
+CONFIG_USBIP_ETH_RGMII_TX_CTL_GPIO=12
+CONFIG_USBIP_ETH_RGMII_TXD0_GPIO=8
+CONFIG_USBIP_ETH_RGMII_TXD1_GPIO=9
+CONFIG_USBIP_ETH_RGMII_TXD2_GPIO=10
+CONFIG_USBIP_ETH_RGMII_TXD3_GPIO=11
+CONFIG_USBIP_ETH_RGMII_RX_CTL_GPIO=15
+CONFIG_USBIP_ETH_RGMII_RXD0_GPIO=19
+CONFIG_USBIP_ETH_RGMII_RXD1_GPIO=18
+CONFIG_USBIP_ETH_RGMII_RXD2_GPIO=17
+CONFIG_USBIP_ETH_RGMII_RXD3_GPIO=16
+
+# The USB-HS Type-A host port has no on-board hub and its VBUS switch
+# (TPS2051C) is hard-wired on, so no power-enable GPIO is needed.
+
+# WS2812 via a non-inverting BSS138 level shifter
+CONFIG_USBIP_NEOPIXEL_GPIO=60
+
+# In-package 1.8 V octal PSRAM (ESP32-S31-WROOM-3 on this board: ESP32-S31NRV16,
+# 16 MB, AP Memory gen 4). The module datasheet (v0.7, Table 6-11) rates its
+# maximum clock at 200 MHz or more; 250 MHz is offered by IDF but is above that.
+# IGNORE_NOTFOUND keeps a board without PSRAM bootable.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# The PSRAM driver takes the MPLL (400 MHz at the PSRAM speeds above), from
+# which the RGMII TX clock cannot make 125 MHz ("EMAC out frequency cannot be
+# used", network init aborts). Clock RGMII from the APLL instead.
+CONFIG_ETH_EMAC_RGMII_TX_CLK_SRC_APLL=y
+
+# Track up to 32 wired DUTs (idle ones stay powered off per port; the DWC
+# host's 16 channels bound how many can be enumerated/claimed at once).
+CONFIG_USBIP_MAX_DEVICES=32
+
+# LwIP socket budget (stock 10 starved the HTTP API at the 8th attach,
+# accept() errno=23). One TCP socket per attached usbip device, plus two
+# listeners (usbipd and HTTP), plus HTTP clients. 32 devices + listeners +
+# HTTP clients fits in 40; active TCP PCBs are sized above the socket count.
+CONFIG_LWIP_MAX_SOCKETS=40
+CONFIG_LWIP_MAX_ACTIVE_TCP=64
+
+# Parked-listener rotation period (phase 2j): tick-only yields, paced at 100 ms.
+CONFIG_USB_HOST_PARKED_IN_ROTATE_MS=100
+
+# LwIP TCP send buffer (round 2l): 2 x MSS instead of the 4 x MSS default. The receive window
+# stays at 4 x MSS (5760). This caps the send data queued per connection at 2.9 KB instead of
+# 5.8 KB. USB FS moves ~1 MB/s and the bench RTT is sub-millisecond, so about 1 KB in flight
+# keeps the link full.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+
+# Phase 3: parked interrupt listeners (cdc-acm notification endpoints, hub status pipes) bind
+# channels on demand, capped at 4 (bench opt-in; 0 keeps every interrupt channel static).
+CONFIG_USB_HOST_PARKED_INTR_BIND_CAP=4

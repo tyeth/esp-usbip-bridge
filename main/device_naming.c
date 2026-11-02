@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -27,30 +28,43 @@ static esp_err_t nvs_open_ro(nvs_handle_t *h)
 }
 
 /* Build the NVS key for a per-device friendly name.
-   busid can contain characters like '-' which NVS keys cannot,
-   so we hex-encode it: "name_" + hex(busid).
-   The result is placed in key_buf (max 64 bytes). */
+   busid can contain characters like '-' which NVS keys cannot, so short
+   busids are hex-encoded: "name_" + hex(busid). NVS keys are limited to
+   15 characters, which that encoding exceeds for any busid longer than
+   5 bytes (e.g. the port path "1-1.3.4.4" needs 23) — nvs_set_str then
+   failed and the name endpoint answered 500 for every device deeper than
+   one hub. Longer busids use "name_" + FNV-1a32(busid) (13 characters);
+   the hex form is kept for short busids so existing stored names keep
+   working. */
 static void device_name_key(const char *busid, char *key_buf, size_t key_size)
 {
-    /* "name_" prefix + 2 hex chars per byte + NUL */
     size_t busid_len = strlen(busid);
-    size_t needed = 5 + busid_len * 2 + 1;
-    if (key_size < needed) {
+    if (busid_len == 0 || key_size < 16) {
         key_buf[0] = '\0';
         return;
     }
-    memcpy(key_buf, "name_", 5);
-    for (size_t i = 0; i < busid_len; i++) {
-        snprintf(key_buf + 5 + i * 2, 3, "%02x", (unsigned char)busid[i]);
+    if (5 + busid_len * 2 <= 15) {      /* NVS_KEY_NAME_MAX_SIZE - 1 */
+        memcpy(key_buf, "name_", 5);
+        for (size_t i = 0; i < busid_len; i++) {
+            snprintf(key_buf + 5 + i * 2, 3, "%02x", (unsigned char)busid[i]);
+        }
+        key_buf[5 + busid_len * 2] = '\0';
+        return;
     }
-    key_buf[5 + busid_len * 2] = '\0';
+    uint32_t h = 2166136261u;           /* FNV-1a 32-bit */
+    for (const char *q = busid; *q; q++) {
+        h = (h ^ (unsigned char)*q) * 16777619u;
+    }
+    snprintf(key_buf, key_size, "name_%08x", (unsigned)h);
 }
 
-/* Build the default MAC-based hostname. */
+/* Build the default MAC-based hostname.  ESP_MAC_BASE is always 6 bytes;
+ * esp_efuse_mac_get_default() returns an 8-byte EUI-64 on 802.15.4 chips
+ * such as the ESP32-S31. */
 static void default_hostname(char *buf, size_t buf_size)
 {
     uint8_t mac[6] = {0};
-    esp_err_t err = esp_efuse_mac_get_default(mac);
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
     if (err != ESP_OK) {
         /* Fallback: "usbip-000000" */
         strlcpy(buf, "usbip-000000", buf_size);
@@ -223,6 +237,9 @@ esp_err_t device_naming_set_device_name(const char *busid, const char *name)
 
     if (strlen(name) == 0) {
         err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;   /* clearing a name that was never set is a no-op */
+        }
     } else {
         err = nvs_set_str(h, key, name);
     }

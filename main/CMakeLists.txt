@@ -1,4 +1,4 @@
-set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns
+set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns esp_driver_i2c
                    harness_io harness_scpi harness_dut harness_io_expander)
 
 set(srcs
@@ -12,6 +12,10 @@ set(srcs
     "http_server.c"
     "led_strip_encoder.c"
     "neopixel.c"
+    "hub_control.c"
+    "port_events.c"
+    "analog_mux.c"
+    "controller_api.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
@@ -32,10 +36,11 @@ if(CONFIG_USBIP_VIRTUAL_HARNESS)
     list(APPEND req_components harness_io_expander harness_gpio harness_bus)
     list(APPEND srcs
         "virtual_harness.c"
+        "scpi_controller.c"
     )
 endif()
 
-if(IDF_TARGET STREQUAL "esp32p4")
+if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32s31")
     list(APPEND req_components esp_eth)
 elseif(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND req_components esp_wifi esp_driver_gpio)
