@@ -512,6 +512,13 @@ esptool --chip esp32s31 -p <port> -b 460800 --before default-reset --after hard-
 image just written, keeps its NVS, and takes every later update with
 `PUT /api/ota`. The factory image stays as the fallback.
 
+**Only upload images that have OTA support themselves** (this code and
+`CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP`). An app built from an older
+tree has the same project name, so the upload is accepted. But it confirms
+itself at startup and has no `/api/ota`, so it cannot be replaced over the
+network and its slot keeps booting. That takes a wired flash that erases
+`otadata` (below).
+
 **Wired app-only flashes after that.** Once a bridge boots an OTA slot, writing
 only the app at `0x10000` changes `factory`, which it does not boot. Erase
 `otadata` in the same esptool call (`erase-region 0xC10000 0x2000`, or write
