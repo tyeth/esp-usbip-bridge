@@ -70,6 +70,10 @@ static void report_status(pb_t *p, const char *what)
         rescue_job_log(p->job, "%s: PICOBOOT status %lu %s", what, (unsigned long)code, rescue_picoboot_status_name(code));
     }
     ctrl(p, 0x41, 0x41, (uint16_t)p->caps.picoboot_if, NULL, 0);     /* PICOBOOT_IF_RESET */
+    /* The stalled bulk endpoint stays halted on the host side until cleared:
+       without this every later command failed with EPIPE too. */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_in, NULL, 0);            /* CLEAR_FEATURE(ENDPOINT_HALT) */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_out, NULL, 0);
 }
 
 /* One command: 32-byte header OUT, data phase (OUT or IN), then the ACK in
@@ -504,6 +508,19 @@ bool picoboot_is_rp2350(const pb_t *p)
 int picoboot_read(pb_t *p, uint32_t addr, uint8_t *buf, uint32_t len)
 {
     uint8_t cmd[32];
+    if ((addr | len) & (PB_PAGE - 1)) {
+        /* The bootrom reads flash in whole 256-byte pages (BAD_ALIGNMENT
+           otherwise): read the pages around it. */
+        const uint32_t a = addr & ~(PB_PAGE - 1);
+        const uint32_t n = ((addr + len + PB_PAGE - 1) & ~(PB_PAGE - 1)) - a;
+        uint8_t *bounce = malloc(n);
+        int rc = bounce ? picoboot_read(p, a, bounce, n) : -1;
+        if (rc == 0) {
+            memcpy(buf, bounce + (addr - a), len);
+        }
+        free(bounce);
+        return rc;
+    }
     for (uint32_t pos = 0; pos < len; pos += PB_SECTOR) {
         const uint32_t n = len - pos < PB_SECTOR ? len - pos : PB_SECTOR;
         rescue_picoboot_range_cmd(RESCUE_PC_READ, ++p->token, addr + pos, n, n, cmd);
