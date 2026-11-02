@@ -365,6 +365,15 @@ static void add_label(cJSON *o, const char *key, const esp_partition_t *p)
     }
 }
 
+/* The first 8 bytes (16 hex digits) of an image's ELF SHA-256, as idf.py
+   prints it (esp_app_get_elf_sha256() stops at CONFIG_APP_RETRIEVE_LEN_ELF_SHA). */
+static void elf_sha_prefix(const esp_app_desc_t *d, char out[17])
+{
+    for (int i = 0; i < 8; i++) {
+        snprintf(out + 2 * i, 3, "%02x", d->app_elf_sha256[i]);
+    }
+}
+
 static cJSON *partition_json(const esp_partition_t *p, const esp_partition_t *running,
                              const esp_partition_t *boot, const esp_partition_t *next)
 {
@@ -390,9 +399,7 @@ static cJSON *partition_json(const esp_partition_t *p, const esp_partition_t *ru
         cJSON_AddStringToObject(a, "time", d.time);
         cJSON_AddStringToObject(a, "idf", d.idf_ver);
         char sha[17];
-        for (int i = 0; i < 8; i++) {
-            snprintf(sha + 2 * i, 3, "%02x", d.app_elf_sha256[i]);
-        }
+        elf_sha_prefix(&d, sha);
         cJSON_AddStringToObject(a, "elf_sha256", sha);
     } else {
         cJSON_AddNullToObject(o, "app");
@@ -413,7 +420,7 @@ cJSON *ota_update_status_json(void)
     cJSON_AddStringToObject(j, "version", me->version);
     cJSON_AddStringToObject(j, "project", me->project_name);
     char sha[17];
-    esp_app_get_elf_sha256(sha, sizeof(sha));
+    elf_sha_prefix(me, sha);
     cJSON_AddStringToObject(j, "elf_sha256", sha);
     add_label(j, "running", running);
     add_label(j, "boot", boot);
@@ -422,9 +429,11 @@ cJSON *ota_update_status_json(void)
     cJSON *c = cJSON_AddObjectToObject(j, "confirm");
     cJSON_AddStringToObject(c, "state", confirm_name(s_confirm));
     cJSON_AddNumberToObject(c, "timeout_s", CONFIG_USBIP_OTA_CONFIRM_TIMEOUT_S);
-    cJSON_AddBoolToObject(c, "app_started", s_app_started);
-    cJSON_AddBoolToObject(c, "network_up", s_seen_ip);
-    cJSON_AddBoolToObject(c, "http_up", s_seen_http);
+    if (s_confirm != CONFIRM_NOT_NEEDED) {      /* the checks only run for a new image */
+        cJSON_AddBoolToObject(c, "app_started", s_app_started);
+        cJSON_AddBoolToObject(c, "network_up", s_seen_ip);
+        cJSON_AddBoolToObject(c, "http_up", s_seen_http);
+    }
     if (s_confirm == CONFIRMED) {
         cJSON_AddNumberToObject(c, "confirmed_after_ms", (double)s_confirm_ms);
     }
