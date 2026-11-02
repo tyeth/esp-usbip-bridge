@@ -44,7 +44,8 @@ No auth needed (same rule as `/api/info`).  Response:
     "transports": ["ethernet", "wifi"],
     "interfaces": [
       {"name": "eth",  "up": true,  "ip": "192.168.1.133", "mac": "1e:29:04:d1:9b:ef"},
-      {"name": "wifi", "up": false, "ip": null, "ssid": null, "rssi": null, "configured": false}
+      {"name": "wifi", "up": false, "ip": null, "mac": "1c:29:04:d1:9b:ee", "ssid": null, "rssi": null,
+       "configured": false, "stored": false, "state": "unconfigured", "attempts": 0, "last_reason": null}
     ]
   },
   "ports": {"http": 80, "usbip": 3240, "serial_stream": 3241},
@@ -64,7 +65,9 @@ No auth needed (same rule as `/api/info`).  Response:
     "mux":            {"version": 1, "available": true},
     "device_info":    {"version": 1},
     "serial_lines":   {"version": 1},
-    "reset":          {"version": 1, "modes": ["esp_hard_reset", "esp_bootloader", "usb_jtag_reset", "touch_1200", "picoboot_bootsel"]},
+    "reset":          {"version": 1, "modes": ["esp_bootloader", "esp_hard_reset", "esp_usb_jtag_bootloader",
+                                               "esp_usb_jtag_reset", "touch_1200", "rp_bootsel", "rp_reboot",
+                                               "picoboot_reboot", "picoboot_bootsel", "bootloader"]},
     "console":        {"version": 1},
     "capture":        {"version": 1},
     "serial_stream":  {"version": 1},
@@ -87,7 +90,15 @@ The example values are .133's.  Rules:
   `ota` key).  `available: false` means compiled in but not usable right now
   (e.g. `mux` with no ADG729 on the bus); clients must check it where present.
 - The `reset.modes` and `dut_fs.filesystems` lists are the real lists the
-  firmware accepts; keep them generated from the same tables the handlers use.
+  firmware accepts; keep them generated from the same tables the handlers use
+  (`rescue_mode_name()` over every mode including `bootloader`, the automatic
+  pick; `dut_fs_kinds[]`).  The `flash_*`, `msc` and `dut_fs` keys come from
+  the rescue job table (`k_job_kinds[]` in `controller_api.c`).
+- `ota` is listed when the partition table has OTA slots; `wifi_config` when
+  the build has the Wi-Fi station next to Ethernet (`CONFIG_USBIP_WIFI_STA`).
+- `fw.version` is the git describe part of the firmware version and
+  `fw.build_time` the rest (`/api/info` `version` carries both); `board.profile`
+  is the `scripts/build-board.sh` profile, `null` for none.
 - Feature names are stable identifiers; never rename one (add a new one).
 
 ## mDNS / DNS-SD
@@ -112,23 +123,43 @@ The example values are .133's.  Rules:
 - Clients browse `_hil-bridge._tcp`, then confirm with `GET /api/capabilities`
   (TXT is a hint, the endpoint is the truth).
 
-## Wi-Fi (S31 and P4 Ethernet boards)
+## Wi-Fi (S31)
 
-Ethernet stays the primary transport.  A board may also join a Wi-Fi network as
-a station; both interfaces can be up at once and every service (HTTP, USB/IP,
-serial streams, mDNS) answers on both.  A board with no Ethernet link and Wi-Fi
-credentials is fully usable over Wi-Fi.
+Only targets with a radio: the ESP32-P4 has none, so P4 builds have no Wi-Fi
+and no `wifi_config` feature (their `/api/network` lists `eth` only, and
+`PUT`/`DELETE /api/network/wifi` answer 501).  The S3 build's Wi-Fi is its only
+transport, configured at boot as before; it lists `wifi` without
+`wifi_config`.
+
+Ethernet stays the primary transport (and the default route).  A board may
+also join a Wi-Fi network as a station; both interfaces can be up at once and
+every service (HTTP, USB/IP, serial streams, mDNS) answers on both, each with
+a DHCP address under the same hostname.  A board with no Ethernet link and
+Wi-Fi credentials is fully usable over Wi-Fi.  Boot never waits for Wi-Fi; a
+lost or failed association is retried with a 1 s backoff doubling to 30 s.
+
+The `wifi` interface object adds `stored` (the credentials in use are the ones
+in NVS), `state` (`unconfigured`, `connecting`, `connected`, `retrying`),
+`attempts` (failures since the last connect), `last_reason` (the last
+disconnect reason, e.g. `auth_fail`, `no_ap_found`, or `null`) and, while
+retrying, `retry_in_ms`.
 
 Credentials live in NVS namespace `wifi`, keys `ssid` and `pass` (the existing
 S3 keys).  They can be set the way a user would, three ways:
 
-1. **Serial console** (the board's UART/USB console, 115200): line commands,
-   never blocking boot —
-   `wifi status`, `wifi set <ssid> <password>` (quotes allowed for spaces),
-   `wifi clear`, `reboot`.  Answers are one line starting `wifi:`.
+1. **Serial console** (the board's console UART, 115200: the CP2102N on the
+   S31): line commands, never blocking boot —
+   `wifi status`, `wifi set <ssid> [<password>]` (quotes allowed for spaces;
+   no password joins an open network; stores at once and connects without a
+   reboot), `wifi clear`, `reboot`, `help`.  Answers are one line starting
+   `wifi:` (`reboot:`, `console:` for the others); the password echoes as `*`.
 2. **HTTP**: `GET /api/network` (the `network` object above),
-   `PUT /api/network/wifi {"ssid": "...", "password": "..."}` (connects
-   without a reboot, stores on success or with `"store": true` regardless),
+   `PUT /api/network/wifi {"ssid": "...", "password": "...", "store": false,
+   "wait_ms": 10000}` (connects without a reboot, stores on success or with
+   `"store": true` regardless; waits up to `wait_ms`, default and max 10000,
+   for an address and answers 200 `{"ok", "connected": true, "stored",
+   "network"}`, or 202 with `"connected": false` while it keeps trying; an
+   empty password joins an open network, otherwise 8-63 characters),
    `DELETE /api/network/wifi`.  The password is never returned.  Auth rules as
    for the other write endpoints.
 3. **Web UI**: a Network section on the bridge page with the same three actions.

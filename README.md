@@ -41,7 +41,8 @@ USB/IP wire format is implemented from Linux kernel documentation:
 ## Project Layout
 
 - `main/main.c`: application startup
-- `main/network_init.c`: target-specific network bring-up (Ethernet or Wi-Fi STA)
+- `main/network_init.c`: target-specific network bring-up (Ethernet or Wi-Fi STA), `GET /api/network`
+- `main/wifi_sta.c`, `main/serial_console.c`: the optional Wi-Fi station next to Ethernet (S31) and its console commands
 - `main/usb_backend.c`: USB Host backend, device discovery, EP0 control transfers
 - `main/usbip_server.c`: TCP server and USB/IP message handling
 - `main/usbip_protocol.h`: protocol constants and packet structs
@@ -97,13 +98,16 @@ export ESPPORT=/dev/ttyUSB0
 Console output defaults by target:
 - ESP32-P4 boards: USB Serial/JTAG console
 - `s3-usb-otg`: `UART0` console (to avoid USB host conflicts)
-- `s31-function-coreboard-1`: USB Serial/JTAG console
+- `s31-function-coreboard-1`: `UART0` console through the board's CP2102N
+  (115200; USB Serial/JTAG as a secondary console), with the
+  [console commands](#wi-fi-next-to-ethernet-s31)
 
 Once running, a board announces itself over mDNS, so you do not need to know its
 address in advance:
 
 ```bash
-avahi-browse -rt _usbip._tcp
+avahi-browse -rt _hil-bridge._tcp   # the bridge (HTTP API on port 80)
+avahi-browse -rt _usbip._tcp        # its USB/IP server and exported devices
 ```
 
 ### ESP32-P4-Function-EV
@@ -150,6 +154,38 @@ capture settings) is kept across every table change. Once a bridge has this
 table it is updated over the network (see
 [Firmware updates over the network](#firmware-updates-over-the-network-ota));
 moving a bridge to it is one wired flash, described there.
+
+#### Wi-Fi next to Ethernet (S31)
+
+The S31 build (`CONFIG_USBIP_WIFI_STA`, on by default for Ethernet boards with
+a radio) also joins a Wi-Fi network as a station. Ethernet stays the primary
+transport and the default route; both can be up at once, each gets an address
+by DHCP under the same hostname, and HTTP, USB/IP (3240), the serial streams
+(3241) and mDNS answer on both. A board with no Ethernet cable is fully usable
+over Wi-Fi. Boot never waits for Wi-Fi: the station starts after the USB host,
+and a lost or failed association is retried with a backoff (1 s doubling to
+30 s). The ESP32-P4 has no radio, so P4 builds have no Wi-Fi.
+
+Credentials live in NVS namespace `wifi` (keys `ssid`, `pass`); without them
+the radio stays idle. Set them the way a user would, any of:
+
+- **Serial console** (115200 on the board's UART USB-C connector):
+
+  ```text
+  wifi set free4all password     store the credentials and connect now
+  wifi status                    wifi: connected ssid="free4all" ip=192.168.1.60 rssi=-48
+  wifi clear                     forget them and disconnect
+  reboot
+  ```
+
+  Quote an SSID or password with spaces (`wifi set "My Net" "pass phrase"`);
+  an empty password joins an open network. Answers are one line starting
+  `wifi:`; the password echoes as `*`.
+- **HTTP**: `PUT /api/network/wifi {"ssid": "...", "password": "..."}` (see
+  [Discovery, capabilities and network](#discovery-capabilities-and-network)).
+- **Web page**: the Network line under the firmware update controls.
+
+The password is never returned, shown or logged.
 
 `components/esp-serial-flasher` is a vendored copy of Espressif's host-side
 flasher (see its `VENDORED.md` for why the registry package is not used).
@@ -230,6 +266,24 @@ Besides USB/IP, the bridge serves a controller API on port 80 for people
 root port), so a device keeps its busid when it re-enumerates, and
 `usbip list -r` / `usbip attach -b` work like against a Linux host.
 Virtual devices are on bus 2.
+
+### Discovery, capabilities and network
+
+The contract between a bridge and its clients (the HIL controller, CI,
+scripts) is [docs/bridge-discovery-and-capabilities.md](docs/bridge-discovery-and-capabilities.md):
+find bridges by browsing `_hil-bridge._tcp`, read `GET /api/capabilities`,
+and decide what to use from `api_version` and per-feature versions, never
+from the firmware commit.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/capabilities` | `api_version`, firmware (`version`, `build_time`, `idf`, `elf_sha256`, `running_partition`), board (`target`, `profile`, `mac`, `hostname`, `board_id`), network, ports, auth, limits and `features`: each `{"version": n}`, listed only when the build has it (`mux.available` says whether the ADG729 bus answers; `reset.modes` and `dut_fs.filesystems` are the lists the handlers accept) |
+| GET | `/api/info` | identity and firmware version, now with `api_version` |
+| GET | `/api/network` | `transports` and `interfaces`: `eth` and `wifi` with `up`, `ip`, `mac`; Wi-Fi also `ssid`, `rssi`, `configured`, `stored`, `state` (`unconfigured`, `connecting`, `connected`, `retrying`), `attempts`, `last_reason` |
+| PUT | `/api/network/wifi` | `{"ssid", "password"?, "store"?, "wait_ms"?}`: join now, without a reboot. Stored in NVS once the station gets an address, or at once with `"store": true`. Waits up to `wait_ms` (default and max 10000): 200 connected, 202 still connecting. 501 on builds without a Wi-Fi station |
+| DELETE | `/api/network/wifi` | forget the credentials (NVS too) and disconnect |
+
+The password is never returned. PUT and DELETE need the token when one is set.
 
 ### USB devices and hub port power
 
@@ -598,13 +652,19 @@ only the app at `0x10000` changes `factory`, which it does not boot. Erase
 
 **UAT branch and deployment.** The `uat` branch is what bridges under user
 acceptance testing run. Every push to it runs `.github/workflows/uat.yml`: it
-builds `s31-function-coreboard-1`, publishes the rolling `uat-s31` prerelease
-(the OTA image `esp32p4_usbip_bridge.bin`, the wired-flash files,
-`flasher_args.json` and `SHA256SUMS`) and, when the repository variable
-`UAT_BRIDGES` (space-separated addresses) is set and a self-hosted runner
-labelled `bridge-lan` can reach them, deploys it over OTA (`UAT_BRIDGE_TOKEN`
-secret for bridges with an API token). By hand, from anywhere on the bridges'
-network:
+builds `s31-function-coreboard-1` and publishes the rolling `uat-s31`
+prerelease (the OTA image `esp32p4_usbip_bridge.bin`, the wired-flash files,
+`flasher_args.json` and `SHA256SUMS`). A push never deploys. Deploying is a
+manual run of the workflow (`workflow_dispatch`) with the required input
+`bridges` (space-separated host names or addresses): its `deploy` job runs on
+a self-hosted runner labelled `bridge-lan` and updates them over OTA
+(`UAT_BRIDGE_TOKEN` secret for bridges with an API token):
+
+```bash
+gh workflow run uat.yml -R <owner>/esp-usbip-bridge --ref uat -f bridges="192.168.1.133"
+```
+
+By hand, from anywhere on the bridges' network:
 
 ```bash
 gh release download uat-s31 -R <owner>/esp-usbip-bridge -p esp32p4_usbip_bridge.bin
@@ -648,18 +708,28 @@ The virtual test harness device (USB/IP busid `2-1`, CDC-ACM) also accepts
 
 ## Service Discovery (mDNS / DNS-SD)
 
-USB/IP protocol itself does not define mDNS discovery. This firmware advertises a custom DNS-SD service:
+The bridge advertises two DNS-SD services under its hostname
+(`usbip-<last three MAC bytes>.local` unless set), on every interface that is
+up (Ethernet and Wi-Fi):
 
-- Service type: `_usbip._tcp`
-- Port: `3240`
-- TXT keys: `transport`, `state`, `busid`, `vid`, `pid`, `target`
-- `count` indicates the number of exported devices (`busid=multi` when `count > 1`)
+- `_hil-bridge._tcp` on port `80`: the bridge itself, for clients of its HTTP
+  API. Instance name: the hostname. A small, static TXT record: `api` (the
+  API version, `1.0`), `fw` (firmware version), `target`, `board` (the
+  build profile, e.g. `s31-function-coreboard-1`), `mac` (base MAC),
+  `caps` (`/api/capabilities`) and `auth` (`0`/`1`). The TXT is a hint;
+  `GET /api/capabilities` is the truth.
+- `_usbip._tcp` on port `3240` (USB/IP protocol itself does not define mDNS
+  discovery): TXT keys `transport`, `state`, `busid`, `vid`, `pid`, `target`,
+  `board_id`; `count` is the number of exported devices (`busid=multi` when
+  `count > 1`), refreshed as devices come and go.
 
-Linux discovery examples:
+Discovery examples:
 
 ```bash
+avahi-browse -rt _hil-bridge._tcp
 avahi-browse -rt _usbip._tcp
 avahi-resolve-host-name usbip-xxxxxx.local
+dns-sd -B _hil-bridge._tcp          # macOS / Windows (Bonjour)
 ```
 
 ## Notes
