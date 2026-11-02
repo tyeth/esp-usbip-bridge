@@ -13,12 +13,14 @@
 #include "freertos/task.h"
 
 #include "blob_store.h"
+#include "device_rescue.h"
 #include "dut_fs.h"
 #include "dut_part_logic.h"
 #include "esp_flasher.h"
 #include "picoboot_flasher.h"
 #include "rescue_logic.h"
 #include "samba_flasher.h"
+#include "serial_link.h"
 #include "usb_backend.h"
 
 #define DF_UNIT             4096u
@@ -61,6 +63,9 @@ struct df {
     rescue_job_t *job;
     char busid[32];
     plat_t plat;
+    rescue_caps_t caps;         /* of the device as found (before any reset) */
+    uint16_t vid;
+    uint32_t devnum;
     espf_t *esp;
     pb_session_t *pb;
     samba_t *samba;
@@ -179,7 +184,8 @@ static bool want(const cJSON *args, const char *key, const char *value)
 static int pick_platform(df_t *df, const cJSON *args)
 {
     const cJSON *p = cJSON_GetObjectItemCaseSensitive(args, "platform");
-    if (cJSON_IsString(p) && strcmp(p->valuestring, "auto") != 0) {
+    const bool p_given = cJSON_IsString(p) && strcmp(p->valuestring, "auto") != 0;
+    if (p_given) {
         if (strcmp(p->valuestring, "esp") == 0) {
             df->plat = PLAT_ESP;
         } else if (strcmp(p->valuestring, "rp2") == 0) {
@@ -189,7 +195,6 @@ static int pick_platform(df_t *df, const cJSON *args)
         } else {
             return rescue_job_fail(df->job, "platform: esp, rp2 or samd");
         }
-        return 0;
     }
     usbip_backend_device_t d;
     if (!usb_backend_get_device_by_busid(df->busid, &d)) {
@@ -204,6 +209,12 @@ static int pick_platform(df_t *df, const cJSON *args)
     free(cfg);
     rescue_caps_t caps;
     rescue_classify(d.id_vendor, d.id_product, d.bcd_device, &c, 0, &caps);
+    df->caps = caps;
+    df->vid = d.id_vendor;
+    df->devnum = d.devnum;
+    if (p_given) {
+        return 0;
+    }
     if (caps.picoboot_if >= 0 || caps.rp_reset_if >= 0 || d.id_vendor == 0x2e8a) {
         df->plat = PLAT_RP2;
     } else if (caps.esp_usb_jtag || d.id_vendor == 0x303a || caps.serial == RESCUE_SERIAL_CP210X ||
@@ -216,6 +227,36 @@ static int pick_platform(df_t *df, const cJSON *args)
     return 0;
 }
 
+/* An ESP32-S2/S3 app on its own USB CDC (TinyUSB: Arduino, CircuitPython,
+   WipperSnapper) has no DTR/RTS reset circuit: the 1200-baud touch sends it
+   to the ROM loader, as the Arduino IDE does before an upload. */
+static void esp_app_touch(df_t *df, const cJSON *args)
+{
+    if (df->caps.serial != RESCUE_SERIAL_CDC_ACM || df->caps.esp_usb_jtag || df->vid == 0x303a ||
+            want(args, "before", "no_reset")) {
+        return;
+    }
+    rescue_job_log(df->job, "native USB CDC app: 1200-baud touch for the ROM loader");
+    serial_link_t *l = calloc(1, sizeof(*l));
+    char msg[96];
+    if (l != NULL && serial_link_open(l, df->busid, 0, msg, sizeof(msg)) == 0) {
+        serial_link_set_lines(l, true, true);
+        serial_link_set_baud(l, 1200);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        serial_link_set_lines(l, false, false);
+        serial_link_close(l);
+    }
+    free(l);
+    usbip_backend_device_t now;
+    bool dropped = false;
+    if (device_rescue_wait_reenumeration(df->busid, df->devnum, 6000, &now, &dropped)) {
+        rescue_job_log(df->job, "came back as %04x:%04x %s", now.id_vendor, now.id_product, now.product);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        rescue_job_log(df->job, "no re-enumeration after the touch (%s)", dropped ? "dropped" : "no reset");
+    }
+}
+
 static int dev_open(df_t *df, const cJSON *args)
 {
     int rc = pick_platform(df, args);
@@ -223,6 +264,7 @@ static int dev_open(df_t *df, const cJSON *args)
         return rc;
     }
     if (df->plat == PLAT_ESP) {
+        esp_app_touch(df, args);
         df->esp = esp_flasher_open(df->job, df->busid, args, &df->encrypted);
         if (df->esp == NULL) {
             return -1;
