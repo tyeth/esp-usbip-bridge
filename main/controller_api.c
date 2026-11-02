@@ -8,7 +8,10 @@
 #include <strings.h>
 
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -17,12 +20,14 @@
 #include "sdkconfig.h"
 
 #include "analog_mux.h"
+#include "bridge_identity.h"
 #include "busid_owner.h"
 #include "device_naming.h"
 #include "blob_store.h"
 #include "capture.h"
 #include "device_rescue.h"
 #include "dut_flash.h"
+#include "dut_fs.h"
 #include "esp_flasher.h"
 #include "msc_host.h"
 #include "ota_update.h"
@@ -32,11 +37,17 @@
 #include "serial_monitor.h"
 #include "discovery_service.h"
 #include "hub_control.h"
+#include "network_init.h"
 #include "port_events.h"
+#include "rescue_logic.h"
 #include "usb/usb_types_stack.h"
 #include "usb_backend.h"
+#include "usbip_protocol.h"
 #include "virtual_device.h"
 #include "version_autogen.h"
+#if CONFIG_USBIP_WIFI_STA
+#include "wifi_sta.h"
+#endif
 
 static const char *TAG = "controller_api";
 
@@ -45,6 +56,8 @@ static const char *TAG = "controller_api";
 #define API_TOKEN_MAX_LEN   64
 #define API_DEFAULT_OFF_MS  1000
 #define API_REBOOT_DELAY_US (800 * 1000)
+#define API_HTTP_PORT       80      /* http_server.c */
+#define API_WIFI_WAIT_MS    10000   /* PUT /api/network/wifi waits this long for an address, at most */
 
 #define MCP_PROTOCOL_VERSION "2025-06-18"
 
@@ -116,6 +129,7 @@ const char *controller_api_status_text(int status)
     case 409: return "Conflict";
     case 411: return "Length Required";
     case 413: return "Payload Too Large";
+    case 501: return "Not Implemented";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
     default:  return "Internal Server Error";
@@ -376,6 +390,7 @@ static api_result_t core_info(void)
     }
     cJSON_AddStringToObject(j, "target", CONFIG_IDF_TARGET);
     cJSON_AddStringToObject(j, "version", HARNESS_FW_VERSION);
+    cJSON_AddStringToObject(j, "api_version", BRIDGE_API_VERSION);
     ota_update_add_summary(j);
     cJSON_AddNumberToObject(j, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(j, "free_heap", esp_get_free_heap_size());
@@ -1378,6 +1393,25 @@ static api_result_t core_rescue_job(const char *kind, const char *busid, const c
     return result(202, j);
 }
 
+/* Rescue job kinds (MCP rescue_start_job; the device routes below start the
+   same jobs) and the /api/capabilities feature each one stands for. */
+static const struct {
+    const char *kind;
+    rescue_job_fn_t fn;
+    const char *feature;
+} k_job_kinds[] = {
+    { "esp_flash", esp_flasher_job, "flash_esp" },
+    { "esp_info", esp_flasher_info_job, NULL },
+    { "picoboot_load", picoboot_flasher_job, "flash_picoboot" },
+    { "picoboot_info", picoboot_info_job, NULL },
+    { "samba_flash", samba_flasher_job, "flash_samba" },
+    { "samba_info", samba_info_job, NULL },
+    { "uf2_copy", msc_uf2_job, "flash_uf2" },
+    { "msc_write", msc_write_job, "msc" },
+    { "msc_read", msc_read_job, NULL },
+    { "dut_flash", dut_flash_job, "dut_fs" },
+};
+
 /* /api/usb/devices/{busid}/<rest> beyond the basic rescue actions. */
 static api_result_t core_device_tools(const char *method, const char *busid, const char *rest,
                                       const char *query, const cJSON *json)
@@ -1667,7 +1701,11 @@ typedef struct {
 
 static const api_route_doc_t k_routes[] = {
     { "GET",  "/ping",                              false, "Liveness check", NULL },
-    { "GET",  "/api/info",                          false, "Bridge identity, firmware version, auth and mux bus state", NULL },
+    { "GET",  "/api/info",                          false, "Bridge identity, firmware version, api_version, auth and mux bus state", NULL },
+    { "GET",  "/api/capabilities",                  false, "What this bridge can do (docs/bridge-discovery-and-capabilities.md): api_version, firmware, board, network, ports, auth, limits and versioned features (reset modes, DUT file systems ...); a feature is listed only when the build has it", NULL },
+    { "GET",  "/api/network",                       false, "Transports and interfaces (eth, wifi): up, ip, mac; Wi-Fi ssid, rssi, configured, state. Never the password", NULL },
+    { "PUT",  "/api/network/wifi",                  true,  "Join a Wi-Fi network now, without a reboot (Ethernet stays up). The credentials are stored in NVS once the station gets an address, or at once with store: true. Waits up to wait_ms (default and max 10000) for the address: 200 connected, 202 still connecting. An empty password joins an open network. POST also accepted", "{\"ssid\":str,\"password\":str?,\"store\":bool?,\"wait_ms\":int?}" },
+    { "DELETE", "/api/network/wifi",                true,  "Forget the Wi-Fi credentials (NVS too) and disconnect", NULL },
     { "GET",  "/api/schema",                        false, "This endpoint list", NULL },
     { "GET",  "/api/usb/devices",                   false, "Exported USB devices with descriptors, topology and port power state. busid is the Linux style port path used by usbip", NULL },
     { "GET",  "/api/usb/devices/{busid}",           false, "One device; 404 when absent (presence check)", NULL },
@@ -1963,18 +2001,11 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
         return core_rescue_console(json_string(args, "busid"), args);
     }
     if (strcmp(name, "rescue_start_job") == 0) {
-        static const struct { const char *kind; rescue_job_fn_t fn; } k_kinds[] = {
-            { "esp_flash", esp_flasher_job }, { "esp_info", esp_flasher_info_job },
-            { "picoboot_load", picoboot_flasher_job }, { "picoboot_info", picoboot_info_job },
-            { "samba_flash", samba_flasher_job }, { "samba_info", samba_info_job },
-            { "uf2_copy", msc_uf2_job }, { "msc_write", msc_write_job }, { "msc_read", msc_read_job },
-            { "dut_flash", dut_flash_job },
-        };
         const char *kind = json_string(args, "kind");
-        for (size_t i = 0; kind && i < sizeof(k_kinds) / sizeof(k_kinds[0]); i++) {
-            if (strcmp(kind, k_kinds[i].kind) == 0) {
+        for (size_t i = 0; kind && i < sizeof(k_job_kinds) / sizeof(k_job_kinds[0]); i++) {
+            if (strcmp(kind, k_job_kinds[i].kind) == 0) {
                 return core_rescue_job(kind, json_string(args, "busid"),
-                                       cJSON_GetObjectItemCaseSensitive(args, "args"), k_kinds[i].fn);
+                                       cJSON_GetObjectItemCaseSensitive(args, "args"), k_job_kinds[i].fn);
             }
         }
         return fail(400, "unknown kind");
@@ -2259,6 +2290,168 @@ static bool path_is(const char *path, const char *p)
     return strcmp(path, p) == 0;
 }
 
+/* ===========================================================================
+ *  Capabilities and network (docs/bridge-discovery-and-capabilities.md)
+ * ======================================================================== */
+
+static cJSON *add_feature(cJSON *features, const char *name, int version)
+{
+    cJSON *f = cJSON_AddObjectToObject(features, name);
+    cJSON_AddNumberToObject(f, "version", version);
+    return f;
+}
+
+static api_result_t core_capabilities(void)
+{
+    cJSON *j = cJSON_CreateObject();
+    char buf[72];
+    cJSON_AddNumberToObject(j, "schema", 1);
+    cJSON_AddStringToObject(j, "api_version", BRIDGE_API_VERSION);
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    cJSON *fw = cJSON_AddObjectToObject(j, "fw");
+    cJSON_AddStringToObject(fw, "project", app->project_name);
+    bridge_fw_version(buf, sizeof(buf));
+    cJSON_AddStringToObject(fw, "version", buf);
+    add_str_or_null(fw, "build_time", bridge_build_time());
+    cJSON_AddStringToObject(fw, "idf", app->idf_ver);
+    /* 16 hex digits as /api/ota and idf.py print them (esp_app_get_elf_sha256()
+       stops at CONFIG_APP_RETRIEVE_LEN_ELF_SHA, 9 by default) */
+    for (int i = 0; i < 8; i++) {
+        snprintf(buf + 2 * i, 3, "%02x", app->app_elf_sha256[i]);
+    }
+    cJSON_AddStringToObject(fw, "elf_sha256", buf);
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    add_str_or_null(fw, "running_partition", running ? running->label : NULL);
+
+    cJSON *board = cJSON_AddObjectToObject(j, "board");
+    cJSON_AddStringToObject(board, "target", CONFIG_IDF_TARGET);
+    add_str_or_null(board, "profile", bridge_board_profile());
+    uint8_t m[6] = {0};
+    esp_read_mac(m, ESP_MAC_BASE);
+    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+    cJSON_AddStringToObject(board, "mac", buf);
+    char name[DEVICE_NAME_MAX_LEN];
+    device_naming_get_hostname(name, sizeof(name));
+    cJSON_AddStringToObject(board, "hostname", name);
+    if (device_naming_get_board_id(name, sizeof(name)) == ESP_OK) {
+        add_str_or_null(board, "board_id", name);
+    } else {
+        cJSON_AddNullToObject(board, "board_id");
+    }
+
+    cJSON_AddItemToObject(j, "network", network_describe());
+
+    cJSON *ports = cJSON_AddObjectToObject(j, "ports");
+    cJSON_AddNumberToObject(ports, "http", API_HTTP_PORT);
+    cJSON_AddNumberToObject(ports, "usbip", USBIP_TCP_PORT);
+    cJSON_AddNumberToObject(ports, "serial_stream", CAPTURE_STREAM_PORT);
+
+    cJSON *auth = cJSON_AddObjectToObject(j, "auth");
+    cJSON_AddBoolToObject(auth, "required", s_token[0] != '\0');
+
+    cJSON *limits = cJSON_AddObjectToObject(j, "limits");
+    cJSON_AddNumberToObject(limits, "max_devices", CONFIG_USBIP_MAX_DEVICES);
+    cJSON_AddNumberToObject(limits, "max_interfaces_per_device", CONFIG_USBIP_MAX_INTERFACES);
+    cJSON_AddNumberToObject(limits, "max_endpoints_per_device", CONFIG_USBIP_MAX_ENDPOINTS);
+    cJSON_AddNumberToObject(limits, "max_inflight_transfers", CONFIG_USBIP_MAX_INFLIGHT_XFERS);
+    cJSON_AddNumberToObject(limits, "rescue_staging_bytes", BLOB_TOTAL_MAX);
+
+    /* Bump a feature's version when it gains or changes behaviour; never
+       rename one. */
+    cJSON *features = cJSON_AddObjectToObject(j, "features");
+    add_feature(features, "usbip", 1);
+    add_feature(features, "claims", 1);
+    add_feature(features, "hub_power", 1);
+    add_feature(features, "port_events", 1);
+    cJSON_AddBoolToObject(add_feature(features, "mux", 1), "available", analog_mux_bus_ok());
+    add_feature(features, "device_info", 1);
+    add_feature(features, "serial_lines", 1);
+    cJSON *modes = cJSON_AddArrayToObject(add_feature(features, "reset", 1), "modes");
+    for (int mode = 0; mode <= RESCUE_MODE_AUTO_BOOTLOADER; mode++) {
+        cJSON_AddItemToArray(modes, cJSON_CreateString(rescue_mode_name((rescue_mode_t)mode)));
+    }
+    add_feature(features, "console", 1);
+    add_feature(features, "capture", 1);
+    add_feature(features, "serial_stream", 1);
+    for (size_t i = 0; i < sizeof(k_job_kinds) / sizeof(k_job_kinds[0]); i++) {
+        if (k_job_kinds[i].feature == NULL) {
+            continue;
+        }
+        cJSON *f = add_feature(features, k_job_kinds[i].feature, 1);
+        if (strcmp(k_job_kinds[i].feature, "dut_fs") == 0) {
+            cJSON *fs = cJSON_AddArrayToObject(f, "filesystems");
+            for (size_t k = 0; k < dut_fs_kind_count; k++) {
+                cJSON_AddItemToArray(fs, cJSON_CreateString(dpl_fs_name(dut_fs_kinds[k])));
+            }
+        }
+    }
+    /* A build whose partition table has no OTA slots cannot update itself. */
+    if (esp_ota_get_next_update_partition(NULL) != NULL) {
+        add_feature(features, "ota", 1);
+    }
+#if CONFIG_USBIP_WIFI_STA
+    add_feature(features, "wifi_config", 1);
+#endif
+    add_feature(features, "debug_ctrl", 1);
+    return result(200, j);
+}
+
+/* GET /api/network, PUT and DELETE /api/network/wifi */
+static api_result_t core_network(const char *method, const char *path, const cJSON *json)
+{
+    if (path_is(path, "/api/network")) {
+        return is_method(method, "GET") ? result(200, network_describe()) : fail(405, "use GET");
+    }
+    if (!path_is(path, "/api/network/wifi")) {
+        return fail(404, "GET /api/network, PUT or DELETE /api/network/wifi");
+    }
+#if CONFIG_USBIP_WIFI_STA
+    if (is_method(method, "PUT") || is_method(method, "POST")) {
+        const char *ssid = json_string(json, "ssid");
+        const char *password = json_string(json, "password");
+        if (ssid == NULL) {
+            return fail(400, "expected JSON body {\"ssid\": str, \"password\": str?, \"store\": bool?, \"wait_ms\": int?}");
+        }
+        int wait_ms = API_WIFI_WAIT_MS;
+        json_int(json, "wait_ms", &wait_ms);
+        if (wait_ms < 0 || wait_ms > API_WIFI_WAIT_MS) {
+            wait_ms = API_WIFI_WAIT_MS;
+        }
+        wifi_sta_status_t st;
+        esp_err_t err = wifi_sta_set(ssid, password ? password : "", json_bool(json, "store", false),
+                                     (uint32_t)wait_ms, &st);
+        if (err == ESP_ERR_INVALID_ARG) {
+            return fail(400, "ssid: 1-32 characters; password: empty (open network) or 8-63 characters");
+        }
+        if (err != ESP_OK) {
+            return fail(status_for_err(err), esp_err_to_name(err));
+        }
+        const bool connected = st.state == WIFI_STA_CONNECTED && st.has_ip;
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddBoolToObject(j, "ok", true);
+        cJSON_AddBoolToObject(j, "connected", connected);
+        cJSON_AddBoolToObject(j, "stored", st.stored);
+        cJSON_AddItemToObject(j, "network", network_describe());
+        return result(connected ? 200 : 202, j);
+    }
+    if (is_method(method, "DELETE")) {
+        esp_err_t err = wifi_sta_clear();
+        if (err != ESP_OK) {
+            return fail(status_for_err(err), esp_err_to_name(err));
+        }
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddBoolToObject(j, "ok", true);
+        cJSON_AddItemToObject(j, "network", network_describe());
+        return result(200, j);
+    }
+    return fail(405, "use PUT or DELETE");
+#else
+    (void)json;
+    return fail(501, "this build has no Wi-Fi station to configure (no wifi_config feature)");
+#endif
+}
+
 bool controller_api_handle(const char *method, const char *url, const char *auth,
                            const char *body, size_t body_len, api_response_t *resp)
 {
@@ -2282,6 +2475,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
 
     const bool known = path_is(path, "/ping") || path_is(path, "/mcp") ||
                        strncmp(path, "/api/info", 9) == 0 || path_is(path, "/api/schema") ||
+                       path_is(path, "/api/capabilities") ||
+                       path_is(path, "/api/network") || strncmp(path, "/api/network/", 13) == 0 ||
                        strncmp(path, "/api/usb/", 9) == 0 || strncmp(path, "/api/ports", 10) == 0 ||
                        path_is(path, "/api/status") || path_is(path, "/api/duts") ||
                        strncmp(path, "/api/select", 11) == 0 || path_is(path, "/api/isolate") ||
@@ -2322,6 +2517,10 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_info();
     } else if (path_is(path, "/api/schema")) {
         r = core_schema();
+    } else if (path_is(path, "/api/capabilities")) {
+        r = is_method(method, "GET") || is_method(method, "HEAD") ? core_capabilities() : fail(405, "use GET");
+    } else if (path_is(path, "/api/network") || strncmp(path, "/api/network/", 13) == 0) {
+        r = core_network(method, path, json);
     } else if (path_is(path, "/mcp")) {
         if (!is_method(method, "POST")) {
             r = mux_fail(405, "only POST is supported (stateless, no SSE stream)");

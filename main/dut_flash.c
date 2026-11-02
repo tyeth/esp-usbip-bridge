@@ -1155,10 +1155,16 @@ static int op_format(df_t *df, const cJSON *a, op_t *o)
     const char *kind = str_arg(a, "fs");
     dut_fs_format_t how = { .lfs_prog = df->lfs_prog_default, .lfs_version = 0x00020000,
                             .lfs_name_max = df->plat == PLAT_ESP ? 64 : 255, .fat_sector = 512 };
-    if (kind && strcmp(kind, "littlefs") == 0) {
-        how.kind = DPL_FS_LITTLEFS;
-    } else if (kind && strcmp(kind, "fat") == 0) {
-        how.kind = DPL_FS_FAT;
+    how.kind = DPL_FS_UNKNOWN;
+    for (size_t i = 0; kind && i < dut_fs_kind_count; i++) {
+        if (strcmp(kind, dpl_fs_name(dut_fs_kinds[i])) == 0) {
+            how.kind = dut_fs_kinds[i];
+        }
+    }
+    if (how.kind == DPL_FS_UNKNOWN) {
+        return op_fail(o, 400, "fs: littlefs, fat or spiffs");
+    }
+    if (how.kind == DPL_FS_FAT) {
         uint32_t ss;
         if (parse_u32(cJSON_GetObjectItemCaseSensitive(a, "sector_size"), &ss)) {
             how.fat_sector = ss;
@@ -1166,10 +1172,6 @@ static int op_format(df_t *df, const cJSON *a, op_t *o)
         if (how.fat_sector != 512 && how.fat_sector != 4096) {
             return op_fail(o, 400, "sector_size: 512 or 4096");
         }
-    } else if (kind && strcmp(kind, "spiffs") == 0) {
-        how.kind = DPL_FS_SPIFFS;
-    } else {
-        return op_fail(o, 400, "fs: littlefs, fat or spiffs");
     }
     if (r->protect && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(a, "force"))) {
         return op_fail(o, 409, "%s holds code or system data (force: true to format anyway)", r->name);

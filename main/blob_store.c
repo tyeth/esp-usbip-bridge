@@ -9,7 +9,6 @@
 #include "freertos/semphr.h"
 
 #define BLOB_SLOTS          16
-#define BLOB_TOTAL_MAX      (12u * 1024 * 1024)
 #define BLOB_PSRAM_RESERVE  (1024u * 1024)  /* left for everything else */
 
 typedef struct {

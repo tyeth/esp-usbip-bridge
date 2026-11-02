@@ -60,4 +60,9 @@ typedef struct {
 
 int dut_fs_format(const dut_bd_t *bd, const dut_fs_format_t *how, char *err, size_t err_len);
 
+/* The file systems this module mounts and formats, in the order the format
+   op names them (fat, littlefs, spiffs); /api/capabilities lists them. */
+extern const dpl_fs_kind_t dut_fs_kinds[];
+extern const size_t dut_fs_kind_count;
+
 #endif
