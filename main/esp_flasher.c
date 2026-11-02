@@ -95,10 +95,9 @@ static void port_enter_bootloader(esp_loader_port_t *port)
         rescue_job_log(p->job, "reset into the bootloader: %s", serial_link_errno_name(st));
     }
     if (usb) {
-        /* The chip resets with its USB-Serial/JTAG, so it always comes back
-           as a new device, sometimes seconds after the sequence ended. */
-        (void)dropped;
-        follow_reenumeration(p, devnum, true);
+        /* Entering download mode usually keeps the USB-Serial/JTAG connected
+           (ESP32-C6, C5 on .147), so wait long only when a drop was seen. */
+        follow_reenumeration(p, devnum, dropped);
         serial_link_set_baud(p->link, ESPF_ROM_BAUD);
     }
     vTaskDelay(pdMS_TO_TICKS(50));

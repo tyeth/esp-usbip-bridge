@@ -201,6 +201,11 @@ int samba_info_job(rescue_job_t *job, const char *busid, const cJSON *args)
         return rescue_job_fail(job, "out of memory");
     }
     const int rc = samba_connect(s, job, busid, args);
+    if (rc == 0 && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(args, "reset"))) {
+        /* Back to the app: SYSRESETREQ through AIRCR, as Device::reset() does. */
+        rescue_job_log(job, "resetting the board");
+        send_cmd(s, "WE000ED0C,05FA0004#");
+    }
     serial_link_close(&s->link);
     heap_caps_free(s);
     return rc;
