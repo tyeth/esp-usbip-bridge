@@ -741,6 +741,9 @@ int dut_fs_mkdir(dut_fs_t *fs, const char *path, char *err, size_t err_len)
  *  Format
  * ======================================================================== */
 
+const dpl_fs_kind_t dut_fs_kinds[] = { DPL_FS_FAT, DPL_FS_LITTLEFS, DPL_FS_SPIFFS };
+const size_t dut_fs_kind_count = sizeof(dut_fs_kinds) / sizeof(dut_fs_kinds[0]);
+
 int dut_fs_format(const dut_bd_t *bd, const dut_fs_format_t *how, char *err, size_t err_len)
 {
     if (how->kind == DPL_FS_LITTLEFS) {

@@ -21,6 +21,17 @@
 #include "esp_wifi.h"
 #endif
 
+#include "device_naming.h"
+
+#if CONFIG_USBIP_WIFI_STA
+#include "serial_console.h"
+#include "wifi_sta.h"
+
+/* Above the Wi-Fi station's 100 (ESP_NETIF_INHERENT_DEFAULT_WIFI_STA), so
+   Ethernet stays the default route while both are up. */
+#define ETH_ROUTE_PRIO 128
+#endif
+
 static const char *TAG = "network";
 
 #if CONFIG_USBIP_TRANSPORT_ETHERNET
@@ -112,11 +123,22 @@ static esp_err_t network_init_ethernet(void)
         return err;
     }
 
+#if CONFIG_USBIP_WIFI_STA
+    esp_netif_inherent_config_t eth_base = ESP_NETIF_INHERENT_DEFAULT_ETH();
+    eth_base.route_prio = ETH_ROUTE_PRIO;
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    netif_cfg.base = &eth_base;
+#else
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+#endif
     esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
     if (eth_netif == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    /* DHCP option 12: the same name as mDNS (and the Wi-Fi station) */
+    char hostname[DEVICE_NAME_MAX_LEN];
+    device_naming_get_hostname(hostname, sizeof(hostname));
+    esp_netif_set_hostname(eth_netif, hostname);
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
@@ -540,4 +562,112 @@ esp_err_t network_init_start(void)
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
+}
+
+esp_err_t network_init_start_secondary(void)
+{
+#if CONFIG_USBIP_WIFI_STA
+    esp_err_t err = wifi_sta_start();
+    if (err != ESP_OK) {
+        /* Ethernet carries on without it */
+        ESP_LOGE(TAG, "Wi-Fi station failed to start: %s", esp_err_to_name(err));
+    }
+    return serial_console_start();
+#else
+    return ESP_OK;
+#endif
+}
+
+/* ===========================================================================
+ *  GET /api/network, the "network" object of /api/capabilities
+ * ======================================================================== */
+
+static void add_netif_addr(cJSON *o, esp_netif_t *netif)
+{
+    esp_netif_ip_info_t ip;
+    char buf[18];
+    const bool up = netif != NULL && esp_netif_is_netif_up(netif);
+    cJSON_AddBoolToObject(o, "up", up);
+    if (up && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip.ip));
+        cJSON_AddStringToObject(o, "ip", buf);
+    } else {
+        cJSON_AddNullToObject(o, "ip");
+    }
+    uint8_t mac[6];
+    if (netif != NULL && esp_netif_get_mac(netif, mac) == ESP_OK) {
+        snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        cJSON_AddStringToObject(o, "mac", buf);
+    } else {
+        cJSON_AddNullToObject(o, "mac");
+    }
+}
+
+cJSON *network_describe(void)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON *transports = cJSON_AddArrayToObject(j, "transports");
+#if CONFIG_USBIP_TRANSPORT_ETHERNET
+    cJSON_AddItemToArray(transports, cJSON_CreateString("ethernet"));
+#endif
+#if CONFIG_USBIP_TRANSPORT_WIFI || CONFIG_USBIP_WIFI_STA
+    cJSON_AddItemToArray(transports, cJSON_CreateString("wifi"));
+#endif
+    cJSON *ifs = cJSON_AddArrayToObject(j, "interfaces");
+
+#if CONFIG_USBIP_TRANSPORT_ETHERNET
+    cJSON *eth = cJSON_CreateObject();
+    cJSON_AddStringToObject(eth, "name", "eth");
+    add_netif_addr(eth, esp_netif_get_handle_from_ifkey("ETH_DEF"));
+    cJSON_AddItemToArray(ifs, eth);
+#endif
+
+#if CONFIG_USBIP_WIFI_STA
+    wifi_sta_status_t st;
+    wifi_sta_get_status(&st);
+    cJSON *w = cJSON_CreateObject();
+    cJSON_AddStringToObject(w, "name", "wifi");
+    add_netif_addr(w, esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
+    if (st.configured) {
+        cJSON_AddStringToObject(w, "ssid", st.ssid);
+    } else {
+        cJSON_AddNullToObject(w, "ssid");
+    }
+    if (st.state == WIFI_STA_CONNECTED) {
+        cJSON_AddNumberToObject(w, "rssi", st.rssi);
+    } else {
+        cJSON_AddNullToObject(w, "rssi");
+    }
+    cJSON_AddBoolToObject(w, "configured", st.configured);
+    cJSON_AddBoolToObject(w, "stored", st.stored);
+    cJSON_AddStringToObject(w, "state", wifi_sta_state_name(st.state));
+    cJSON_AddNumberToObject(w, "attempts", st.attempts);
+    if (st.last_reason != 0) {
+        cJSON_AddStringToObject(w, "last_reason", wifi_sta_reason_name(st.last_reason));
+    } else {
+        cJSON_AddNullToObject(w, "last_reason");
+    }
+    if (st.state == WIFI_STA_RETRYING) {
+        cJSON_AddNumberToObject(w, "retry_in_ms", st.retry_in_ms);
+    }
+    cJSON_AddItemToArray(ifs, w);
+#elif CONFIG_USBIP_TRANSPORT_WIFI
+    /* The S3 transport: configured at boot (the UART prompt) or not running. */
+    cJSON *w = cJSON_CreateObject();
+    cJSON_AddStringToObject(w, "name", "wifi");
+    add_netif_addr(w, esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        cJSON_AddStringToObject(w, "ssid", (const char *)ap.ssid);
+        cJSON_AddNumberToObject(w, "rssi", ap.rssi);
+    } else {
+        cJSON_AddNullToObject(w, "ssid");
+        cJSON_AddNullToObject(w, "rssi");
+    }
+    cJSON_AddBoolToObject(w, "configured", true);
+    cJSON_AddItemToArray(ifs, w);
+#endif
+    (void)ifs;
+    return j;
 }

@@ -15,3 +15,8 @@ CONFIG_USBIP_ETH_PHY_RST_GPIO=52
 
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 
+
+# The HTTP API serves one request at a time; connections wait in the accept
+# mailbox meanwhile (a console peek holds it up to 12 s).  At the default 6,
+# a browser's pollers overflowed it and lwIP reset the extra connections.
+CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=12

@@ -47,7 +47,11 @@
 extern const char _binary_web_app_js_start[];
 
 #define HTTP_PORT              80
-#define HTTP_MAX_CLIENTS       4
+/* Listen backlog: connections wait here while one request is served (the
+   server handles one at a time; a console peek holds it up to 12 s).  With
+   4, a browser's pollers overflowed it during a peek: the extra SYNs were
+   dropped, retried after 3 + 6 s by the client, and failed after ~21 s. */
+#define HTTP_MAX_CLIENTS       10      /* <= CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE (12) */
 #define HTTP_BUF_SIZE          2048
 #define HTTP_TASK_STACK        16384
 #define HTTP_TASK_PRIORITY     3
@@ -950,6 +954,17 @@ static void stream_html_page(stream_t *s)
         " <label class=\"muted\"><input type=\"checkbox\" id=\"otareboot\" checked> reboot into it</label>"
         " <button onclick=\"otaUpload()\" style=\"font-size:0.7rem\">Upload app .bin</button>"
         " <span id=\"otaprog\" class=\"muted\"></span></p>\n"
+        /* Network: interfaces and the optional Wi-Fi station (web_app.js
+           netLoad / netSet / netClear, GET /api/network) */
+        "<p class=\"sub\">Network: <span id=\"netst\" class=\"muted\">&hellip;</span>"
+        "<span id=\"netwifi\" style=\"display:none\"><br>Wi-Fi: SSID"
+        " <input id=\"netssid\" class=\"txt\" type=\"text\" size=\"14\" maxlength=\"32\">"
+        " password <input id=\"netpass\" class=\"txt\" type=\"password\" size=\"14\" maxlength=\"63\""
+        " placeholder=\"empty: open\">"
+        " <label class=\"muted\"><input type=\"checkbox\" id=\"netstore\"> store now</label>"
+        " <button onclick=\"netSet()\" style=\"font-size:0.7rem\">Connect</button>"
+        " <button onclick=\"netClear()\" style=\"font-size:0.7rem\">Forget</button>"
+        " <span id=\"netprog\" class=\"muted\"></span></span></p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
@@ -1113,6 +1128,7 @@ static void stream_html_page(stream_t *s)
         " <a href=\"#\" onclick=\"st('m');return false\" style=\"color:#e94560\">I2C strand mux &rarr;</a></p>\n"
         "<p class=\"sub\">Device <select id=\"rdev\" onchange=\"rescueSel(this.value)\"></select>"
         " <button onclick=\"rescueLoad()\">Refresh</button> <span id=\"rst\" class=\"muted\"></span></p>\n"
+        "<div id=\"rholders\" class=\"sub\"></div>\n"
         "<div id=\"rinfo\" class=\"muted\">Pick a device</div>\n"
         "</div>\n"
         "<footer>USB/IP Bridge &mdash; <a href=\"/\" style=\"color:#555\">refresh</a></footer>\n"

@@ -43,7 +43,7 @@ answers['GET /api/status'] = [200, { active: null, duts: [{ name: 'feather-s3', 
 answers['GET /api/usb/devices'] = [200, { devices: [] }];
 
 const base = { ok: true, busid: '1-1.2', vid: '303a', pid: '1001', bcd_device: '0101', device_class: 'ef',
-  manufacturer: 'Espressif', product: 'USB JTAG/serial debug unit', serial: 'AA', name: 'feather-s3', speed: 'full',
+  manufacturer: 'Espressif', product: 'USB JTAG/serial debug unit', serial_number: 'AA', name: 'feather-s3', speed: 'full',
   address: 3, configuration: 1, interfaces: [{ number: 0, class: '02', subclass: '02', protocol: '00', class_name: 'cdc',
   num_endpoints: 1, intr_in: '82' }], owner: null, imported: false, monitor: false, job_running: false,
   port: { path: '1-1.2', power: 'on', connected: true, over_current: false, saved: 'on', read_only: true },
@@ -71,6 +71,8 @@ for (const [name, info] of Object.entries(cases)) {
     for (const w of want) {
       if (!h.includes(w)) { console.log(`FAIL ${name}: missing "${w}"`); failed++; }
     }
+    if (h.includes('[object Object]')) { console.log(`FAIL ${name}: an object rendered as text`); failed++; }
+    if (name === 'esp' && !h.includes('<td>Serial number</td><td>AA</td>')) { console.log('FAIL esp: serial number not shown'); failed++; }
     if (name === 'bootsel' && h.includes('Flash ESP')) { console.log('FAIL bootsel shows the ESP flasher'); failed++; }
     if (!el('rfiles').innerHTML.includes('app.bin')) { console.log(`FAIL ${name}: staged files not listed`); failed++; }
   } catch (e) {
@@ -111,5 +113,34 @@ try {
   if (!l.includes('secrets.json') || !l.includes('lib/')) { console.log('FAIL device flash listing'); failed++; }
   if (!el('rdfinfo').textContent.includes('120 KB free')) { console.log('FAIL device flash usage: ' + el('rdfinfo').textContent); failed++; }
 } catch (e) { console.log('FAIL device flash: ' + e.stack); failed++; }
+// switching devices releases the DUT flash session of the device left behind,
+// and a held device keeps its Close/Cancel controls (holders banner, job box)
+try {
+  const posts = [];
+  const send = XHR.prototype.send;
+  XHR.prototype.send = function (b) { posts.push(this.m + ' ' + this.url); return send.call(this, b); };
+  const other = Object.assign({}, base, { busid: '1-3' });
+  answers['GET /api/usb/devices/1-3/rescue'] = [200, other];
+  answers['GET /api/rescue/holders'] = [200, { holders: [{ busid: '1-1.2', kind: 'job', job: 9, what: 'dut_flash', state: 'running',
+    elapsed_s: 4, limit_s: 1800, stop: [{ label: 'Close session', method: 'POST', path: '/api/usb/devices/1-1.2/dutflash/close', body: {} },
+                                        { label: 'Cancel job', method: 'DELETE', path: '/api/rescue/jobs/9' }] }], job_limit_s: 1800 }];
+  answers['POST /api/usb/devices/1-1.2/dutflash/close'] = [200, { ok: true, job: 9 }];
+  answers['DELETE /api/rescue/jobs/9'] = [200, { ok: true }];
+  vm.runInContext("rescueSel('1-1.2'); rDfRun([]);", sandbox);
+  posts.length = 0;
+  vm.runInContext("rescueSel('1-3');", sandbox);
+  if (!posts.includes('POST /api/usb/devices/1-1.2/dutflash/close')) { console.log('FAIL switch: session left open: ' + posts); failed++; }
+  if (!el('rholders').innerHTML.includes('Cancel job')) { console.log('FAIL holders banner: ' + el('rholders').innerHTML); failed++; }
+  answers['GET /api/usb/devices/1-1.2/rescue'] = [200, Object.assign({}, base,
+    { owner: { kind: 'rescue', peer: 'rescue:job:dut_flash', sessions: 0, for_s: 9 }, job_running: true })];
+  answers['GET /api/rescue/jobs'] = [200, { jobs: [{ id: 9, kind: 'dut_flash', busid: '1-1.2', state: 'running' }], running: 9 }];
+  vm.runInContext("rescueSel('1-1.2');", sandbox);
+  if (/rDfClose\(\)" disabled/.test(el('rinfo').innerHTML)) { console.log('FAIL held device: Close session disabled'); failed++; }
+  if (el('rjob').style.display !== 'block') { console.log('FAIL held device: running job not shown'); failed++; }
+  posts.length = 0;
+  vm.runInContext("rHoldStop(0, 1);", sandbox);
+  if (!posts.includes('DELETE /api/rescue/jobs/9')) { console.log('FAIL holder Cancel: ' + posts); failed++; }
+  XHR.prototype.send = send;
+} catch (e) { console.log('FAIL device switch: ' + e.stack); failed++; }
 console.log(failed ? `${failed} failure(s)` : 'ui smoke: all passed');
 process.exit(failed ? 1 : 0);

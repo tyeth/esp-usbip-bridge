@@ -13,12 +13,31 @@
 #include "mdns.h"
 #include "sdkconfig.h"
 
+#include "analog_mux.h"
+#include "bridge_identity.h"
+#include "controller_api.h"
 #include "device_naming.h"
 #include "usb_backend.h"
 #include "usbip_protocol.h"
 
 #define USBIP_MDNS_SERVICE_TYPE "_usbip"
 #define USBIP_MDNS_SERVICE_PROTO "_tcp"
+/* The bridge itself, for clients that drive it over HTTP (the HIL
+   controller): a small, static TXT; GET /api/capabilities is the truth.
+   ("_esp-usbip-bridge" is 16 characters, over the DNS-SD limit of 15.) */
+#define BRIDGE_MDNS_SERVICE_TYPE "_esp-usbip"
+#define BRIDGE_MDNS_SERVICE_PROTO "_tcp"
+#define BRIDGE_HTTP_PORT 80
+#define BRIDGE_PRODUCT "esp-usbip-bridge"
+/* On _usbip._tcp and _esp-usbip._tcp: a browse of
+   _esp-usbip-bridge._sub._usbip._tcp finds only these bridges among USB/IP
+   servers. */
+#define BRIDGE_MDNS_SUBTYPE "_esp-usbip-bridge"
+/* The I2C strand mux, on the same HTTP port: the same API as the
+   standalone sbc-dut-analog-mux box (product=sbc-dut-analog-mux). */
+#define STRAND_MDNS_SERVICE_TYPE "_i2c-strand"
+#define STRAND_MDNS_SERVICE_PROTO "_tcp"
+#define STRAND_API_VERSION "1"
 #define USBIP_DISCOVERY_TASK_STACK 4096
 #define USBIP_DISCOVERY_TASK_PRIORITY 5
 #define USBIP_DISCOVERY_REFRESH_MS 1000
@@ -34,6 +53,23 @@ typedef struct {
 
 static discovery_snapshot_t s_last_snapshot;
 static char s_board_id[DEVICE_NAME_MAX_LEN];
+static char s_hostname[DEVICE_NAME_MAX_LEN];  /* the mDNS host and instance name in use */
+static bool s_started;
+static bool s_bridge_auth;                  /* the auth value last published */
+
+typedef struct {
+    bool advertised;
+    int groups, duts;
+    const char *mux;
+} strand_state_t;
+static strand_state_t s_strand;             /* what _i2c-strand._tcp last published */
+
+static void base_mac_str(char *buf, size_t len)
+{
+    uint8_t m[6] = {0};
+    esp_read_mac(m, ESP_MAC_BASE);
+    snprintf(buf, len, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
 
 static bool snapshot_changed(const discovery_snapshot_t *a, const discovery_snapshot_t *b)
 {
@@ -84,6 +120,87 @@ static esp_err_t discovery_publish_txt_from_snapshot(const discovery_snapshot_t 
     return mdns_service_txt_set(USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, txt, sizeof(txt) / sizeof(txt[0]));
 }
 
+/* _esp-usbip._tcp: product, api, fw, target, board, mac, caps, auth.  add:
+   register the service (instance name = hostname) with its subtype, else
+   replace its TXT. */
+static esp_err_t discovery_publish_bridge(bool add, const char *hostname)
+{
+    char fw[48];
+    bridge_fw_version(fw, sizeof(fw));
+    char mac[18];
+    base_mac_str(mac, sizeof(mac));
+    const char *board = bridge_board_profile();
+    s_bridge_auth = controller_api_auth_required();
+
+    mdns_txt_item_t txt[] = {
+        {.key = "product", .value = BRIDGE_PRODUCT},
+        {.key = "api", .value = BRIDGE_API_VERSION},
+        {.key = "fw", .value = fw},
+        {.key = "target", .value = CONFIG_IDF_TARGET},
+        {.key = "board", .value = board ? board : "none"},
+        {.key = "mac", .value = mac},
+        {.key = "caps", .value = "/api/capabilities"},
+        {.key = "auth", .value = s_bridge_auth ? "1" : "0"},
+    };
+    const size_t n = sizeof(txt) / sizeof(txt[0]);
+    if (add) {
+        esp_err_t err = mdns_service_add(hostname, BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO,
+                                         BRIDGE_HTTP_PORT, txt, n);
+        if (err == ESP_OK) {
+            err = mdns_service_subtype_add_for_host(NULL, BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO,
+                                                    NULL, BRIDGE_MDNS_SUBTYPE);
+        }
+        return err;
+    }
+    return mdns_service_txt_set(BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, txt, n);
+}
+
+/* _i2c-strand._tcp while the mux control bus is up (even with no groups
+   configured): product, api, mux, groups, duts, path, mac, caps.  Called
+   every discovery pass; touches mDNS only when something changed. */
+static void discovery_publish_strand(const char *hostname)
+{
+    const bool want = analog_mux_bus_ok();
+    strand_state_t now = { .advertised = want, .mux = "none" };
+    analog_mux_summary(&now.groups, &now.duts, &now.mux);
+    if (!want) {
+        if (s_strand.advertised && mdns_service_remove(STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO) == ESP_OK) {
+            ESP_LOGI(TAG, "%s.%s withdrawn: mux control bus down", STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO);
+            s_strand.advertised = false;
+        }
+        return;
+    }
+    if (s_strand.advertised && now.groups == s_strand.groups && now.duts == s_strand.duts &&
+        strcmp(now.mux, s_strand.mux) == 0) {
+        return;
+    }
+    char mac[18], groups[8], duts[8];
+    base_mac_str(mac, sizeof(mac));
+    snprintf(groups, sizeof(groups), "%d", now.groups);
+    snprintf(duts, sizeof(duts), "%d", now.duts);
+    mdns_txt_item_t txt[] = {
+        {.key = "product", .value = BRIDGE_PRODUCT},
+        {.key = "api", .value = STRAND_API_VERSION},
+        {.key = "mux", .value = now.mux},
+        {.key = "groups", .value = groups},
+        {.key = "duts", .value = duts},
+        {.key = "path", .value = "/api"},
+        {.key = "mac", .value = mac},
+        {.key = "caps", .value = "/api/capabilities"},
+    };
+    const size_t n = sizeof(txt) / sizeof(txt[0]);
+    const esp_err_t err = s_strand.advertised
+        ? mdns_service_txt_set(STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO, txt, n)
+        : mdns_service_add(hostname, STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO, BRIDGE_HTTP_PORT, txt, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s.%s: %s", STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO, esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "%s %s.%s port=%d: mux=%s groups=%d duts=%d", s_strand.advertised ? "Updated" : "Advertised",
+             STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO, BRIDGE_HTTP_PORT, now.mux, now.groups, now.duts);
+    s_strand = now;
+}
+
 static void discovery_task(void *arg)
 {
     (void)arg;
@@ -130,6 +247,8 @@ static void discovery_task(void *arg)
             }
         }
 
+        discovery_publish_strand(s_hostname);
+
         vTaskDelay(pdMS_TO_TICKS(USBIP_DISCOVERY_REFRESH_MS));
     }
 }
@@ -144,6 +263,7 @@ esp_err_t discovery_service_start(void)
 
     char hostname[DEVICE_NAME_MAX_LEN];
     device_naming_get_hostname(hostname, sizeof(hostname));
+    strlcpy(s_hostname, hostname, sizeof(s_hostname));
 
     char instance[DEVICE_NAME_MAX_LEN + 32];
     snprintf(instance, sizeof(instance), "%s (%s)", hostname, CONFIG_IDF_TARGET);
@@ -193,11 +313,26 @@ esp_err_t discovery_service_start(void)
     if (err != ESP_OK) {
         return err;
     }
+    err = mdns_service_subtype_add_for_host(NULL, USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO,
+                                            NULL, BRIDGE_MDNS_SUBTYPE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s subtype on %s: %s", BRIDGE_MDNS_SUBTYPE, USBIP_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+    }
 
     s_last_snapshot = initial;
 
     ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local",
              USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
+
+    err = discovery_publish_bridge(true, hostname);
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_started = true;
+    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d instance=%s api=%s product=%s (subtype %s here and on %s.%s)",
+             BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, BRIDGE_HTTP_PORT, hostname,
+             BRIDGE_API_VERSION, BRIDGE_PRODUCT, BRIDGE_MDNS_SUBTYPE, USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO);
+    discovery_publish_strand(hostname);
 
     if (xTaskCreate(discovery_task,
                     "usbip_discovery",
@@ -229,6 +364,17 @@ esp_err_t discovery_service_notify_config_changed(void)
         ESP_LOGW(TAG, "mdns_instance_name_set failed: %s", esp_err_to_name(err));
         /* Non-fatal; continue to update TXT records. */
     }
+    err = mdns_service_instance_name_set(BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, hostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s instance name: %s", BRIDGE_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+    }
+    if (s_strand.advertised) {
+        err = mdns_service_instance_name_set(STRAND_MDNS_SERVICE_TYPE, STRAND_MDNS_SERVICE_PROTO, hostname);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "%s instance name: %s", STRAND_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+        }
+    }
+    strlcpy(s_hostname, hostname, sizeof(s_hostname));
 
     /* Re-read board ID and force re-publish of TXT records. */
     device_naming_get_board_id(s_board_id, sizeof(s_board_id));
@@ -242,4 +388,18 @@ esp_err_t discovery_service_notify_config_changed(void)
     ESP_LOGI(TAG, "mDNS identity refreshed: host=%s.local, board_id=\"%s\"",
              hostname, s_board_id);
     return ESP_OK;
+}
+
+esp_err_t discovery_service_notify_auth_changed(void)
+{
+    if (!s_started || controller_api_auth_required() == s_bridge_auth) {
+        return ESP_OK;
+    }
+    esp_err_t err = discovery_publish_bridge(false, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s TXT: %s", BRIDGE_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "%s TXT republished: auth=%d", BRIDGE_MDNS_SERVICE_TYPE, s_bridge_auth);
+    }
+    return err;
 }

@@ -17,6 +17,8 @@
 #include "esp_err.h"
 
 #define BLOB_NAME_MAX   64
+/* Staged files together, at most (PSRAM permitting) */
+#define BLOB_TOTAL_MAX  (12u * 1024 * 1024)
 
 /* One PSRAM budget for staged files and serial capture buffers: a capture
    reserves its ring here so neither can starve the other.  reserve returns

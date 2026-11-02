@@ -65,6 +65,15 @@ void serial_link_close(serial_link_t *l);
 /* CP210x enable / CH34x setup (once per enumeration); call before line or
    data traffic.  Returns 0 or a negative errno. */
 int serial_link_prepare(serial_link_t *l);
+/* Start a new data session with both bulk toggles at DATA0 on both sides:
+   CLEAR_FEATURE(ENDPOINT_HALT) on the bulk IN and OUT endpoints.  Each
+   session releases its interfaces at close, so the next claim starts the
+   host's pipes at DATA0 while the device's toggles carry on; the first
+   packet each way can then look like a retransmission and be dropped.
+   Call it before the first bulk transfer of a link that owns the device
+   (not on one shared with a running capture: it would flush that capture's
+   IN).  Returns 0 or the first failing request's errno. */
+int serial_link_sync_toggles(serial_link_t *l);
 int serial_link_set_baud(serial_link_t *l, uint32_t baud);
 int serial_link_set_lines(serial_link_t *l, bool dtr, bool rts);
 /* The DTR/RTS last set by the bridge (false when never set). */

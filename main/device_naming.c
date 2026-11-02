@@ -1,10 +1,12 @@
 #include "device_naming.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "esp_chip_info.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs.h"
@@ -58,19 +60,86 @@ static void device_name_key(const char *busid, char *key_buf, size_t key_size)
     snprintf(key_buf, key_size, "name_%08x", (unsigned)h);
 }
 
-/* Build the default MAC-based hostname.  ESP_MAC_BASE is always 6 bytes;
- * esp_efuse_mac_get_default() returns an 8-byte EUI-64 on 802.15.4 chips
- * such as the ESP32-S31. */
+/* The chip in the default hostname: the IDF target without its "esp32"
+ * prefix ("s31", "s3", "p4"; plain "esp32" stays), plus "v<major revision>"
+ * on the ESP32-P4, whose v1 and v3 silicon differ.  Lower case, DNS-safe. */
+static void chip_token(char *buf, size_t buf_size)
+{
+    const char *t = CONFIG_IDF_TARGET;
+    if (strncmp(t, "esp32", 5) == 0 && t[5] != '\0') {
+        t += 5;
+    }
+    size_t n = 0;
+    for (; t[n] != '\0' && n + 1 < buf_size; n++) {
+        const char c = t[n];
+        buf[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a')
+               : ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) ? c : '-';
+    }
+    buf[n] = '\0';
+#if CONFIG_IDF_TARGET_ESP32P4
+    esp_chip_info_t info;
+    esp_chip_info(&info);           /* revision = major * 100 + minor */
+    snprintf(buf + n, buf_size - n, "v%u", (unsigned)(info.revision / 100));
+#endif
+}
+
+/* The hostname older firmware defaulted to ("usbip-" + the last three
+ * base-MAC bytes). */
+static bool legacy_default_hostname(char *buf, size_t buf_size)
+{
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_BASE) != ESP_OK) {
+        return false;
+    }
+    snprintf(buf, buf_size, "usbip-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    return true;
+}
+
+/* The default hostname: "usbip-<chip>-<last three base-MAC bytes>", e.g.
+ * usbip-s31-d19bee or usbip-p4v3-0a1b2c (well under the 63-character DNS
+ * label limit).  ESP_MAC_BASE is always 6 bytes; esp_efuse_mac_get_default()
+ * returns an 8-byte EUI-64 on 802.15.4 chips such as the ESP32-S31. */
 static void default_hostname(char *buf, size_t buf_size)
 {
     uint8_t mac[6] = {0};
-    esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
-    if (err != ESP_OK) {
-        /* Fallback: "usbip-000000" */
-        strlcpy(buf, "usbip-000000", buf_size);
+    if (esp_read_mac(mac, ESP_MAC_BASE) != ESP_OK) {
+        strlcpy(buf, "usbip-000000", buf_size);     /* the old format's fallback */
         return;
     }
-    snprintf(buf, buf_size, "usbip-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    char chip[24];
+    chip_token(chip, sizeof(chip));
+    char name[64];
+    snprintf(name, sizeof(name), "usbip-%s-%02x%02x%02x", chip, mac[3], mac[4], mac[5]);
+    strlcpy(buf, name, buf_size);
+}
+
+/* A stored hostname equal to the old default was never chosen by anyone
+ * (it was saved back from an older firmware's default): clear it, once, so
+ * the new default applies.  Returns true when stored is that old default. */
+static bool migrate_legacy_hostname(const char *stored)
+{
+    char legacy[DEVICE_NAME_MAX_LEN];
+    if (!legacy_default_hostname(legacy, sizeof(legacy)) || strcmp(stored, legacy) != 0) {
+        return false;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_rw(&h);
+    if (err == ESP_OK) {
+        err = nvs_erase_key(h, DEVICE_NVS_KEY_HOSTNAME);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    char now[DEVICE_NAME_MAX_LEN];
+    default_hostname(now, sizeof(now));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Stored hostname \"%s\" was the old default: cleared, now \"%s\"", stored, now);
+    } else {
+        ESP_LOGW(TAG, "Stored hostname \"%s\" is the old default; clearing it failed (%s), using \"%s\"",
+                 stored, esp_err_to_name(err), now);
+    }
+    return true;
 }
 
 /* ─────────────────────────────────────────────
@@ -95,7 +164,7 @@ esp_err_t device_naming_get_hostname(char *buf, size_t buf_size)
     err = nvs_get_str(h, DEVICE_NVS_KEY_HOSTNAME, buf, &len);
     nvs_close(h);
 
-    if (err == ESP_OK && strlen(buf) > 0) {
+    if (err == ESP_OK && strlen(buf) > 0 && !migrate_legacy_hostname(buf)) {
         ESP_LOGI(TAG, "Using stored hostname: \"%s\"", buf);
         return ESP_OK;
     }

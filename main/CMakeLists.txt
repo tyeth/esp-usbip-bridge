@@ -58,10 +58,20 @@ if(CONFIG_USBIP_VIRTUAL_HARNESS)
     )
 endif()
 
-if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32s31")
+if(IDF_TARGET STREQUAL "esp32p4")
     list(APPEND req_components esp_eth)
+elseif(IDF_TARGET STREQUAL "esp32s31")
+    # Ethernet, and the optional Wi-Fi station next to it
+    list(APPEND req_components esp_eth esp_wifi esp_driver_uart)
 elseif(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND req_components esp_wifi esp_driver_gpio)
+endif()
+
+# Optional Wi-Fi station next to Ethernet (S31), with its serial console
+# commands (wifi set/status/clear, reboot).  The requirements above go by
+# target: sdkconfig values are not known yet when IDF expands them.
+if(CONFIG_USBIP_WIFI_STA)
+    list(APPEND srcs "wifi_sta.c" "serial_console.c")
 endif()
 
 # Always compiled; neopixel_init() becomes a no-op when gpio < 0.

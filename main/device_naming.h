@@ -33,8 +33,10 @@
  * @brief Get the friendly hostname for this bridge.
  *
  * Reads from NVS.  If no friendly name is stored, returns the default
- * MAC-based hostname (e.g. "usbip-XXXXXX") so the caller always gets
- * a valid hostname.
+ * hostname "usbip-<chip>-<last 3 MAC bytes>" (e.g. "usbip-s31-d19bee",
+ * "usbip-p4v3-0a1b2c") so the caller always gets a valid hostname.  A
+ * stored name equal to the old default ("usbip-<last 3 MAC bytes>") is
+ * cleared from NVS on first read and counts as unset.
  *
  * @param[out] buf       Buffer to write the hostname into.
  * @param[in]  buf_size  Size of the buffer (at least DEVICE_NAME_MAX_LEN).
