@@ -465,14 +465,29 @@ function netSet() {
   if (pass && (pass.length < 8 || pass.length > 63)) { alert('A WPA password is 8-63 characters (empty for an open network)'); return; }
   var st = document.getElementById('netprog');
   st.textContent = 'connecting ...';
-  api('PUT', '/api/network/wifi', { ssid: ssid, password: pass, store: document.getElementById('netstore').checked },
+  /* wait_ms 0: answer at once (202) and poll, rather than hold the bridge's
+     only request slot for up to 10 s while the station joins. */
+  api('PUT', '/api/network/wifi', { ssid: ssid, password: pass, store: document.getElementById('netstore').checked, wait_ms: 0 },
       function (ok, r, code) {
         document.getElementById('netpass').value = '';
         if (!ok) { st.textContent = (r && r.error) || ('HTTP ' + code); return; }
-        st.textContent = r.connected ? 'connected' + (r.stored ? ', stored' : '')
-                                     : 'still connecting (stored once it connects' + (r.stored ? '; stored already' : '') + ')';
         netShow(r.network);
-        if (!r.connected) setTimeout(netLoad, 5000);
+        if (r.connected) { st.textContent = 'connected' + (r.stored ? ', stored' : ''); return; }
+        var tries = 0;
+        var poll = function () {
+          api('GET', '/api/network', null, function (ok2, n) {
+            if (ok2) netShow(n);
+            var w = ok2 && n && n.interfaces ? n.interfaces.filter(function (i) { return i.name == 'wifi'; })[0] : null;
+            if (w && w.ip) { st.textContent = 'connected, ' + w.ip + (w.stored === false ? ' (not stored yet)' : ''); return; }
+            if (++tries >= 15) {
+              st.textContent = 'not connected after 20 s' + (w && w.state ? ': ' + w.state + (w.last_reason ? ' (' + w.last_reason + ')' : '') : '');
+              return;
+            }
+            st.textContent = 'connecting ... ' + tries;
+            setTimeout(poll, 1300);
+          });
+        };
+        setTimeout(poll, 1300);
       });
 }
 
@@ -485,17 +500,45 @@ function netClear() {
   });
 }
 
-/* JSON request helper: cb(ok, body) */
+/* The bridge serves one request at a time: while a long one runs (a console
+   peek holds it up to 12 s) every other request waits.  busyBegin/busyEnd
+   bracket such calls: the page says so, and the pollers pause instead of
+   piling up behind it and timing out. */
+var apiBusy = null;
+
+function busyShow() {
+  var b = document.getElementById('busy');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'busy';
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;padding:4px 8px;background:#5a4a00;color:#fff;' +
+                      'font-size:13px;z-index:9;display:none';
+    document.body.appendChild(b);
+  }
+  b.textContent = apiBusy ? 'Bridge busy: ' + apiBusy.what + ' (up to ' + apiBusy.max_s +
+                            ' s); other panels wait and refresh afterwards' : '';
+  b.style.display = apiBusy ? 'block' : 'none';
+}
+
+function busyBegin(what, max_s) { apiBusy = { what: what, max_s: max_s }; busyShow(); }
+function busyEnd() { apiBusy = null; busyShow(); }
+
+/* JSON request helper: cb(ok, body, status) */
 function api(method, path, body, cb) {
   var x = new XMLHttpRequest();
   x.open(method, path, true);
   x.setRequestHeader('Content-Type', 'application/json');
+  x.timeout = 30000;
   x.onload = function () {
     var r = null;
     try { r = JSON.parse(x.responseText); } catch (e) {}
     if (cb) cb(x.status >= 200 && x.status < 300, r, x.status);
   };
-  x.onerror = function () { if (cb) cb(false, { error: 'network error' }, 0); };
+  var gone = function (what) {
+    if (cb) cb(false, { error: what + (apiBusy ? ' (the bridge is busy: ' + apiBusy.what + ')' : '') }, 0);
+  };
+  x.onerror = function () { gone('network error'); };
+  x.ontimeout = function () { gone('no answer in 30 s'); };
   x.send(body === null || body === undefined ? null : JSON.stringify(body));
 }
 
@@ -747,14 +790,67 @@ function rescueDevList(sel) {
   });
 }
 
+/* Leaving a device: what this page started on it must not keep holding it.
+   The DUT flash session (it keeps the device in its bootloader and the one
+   job slot busy) is closed; job and capture polling stop.  Captures and other
+   jobs are left running on purpose and listed by rHolders() with their Stop /
+   Cancel buttons, which act on their own device. */
+function rescueLeave(prev) {
+  if (rDf.job && rDf.busid == prev) {
+    api('POST', '/api/usb/devices/' + encodeURIComponent(prev) + '/dutflash/close', {}, function () { rHolders(); });
+  }
+  rDf = { job: 0, next: 0, part: '', busid: '' };
+  clearTimeout(rJobTimer);
+  clearTimeout(rMonTimer);
+  rJobId = 0;
+  rMonBusid = '';
+}
+
 function rescueSel(busid) {
+  if ((busid || '') != rBusid && rBusid) rescueLeave(rBusid);
   rBusid = busid || '';
   try { history.replaceState(null, '', rBusid ? '#rescue=' + encodeURIComponent(rBusid) : '#'); } catch (e) {}
   rescueDevList(rBusid);
   rescueLoad();
 }
 
+/* Everything holding a device on this bridge (GET /api/rescue/holders), with
+   the requests that release it, whichever page or client started it. */
+var rHold = [];
+
+function rHolders() {
+  var el = document.getElementById('rholders');
+  if (!el) return;
+  api('GET', '/api/rescue/holders', null, function (ok, r) {
+    if (!ok || !r) return;
+    rHold = r.holders || [];
+    if (!rHold.length) { el.innerHTML = ''; return; }
+    var h = '<strong>Holding devices:</strong>';
+    rHold.forEach(function (x, i) {
+      h += '<br>' + esc(x.busid) + (x.busid == rBusid ? ' (this device)' : '') + ': ' + esc(x.what) +
+           (x.job ? ' job ' + esc(x.job) : '') + (x.state ? ', ' + esc(x.state) : '') + (x.stage ? ' - ' + esc(x.stage) : '') +
+           (x.elapsed_s !== undefined ? ', ' + esc(x.elapsed_s) + ' s of ' + esc(x.limit_s) + ' s max' : '') +
+           (x.armed ? ', armed' : '') + (x.peer ? ' by ' + esc(x.peer) : '') + (x.note ? ' <span class="muted">(' + esc(x.note) + ')</span>' : '');
+      (x.stop || []).forEach(function (s, k) {
+        h += ' <button onclick="rHoldStop(' + i + ',' + k + ')">' + esc(s.label) + '</button>';
+      });
+    });
+    el.innerHTML = h;
+  });
+}
+
+function rHoldStop(i, k) {
+  var x = rHold[i], s = x && x.stop && x.stop[k];
+  if (!s) return;
+  api(s.method, s.path, s.body === undefined ? null : s.body, function (ok, r) {
+    if (!ok) alert((r && r.error) || 'failed');
+    if (x.kind == 'job' && x.what == 'dut_flash' && rDf.busid == x.busid) rDf = { job: 0, next: 0, part: '', busid: '' };
+    setTimeout(function () { rHolders(); if (x.busid == rBusid) rescueLoad(); }, 600);
+  });
+}
+
 function rescueLoad() {
+  rHolders();
   var el = document.getElementById('rinfo');
   if (!rBusid) { el.innerHTML = 'Pick a device'; return; }
   api('GET', '/api/usb/devices/' + encodeURIComponent(rBusid) + '/rescue', null, function (ok, r) {
@@ -947,7 +1043,7 @@ function rescueRender() {
          'while the session is open.</span><br>platform <select id="rdfplat"><option>auto</option><option>esp</option>' +
          '<option>rp2</option><option>samd</option></select> keep open <input id="rdfkeep" class="txt" type="number" value="120" ' +
          'style="width:60px"> s <button class="act" onclick="rDfRun([])"' + dis + '>Map flash</button>' +
-         ' <button onclick="rDfClose()"' + dis + '>Close session</button> <span id="rdfst" class="muted"></span></p>' +
+         ' <button onclick="rDfClose()">Close session</button> <span id="rdfst" class="muted"></span></p>' +
          '<div id="rdfmap" class="sub"></div><div id="rdffs" class="sub"></div>';
   }
   if (r.mass_storage) {
@@ -962,6 +1058,20 @@ function rescueRender() {
   rEspRenderImgs();
   rFiles();
   rCapCfg();
+  /* A job already running on this device (started before a reload or from
+     another page): show it, with its Cancel button. */
+  if (r.job_running && !rJobId) {
+    api('GET', '/api/rescue/jobs', null, function (ok, l) {
+      if (!ok || !l || !l.running) return;
+      var job = (l.jobs || []).filter(function (x) { return x.id == l.running; })[0];
+      if (!job || job.busid != rBusid) return;
+      rJobId = job.id;
+      if (job.kind == 'dut_flash') rDf = { job: job.id, next: 0, part: '', busid: rBusid };
+      var b = document.getElementById('rjob');
+      if (b) b.style.display = 'block';
+      rJobPoll();
+    });
+  }
   if (r.monitor && rMonBusid != rBusid) {
     rMonBusid = rBusid;
     rMonNext = -1;
@@ -1045,6 +1155,7 @@ function rJob(action, body) {
 
 function rJobPoll() {
   clearTimeout(rJobTimer);
+  if (apiBusy) { rJobTimer = setTimeout(rJobPoll, 1000); return; }
   api('GET', '/api/rescue/jobs/' + rJobId, null, function (ok, j) {
     if (!ok || !j) return;
     var p = document.getElementById('rjobp'), s = document.getElementById('rjobs'), l = document.getElementById('rjobl');
@@ -1058,7 +1169,9 @@ function rJobPoll() {
     if (j.state == 'running' || j.state == 'queued') {
       rJobTimer = setTimeout(rJobPoll, 700);
     } else {
+      if (j.kind == 'dut_flash' && rDf.job == j.id) rDf = { job: 0, next: 0, part: '', busid: '' };
       rFiles();
+      rHolders();
       setTimeout(function () { rescueDevList(rBusid); }, 500);
     }
   });
@@ -1143,6 +1256,7 @@ function rMonSwitch() {
 function rMonPoll() {
   clearTimeout(rMonTimer);
   if (rMonBusid != rBusid || !document.getElementById('rmout')) return;
+  if (apiBusy) { rMonTimer = setTimeout(rMonPoll, 1000); return; }
   var port = rMonPort(), ts = document.getElementById('rmts').checked;
   var from = rMonNext < 0 ? 'from=epoch' : 'since=' + rMonNext;
   document.getElementById('rmdl').href = '/api/rescue/capture/' + encodeURIComponent(rBusid) + '/' + port + '.log';
@@ -1275,7 +1389,7 @@ function rMscGet(p) {
 }
 
 /* --- device flash: partitions and file systems through the bootloader ------ */
-var rDf = { job: 0, next: 0, part: '' };
+var rDf = { job: 0, next: 0, part: '', busid: '' };
 
 function rHex(n) { return '0x' + Number(n).toString(16); }
 
@@ -1288,6 +1402,7 @@ function rDfRun(ops, cb) {
   api('POST', rUrl('dutflash'), body, function (ok, r) {
     if (!ok) { if (st) st.textContent = (r && r.error) || 'failed'; return; }
     if (!r.added_to_open_session || r.job != rDf.job) { rDf.job = r.job; rDf.next = 0; }
+    rDf.busid = rBusid;
     var first = rDf.next;
     rDf.next += ops.length;
     rJobId = r.job;
@@ -1315,7 +1430,8 @@ function rDfRun(ops, cb) {
 }
 
 function rDfClose() {
-  api('POST', rUrl('dutflash/close'), {}, function (ok, r) {
+  var b = rDf.busid || rBusid;   /* the session's own device, not whichever is picked now */
+  api('POST', '/api/usb/devices/' + encodeURIComponent(b) + '/dutflash/close', {}, function (ok, r) {
     var st = document.getElementById('rdfst');
     if (st) st.textContent = ok ? 'closing (the device is reset)' : ((r && r.error) || 'failed');
   });
@@ -1502,7 +1618,9 @@ function rConsole() {
   if (t !== undefined) body.rts = t;
   var s = document.getElementById('rconst'), o = document.getElementById('rconout');
   s.textContent = 'capturing ...';
+  busyBegin('console peek on ' + rBusid, Math.ceil((body.pokes.length ? (body.pokes.length - 1) * body.settle_s : 0) + body.capture_s + 0.5));
   api('POST', rUrl('console'), body, function (ok, r) {
+    busyEnd();
     s.textContent = ok ? (r.bytes + ' bytes, ' + r.classification + (r.truncated ? ' (truncated)' : '') +
                           (r.warning ? ' - ' + r.warning : ''))
                        : ((r && r.error) || 'failed');
@@ -1529,6 +1647,19 @@ topoLoad();
   else rescueDevList('');
 })();
 setInterval(function () {
-  var u = document.getElementById('su'), hb = document.getElementById('sh');
+  if (apiBusy) return;                  /* the bridge is serving a long request */
+  var u = document.getElementById('su'), hb = document.getElementById('sh'), rs = document.getElementById('sr');
   if ((u && u.className.indexOf('on') >= 0) || (hb && hb.className.indexOf('on') >= 0)) refreshUsb();
+  if (rs && rs.className.indexOf('on') >= 0) rHolders();
 }, 3000);
+/* Leaving the page: close the DUT flash session it opened (the device would
+   otherwise stay in its bootloader, holding the job slot, until it idles out). */
+window.addEventListener && window.addEventListener('pagehide', function () {
+  if (!rDf.job || !rDf.busid || typeof fetch !== 'function') return;
+  try {
+    var hd = { 'Content-Type': 'application/json' }, t = tokGet();
+    if (t) hd.Authorization = 'Bearer ' + t;
+    fetch('/api/usb/devices/' + encodeURIComponent(rDf.busid) + '/dutflash/close',
+          { method: 'POST', keepalive: true, headers: hd, body: '{}' });
+  } catch (e) {}
+});

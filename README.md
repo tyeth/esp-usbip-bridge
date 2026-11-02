@@ -397,7 +397,11 @@ Notes:
   pass `"dtr": true`. It never uses 1200 baud.
 - **The HTTP server handles one request at a time**, so a console peek blocks
   the bridge API (not USB/IP) for up to 12 s: `capture_s` ≤ 10 and pokes ×
-  `settle_s` + `capture_s` ≤ 12. Resets wait at most 10 s.
+  `settle_s` + `capture_s` ≤ 12. Resets wait at most 10 s. Up to 10
+  connections wait in the listen backlog meanwhile; the web UI shows a "bridge
+  busy" bar and pauses its pollers during a peek, and joins Wi-Fi with
+  `wait_ms: 0` (then polls `GET /api/network`) rather than hold the server for
+  up to 10 s.
 - After a peek the claimed data interface is released again, so its host
   channels go back to USB/IP. A read that fails because no host channel was free
   says so (see `/api/usb/claims`).
@@ -434,6 +438,18 @@ and other rescue actions are refused until it ends. Every job takes
 `"capture_after": {capture start args}` to start a serial capture when it lets
 go of the device; the ESP flasher then defers its final hard reset until the
 capture is reading, so the freshly flashed board's first boot is recorded.
+No job runs longer than 1800 s (`limit_s` in the job): past that it is
+cancelled and fails "timed out".
+
+**Releasing a device from anywhere.** `GET /api/rescue/holders` lists what
+holds a device now (the running job, running captures, USB/IP imports), each
+with the request(s) that let go of it (`stop: [{label, method, path, body}]`),
+and `POST /api/usb/devices/{busid}/release` (`{"disarm": bool?}`) closes the
+device's DUT flash session, cancels its job and stops its capture in one go,
+whichever page or client started them. The web UI shows the holders above the
+Device Rescue panel with those buttons, closes the DUT flash session of the
+device it leaves when another device is picked (and on page unload), and shows
+a job already running on the device it opens.
 
 | Method | Path (under `/api/usb/devices/{busid}/`) | |
 |---|---|---|

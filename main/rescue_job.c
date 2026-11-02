@@ -34,6 +34,7 @@ struct rescue_job {
     volatile job_state_t state;
     volatile int progress;
     volatile bool cancel;
+    volatile bool timed_out;    /* cancelled by the RESCUE_JOB_MAX_S limit */
     char stage[64];
     char *log;                  /* PSRAM, JOB_LOG_MAX; oldest lines dropped */
     size_t log_len;
@@ -192,6 +193,13 @@ uint32_t rescue_job_id(const rescue_job_t *job)
 
 bool rescue_job_cancelled(const rescue_job_t *job)
 {
+    if (!job->cancel && esp_timer_get_time() - job->started_us > (int64_t)RESCUE_JOB_MAX_S * 1000000) {
+        /* Nothing may hold a device forever: past the limit the job is
+           cancelled as by DELETE, at its next check. */
+        rescue_job_t *j = (rescue_job_t *)job;
+        j->timed_out = true;
+        j->cancel = true;
+    }
     return job->cancel;
 }
 
@@ -204,7 +212,9 @@ static void job_task(void *arg)
     unlock();
     rescue_job_log(job, "%s on %s", job->kind, job->busid);
     const int rc = job->fn(job, job->busid, job->args);
-    if (rc == 0 && job->cancel) {
+    if (job->timed_out) {
+        rescue_job_fail(job, "timed out: jobs are stopped after %d s", RESCUE_JOB_MAX_S);
+    } else if (rc == 0 && job->cancel) {
         rescue_job_fail(job, "cancelled");
     }
     busid_owner_end(job->busid, BUSID_OWNER_RESCUE);
@@ -343,6 +353,7 @@ static cJSON *job_json_locked(const rescue_job_t *j, bool with_log)
     cJSON_AddStringToObject(o, "stage", j->stage);
     const int64_t end = j->finished_us ? j->finished_us : esp_timer_get_time();
     cJSON_AddNumberToObject(o, "elapsed_s", (double)((end - j->started_us) / 100000) / 10.0);
+    cJSON_AddNumberToObject(o, "limit_s", RESCUE_JOB_MAX_S);
     if (j->error[0]) {
         cJSON_AddStringToObject(o, "error", j->error);
     } else {
@@ -405,6 +416,15 @@ bool rescue_job_cancel(uint32_t id)
     }
     unlock();
     return ok;
+}
+
+uint32_t rescue_job_running_on(const char *busid)
+{
+    lock();
+    const uint32_t id = (s_running != NULL && (busid == NULL || strcmp(s_running->busid, busid) == 0))
+                        ? s_running->id : 0;
+    unlock();
+    return id;
 }
 
 bool rescue_job_busy(const char *busid)

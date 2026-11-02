@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1418,6 +1419,8 @@ static const struct {
     { "dut_flash", dut_flash_job, "dut_fs" },
 };
 
+static api_result_t core_device_release(const char *busid, const cJSON *json);
+
 /* /api/usb/devices/{busid}/<rest> beyond the basic rescue actions. */
 static api_result_t core_device_tools(const char *method, const char *busid, const char *rest,
                                       const char *query, const cJSON *json)
@@ -1452,6 +1455,9 @@ static api_result_t core_device_tools(const char *method, const char *busid, con
     }
     if (post && strcmp(rest, "/msc/read") == 0) {
         return core_rescue_job("msc_read", busid, json, msc_read_job);
+    }
+    if (post && strcmp(rest, "/release") == 0) {
+        return core_device_release(busid, json);
     }
     if (post && strcmp(rest, "/dutflash") == 0) {
         st = dut_flash_request(busid, json, &j);
@@ -1558,6 +1564,153 @@ static api_result_t core_rescue_jobs(const char *method, const char *id_str)
     }
     cJSON *j = rescue_job_json(id);
     return j ? result(200, j) : fail(404, "no such job");
+}
+
+static void add_stop(cJSON *o, const char *label, const char *method, const char *path, const char *body)
+{
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "label", label);
+    cJSON_AddStringToObject(a, "method", method);
+    cJSON_AddStringToObject(a, "path", path);
+    if (body != NULL) {
+        cJSON_AddItemToObject(a, "body", cJSON_Parse(body));
+    }
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(o, "stop");
+    if (arr == NULL) {
+        arr = cJSON_AddArrayToObject(o, "stop");
+    }
+    cJSON_AddItemToArray(arr, a);
+}
+
+/* GET /api/rescue/holders: everything that holds a device now (the running
+   job, running captures, USB/IP imports), each with the request(s) that
+   release it, so a page or client other than the one that started it can
+   let go of the device. */
+static api_result_t core_rescue_holders(void)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON *hs = cJSON_AddArrayToObject(j, "holders");
+    char path[96];
+
+    const uint32_t job_id = rescue_job_running_on(NULL);
+    cJSON *job = job_id ? rescue_job_json(job_id) : NULL;
+    if (job != NULL) {
+        const cJSON *b = cJSON_GetObjectItemCaseSensitive(job, "busid");
+        const cJSON *k = cJSON_GetObjectItemCaseSensitive(job, "kind");
+        const char *busid = cJSON_IsString(b) ? b->valuestring : "";
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "busid", busid);
+        cJSON_AddStringToObject(o, "kind", "job");
+        cJSON_AddNumberToObject(o, "job", job_id);
+        cJSON_AddStringToObject(o, "what", cJSON_IsString(k) ? k->valuestring : "?");
+        static const char *const copy[] = { "state", "stage", "elapsed_s", "limit_s" };
+        for (size_t i = 0; i < sizeof(copy) / sizeof(copy[0]); i++) {
+            const cJSON *v = cJSON_GetObjectItemCaseSensitive(job, copy[i]);
+            if (v != NULL) {
+                cJSON_AddItemToObject(o, copy[i], cJSON_Duplicate(v, true));
+            }
+        }
+        if (cJSON_IsString(k) && strcmp(k->valuestring, "dut_flash") == 0) {
+            snprintf(path, sizeof(path), "/api/usb/devices/%s/dutflash/close", busid);
+            add_stop(o, "Close session", "POST", path, "{}");
+        }
+        snprintf(path, sizeof(path), "/api/rescue/jobs/%" PRIu32, job_id);
+        add_stop(o, "Cancel job", "DELETE", path, NULL);
+        cJSON_AddItemToArray(hs, o);
+        cJSON_Delete(job);
+    }
+
+    cJSON *caps = capture_status_json();
+    const cJSON *armed = cJSON_GetObjectItemCaseSensitive(caps, "armed");
+    const cJSON *c;
+    cJSON_ArrayForEach(c, cJSON_GetObjectItemCaseSensitive(caps, "captures")) {
+        if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(c, "running"))) {
+            continue;
+        }
+        const cJSON *b = cJSON_GetObjectItemCaseSensitive(c, "busid");
+        if (!cJSON_IsString(b)) {
+            continue;
+        }
+        bool is_armed = false;
+        const cJSON *a;
+        cJSON_ArrayForEach(a, armed) {
+            const cJSON *ab = cJSON_GetObjectItemCaseSensitive(a, "busid");
+            is_armed |= cJSON_IsString(ab) && strcmp(ab->valuestring, b->valuestring) == 0;
+        }
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "busid", b->valuestring);
+        cJSON_AddStringToObject(o, "kind", "capture");
+        cJSON_AddStringToObject(o, "what", "serial capture");
+        const cJSON *s = cJSON_GetObjectItemCaseSensitive(c, "state");
+        cJSON_AddStringToObject(o, "state", cJSON_IsString(s) ? s->valuestring : "running");
+        cJSON_AddBoolToObject(o, "armed", is_armed);
+        snprintf(path, sizeof(path), "/api/usb/devices/%s/capture/stop", b->valuestring);
+        add_stop(o, "Stop", "POST", path, "{}");
+        if (is_armed) {
+            add_stop(o, "Stop & disarm", "POST", path, "{\"disarm\":true}");
+        }
+        cJSON_AddItemToArray(hs, o);
+    }
+    cJSON_Delete(caps);
+
+    usbip_backend_device_t *devs = calloc(CONFIG_USBIP_MAX_DEVICES, sizeof(*devs));
+    const size_t n = devs ? usb_backend_get_devices(devs, CONFIG_USBIP_MAX_DEVICES) : 0;
+    for (size_t i = 0; i < n; i++) {
+        busid_owner_info_t ow;
+        if (!busid_owner_get(devs[i].busid, &ow) || ow.kind != BUSID_OWNER_USBIP) {
+            continue;
+        }
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "busid", devs[i].busid);
+        cJSON_AddStringToObject(o, "kind", "usbip");
+        cJSON_AddStringToObject(o, "what", "imported over USB/IP");
+        cJSON_AddStringToObject(o, "peer", ow.peer);
+        cJSON_AddNumberToObject(o, "for_s", (double)((esp_timer_get_time() - ow.since_us) / 1000000));
+        cJSON_AddStringToObject(o, "note", "released by usbip detach on the client");
+        cJSON_AddItemToArray(hs, o);
+    }
+    free(devs);
+    cJSON_AddNumberToObject(j, "job_limit_s", RESCUE_JOB_MAX_S);
+    return result(200, j);
+}
+
+/* POST /api/usb/devices/{busid}/release: let go of the device whatever holds
+   it here: close its DUT flash session, cancel its job, stop its capture
+   ({"disarm": true} also disarms).  USB/IP imports are the client's. */
+static api_result_t core_device_release(const char *busid, const cJSON *json)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON *done = cJSON_AddArrayToObject(j, "released");
+    cJSON *tmp = NULL;
+    int st = dut_flash_close(busid, &tmp);
+    if (st == 200) {
+        cJSON_AddItemToArray(done, cJSON_CreateString("dut_flash session"));
+    }
+    cJSON_Delete(tmp);
+    const uint32_t id = rescue_job_running_on(busid);
+    if (id != 0 && rescue_job_cancel(id)) {
+        char s[32];
+        snprintf(s, sizeof(s), "job %" PRIu32, id);
+        cJSON_AddItemToArray(done, cJSON_CreateString(s));
+    }
+    if (capture_active(busid) || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "disarm"))) {
+        tmp = NULL;
+        cJSON *args = cJSON_CreateObject();
+        cJSON_AddBoolToObject(args, "disarm", cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "disarm")));
+        if (capture_stop(busid, args, &tmp) == 200) {
+            cJSON_AddItemToArray(done, cJSON_CreateString("capture"));
+        }
+        cJSON_Delete(args);
+        cJSON_Delete(tmp);
+    }
+    busid_owner_info_t ow;
+    if (busid_owner_get(busid, &ow) && ow.kind == BUSID_OWNER_USBIP) {
+        cJSON_AddStringToObject(j, "still_held", "imported over USB/IP: usbip detach on the client");
+    }
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddStringToObject(j, "busid", busid);
+    cJSON_AddStringToObject(j, "note", "a cancelled job stops at its next block; GET /api/rescue/holders to confirm");
+    return result(200, j);
 }
 
 static api_result_t core_mux_status(void)
@@ -1754,6 +1907,8 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/rescue/jobs",                   false, "Recent rescue jobs (one runs at a time)", NULL },
     { "GET",  "/api/rescue/jobs/{id}",              false, "A job's state, progress, stage, log, result and error ({id} = latest for the newest)", NULL },
     { "DELETE", "/api/rescue/jobs/{id}",            true,  "Cancel the running job", NULL },
+    { "GET",  "/api/rescue/holders",                false, "What holds a device now (the running job, running captures, USB/IP imports), each with the request(s) that release it: {holders:[{busid, kind: job|capture|usbip, what, state, stop:[{label, method, path, body?}]}], job_limit_s}", NULL },
+    { "POST", "/api/usb/devices/{busid}/release",   true,  "Let go of a device whatever started it: close its DUT flash session, cancel its job, stop its capture (disarm: also disarm). USB/IP imports are the client's to detach", "{\"disarm\":bool?}" },
     { "POST", "/api/devices/{busid}/name",          true,  "Set a friendly name for the device on a port", "{\"name\":str}" },
     { "GET",  "/api/usb/hubs",                      false, "Hubs with power switching mode and per-port status", NULL },
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
@@ -2582,6 +2737,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_rescue_files(method, seg);
     } else if (path_is(path, "/api/capture") || strncmp(path, "/api/capture/", 13) == 0) {
         r = core_capture(method, path, json);
+    } else if (path_is(path, "/api/rescue/holders") && is_method(method, "GET")) {
+        r = core_rescue_holders();
     } else if (path_is(path, "/api/rescue/jobs") || strncmp(path, "/api/rescue/jobs/", 17) == 0) {
         if (path[16] == '/') {
             take_segment(path + 17, seg, sizeof(seg));

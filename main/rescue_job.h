@@ -38,7 +38,12 @@ cJSON *rescue_job_result(rescue_job_t *job);
 void rescue_job_result_set(rescue_job_t *job, const char *key, cJSON *item);
 void rescue_job_result_append(rescue_job_t *job, const char *key, cJSON *item, int keep);
 uint32_t rescue_job_id(const rescue_job_t *job);
-/* Set by DELETE /api/rescue/jobs/{id}: long loops should check and stop. */
+/* No job holds a device longer than this: rescue_job_cancelled() turns true
+   after it and the job fails "timed out".  The longest legitimate job is a
+   DUT flash session kept open for 900 s idle plus its operations. */
+#define RESCUE_JOB_MAX_S 1800
+/* Set by DELETE /api/rescue/jobs/{id} (or the time limit): long loops
+   should check and stop. */
 bool rescue_job_cancelled(const rescue_job_t *job);
 
 /* {id, kind, busid, state, progress, stage, log, result, error, ...};
@@ -46,6 +51,8 @@ bool rescue_job_cancelled(const rescue_job_t *job);
 cJSON *rescue_job_json(uint32_t id);
 cJSON *rescue_job_list_json(void);
 bool rescue_job_cancel(uint32_t id);
+/* The running job's id when it is on busid (any busid when NULL), else 0. */
+uint32_t rescue_job_running_on(const char *busid);
 /* Whether a job is running on busid (rescue actions are then refused). */
 bool rescue_job_busy(const char *busid);
 
