@@ -384,8 +384,122 @@ static void test_console(void)
     CHECK(strcmp(rescue_classify_transcript("hello"), "other") == 0);
 }
 
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void test_picoboot_uf2(void)
+{
+    uint8_t cmd[32];
+    rescue_picoboot_range_cmd(RESCUE_PC_WRITE, 7, 0x10001000, 4096, 4096, cmd);
+    const uint8_t want[32] = {
+        0x0b, 0xd1, 0x1f, 0x43, 7, 0, 0, 0, 0x05, 8, 0, 0, 0x00, 0x10, 0, 0,
+        0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    CHECK(memcmp(cmd, want, 32) == 0);
+    const uint8_t excl = 1;
+    rescue_picoboot_cmd(RESCUE_PC_EXCLUSIVE_ACCESS, 1, &excl, 1, 0, cmd);
+    CHECK_EQ(cmd[8], 0x01);
+    CHECK_EQ(cmd[9], 1);
+    CHECK_EQ(cmd[16], 1);
+    CHECK(strcmp(rescue_picoboot_status_name(4), "INVALID_ADDRESS") == 0);
+
+    /* Two UF2 blocks, the second for another family */
+    uint8_t uf2[1024];
+    memset(uf2, 0, sizeof(uf2));
+    for (int i = 0; i < 2; i++) {
+        uint8_t *b = uf2 + i * 512;
+        put32(b, 0x0A324655);
+        put32(b + 4, 0x9E5D5157);
+        put32(b + 8, RESCUE_UF2_FLAG_FAMILY);
+        put32(b + 12, 0x10000000 + i * 256);
+        put32(b + 16, 256);
+        put32(b + 20, (uint32_t)i);
+        put32(b + 24, 2);
+        put32(b + 28, 0xe48bff56);
+        b[32] = (uint8_t)(0xA0 + i);
+        put32(b + 508, 0x0AB16F30);
+    }
+    rescue_uf2_block_t blk;
+    CHECK(rescue_uf2_block(uf2, sizeof(uf2), 1, &blk));
+    CHECK_EQ(blk.target_addr, 0x10000100);
+    CHECK_EQ(blk.payload_size, 256);
+    CHECK_EQ(blk.family_id, 0xe48bff56);
+    CHECK_EQ(blk.data[0], 0xA1);
+    CHECK(!rescue_uf2_block(uf2, sizeof(uf2), 2, &blk));         /* past the end */
+    uf2[508] = 0;
+    CHECK(!rescue_uf2_block(uf2, sizeof(uf2), 0, &blk));         /* bad end magic */
+    CHECK(strcmp(rescue_uf2_family_name(0xe48bff59), "rp2350-arm-s") == 0);
+    CHECK(strcmp(rescue_uf2_family_name(0x68ed2b88), "samd21") == 0);
+    CHECK(rescue_uf2_family_name(0x12345678) == NULL);
+    CHECK(rescue_uf2_family_fits_rp(0xe48bff56, RESCUE_CHIP_RP2040));
+    CHECK(!rescue_uf2_family_fits_rp(0xe48bff56, RESCUE_CHIP_RP2350));
+    CHECK(rescue_uf2_family_fits_rp(0xe48bff5a, RESCUE_CHIP_RP2350));
+    CHECK(rescue_uf2_family_fits_rp(0xe48bff57, RESCUE_CHIP_RP2040));
+    CHECK(!rescue_uf2_family_fits_rp(0x68ed2b88, RESCUE_CHIP_RP2040));
+}
+
+static void test_msc(void)
+{
+    const uint8_t cdb[10] = { 0x28, 0, 0, 0, 0, 0x10, 0, 0, 8, 0 };   /* READ(10) LBA 16, 8 blocks */
+    uint8_t cbw[31];
+    rescue_msc_cbw(0x11223344, 4096, true, 0, cdb, 10, cbw);
+    const uint8_t want[31] = {
+        0x55, 0x53, 0x42, 0x43, 0x44, 0x33, 0x22, 0x11, 0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 10,
+        0x28, 0, 0, 0, 0, 0x10, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
+    };
+    CHECK(memcmp(cbw, want, 31) == 0);
+    uint8_t rw[10];
+    rescue_scsi_rw10(0x28, 0x10, 8, rw);
+    CHECK(memcmp(rw, cdb, 10) == 0);
+    rescue_scsi_rw10(0x2A, 0x01020304, 0x0506, rw);
+    CHECK(rw[0] == 0x2A && rw[2] == 1 && rw[3] == 2 && rw[4] == 3 && rw[5] == 4 && rw[7] == 5 && rw[8] == 6);
+    const uint8_t csw[13] = { 0x55, 0x53, 0x42, 0x53, 0x44, 0x33, 0x22, 0x11, 4, 0, 0, 0, 1 };
+    uint32_t residue = 0;
+    uint8_t status = 0;
+    CHECK(rescue_msc_csw(csw, 13, 0x11223344, &residue, &status));
+    CHECK_EQ(residue, 4);
+    CHECK_EQ(status, 1);
+    CHECK(!rescue_msc_csw(csw, 13, 0x11223345, &residue, &status));    /* wrong tag */
+    CHECK(!rescue_msc_csw(csw, 12, 0x11223344, &residue, &status));
+    const uint8_t cap[8] = { 0x00, 0x00, 0x3F, 0xFF, 0x00, 0x00, 0x02, 0x00 };   /* 16384 blocks of 512 */
+    uint32_t blocks = 0, bs = 0;
+    rescue_scsi_capacity(cap, &blocks, &bs);
+    CHECK_EQ(blocks, 16384);
+    CHECK_EQ(bs, 512);
+}
+
+static void test_samba(void)
+{
+    CHECK_EQ(rescue_crc16_xmodem((const uint8_t *)"123456789", 9, 0), 0x31C3);   /* CRC-16/XMODEM check value */
+    uint32_t page = 0;
+    CHECK_EQ(rescue_samba_flash_size(0x00031000, &page), 262144);               /* SAMD21x18: 4096 pages of 64 */
+    CHECK_EQ(page, 64);
+    CHECK_EQ(rescue_samba_flash_size(0x00060400, &page), 524288);               /* SAMD51x19: 1024 pages of 512 */
+    CHECK_EQ(page, 512);
+    rescue_samba_chip_t c;
+    rescue_samba_chip(0x410CC601, 0x1001000A, 262144, &c);
+    CHECK(c.family && strcmp(c.family, "SAMD21") == 0);
+    CHECK_EQ(c.app_offset, 0x2000);
+    CHECK_EQ(c.user_ram, 0x20004000);
+    rescue_samba_chip(0x410CC601, 0x1001000A, 65536, &c);
+    CHECK_EQ(c.user_ram, 0x20001000);
+    rescue_samba_chip(0x410FC241, 0x60060006, 524288, &c);
+    CHECK(c.family && strcmp(c.family, "SAMD51") == 0);
+    CHECK_EQ(c.app_offset, 0x4000);
+    rescue_samba_chip(0x410FC241, 0x00000000, 0, &c);
+    CHECK(c.family == NULL);
+}
+
 int main(void)
 {
+    test_picoboot_uf2();
+    test_msc();
+    test_samba();
     test_esp_usb_jtag();
     test_pico_sdk_cdc_reset();
     test_rp_bootsel();

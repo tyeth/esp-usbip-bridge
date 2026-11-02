@@ -753,7 +753,322 @@ function rescueRender() {
          ' TinyUSB CDC sends nothing until DTR is on. The bridge API is blocked while it captures.</span></p>' +
          '<pre id="rconout" class="con" style="display:none"></pre>';
   }
+
+  if (r.console) {
+    h += '<h2>Serial monitor</h2><p class="sub">Baud <input id="rmbaud" class="txt" type="number" value="115200" style="width:90px">' +
+         ' DTR ' + rTriSel('rmdtr') + ' RTS ' + rTriSel('rmrts') +
+         ' <button onclick="rMonStart()"' + dis + '>Start</button> <button onclick="rMonStop()">Stop</button>' +
+         ' <span id="rmst" class="muted">' + (r.monitor ? 'running' : 'stopped') + '</span><br>' +
+         '<span class="muted">Keeps reading in the background and follows the device through resets (the reset buttons above' +
+         ' work while it runs). USB/IP imports are refused while it runs.</span></p>' +
+         '<pre id="rmout" class="con" style="height:260px"></pre>' +
+         '<p class="sub"><input id="rmin" class="txt" size="40" onkeydown="if(event.key==\'Enter\')rMonSend()">' +
+         ' <label><input type="checkbox" id="rmnl" checked> + CR LF</label> <button onclick="rMonSend()">Send</button>' +
+         ' <button onclick="rMonSendRaw(\'03\')">Ctrl-C</button> <button onclick="rMonSendRaw(\'04\')">Ctrl-D</button>' +
+         ' <button onclick="document.getElementById(\'rmout\').textContent=\'\'">Clear</button></p>';
+  }
+
+  h += '<h2>Flash</h2><p class="sub">Stage the firmware below first (kept in the bridge\'s PSRAM until reboot).' +
+       ' Each flash runs as a background job; the bridge API stays responsive.</p>' +
+       '<div id="rjob" class="sub" style="display:none"><progress id="rjobp" max="100" value="0" style="width:200px"></progress>' +
+       ' <span id="rjobs"></span> <button onclick="rJobCancel()">Cancel</button><pre id="rjobl" class="con"></pre></div>';
+  if (r.serial && r.serial.kind != 'none') {
+    h += '<p class="sub"><strong>ESP (esptool write-flash)</strong> <span class="muted">through ' + esc(r.serial.kind) +
+         (r.serial.esp_usb_jtag ? ' USB-Serial/JTAG' : '') + '</span><br><span id="respimgs"></span>' +
+         '<button onclick="rEspAddImg()">+ image</button> before <select id="respbefore"><option>default_reset</option>' +
+         '<option>usb_reset</option><option>no_reset</option></select> after <select id="respafter"><option>hard_reset</option>' +
+         '<option>no_reset</option></select> baud <input id="respbaud" class="txt" type="number" value="460800" style="width:80px">' +
+         ' <label><input type="checkbox" id="resperase"> erase all</label> <label><input type="checkbox" id="respverify" checked> verify</label>' +
+         ' <button class="act" onclick="rEspFlash()"' + dis + '>Flash ESP</button> <button onclick="rJob(\'esp/info\',{})"' + dis + '>Chip info</button></p>';
+    h += '<p class="sub"><strong>SAM-BA (bossac)</strong> <span class="muted">SAMD21/SAMD51 .bin; offset blank = after the bootloader</span><br>' +
+         rFileSel('rsbfile') + ' offset <input id="rsboff" class="txt" size="8" placeholder="auto">' +
+         ' <label><input type="checkbox" id="rsbverify" checked> verify</label>' +
+         ' <button class="act" onclick="rJob(\'flash/samba\',{file:rVal(\'rsbfile\'),offset:rVal(\'rsboff\')||undefined,' +
+         'verify:document.getElementById(\'rsbverify\').checked})"' + dis + '>Flash SAM-BA</button>' +
+         ' <button onclick="rJob(\'samba/info\',{})"' + dis + '>Bootloader info</button></p>';
+  }
+  if (r.rp && (r.rp.reset_interface >= 0 || r.rp.picoboot_interface >= 0 || r.vid == '2e8a' || r.console)) {
+    h += '<p class="sub"><strong>RP2040/RP2350 (picotool load)</strong> <span class="muted">UF2, or .bin at an address; enters BOOTSEL first</span><br>' +
+         rFileSel('rpbfile') + ' address (.bin) <input id="rpbaddr" class="txt" size="10" placeholder="0x10000000">' +
+         ' <label><input type="checkbox" id="rpbverify" checked> verify</label>' +
+         ' <button class="act" onclick="rJob(\'flash/picoboot\',{file:rVal(\'rpbfile\'),address:rVal(\'rpbaddr\')||undefined,' +
+         'verify:document.getElementById(\'rpbverify\').checked})"' + dis + '>Load</button>' +
+         ' <button onclick="rJob(\'picoboot/info\',{})"' + dis + '>BOOTSEL info</button></p>';
+  }
+  h += '<p class="sub"><strong>UF2 drive</strong> <span class="muted">copy to the UF2 bootloader drive (enters the bootloader first if needed)</span><br>' +
+       rFileSel('ruf2file') + ' <button class="act" onclick="rJob(\'flash/uf2\',{file:rVal(\'ruf2file\')})"' + dis + '>Copy UF2</button></p>';
+
+  h += '<h2>Staged files</h2><p class="sub"><input type="file" id="rupfile"> as <input id="rupname" class="txt" size="20" placeholder="name">' +
+       ' <button onclick="rUpload()">Upload</button> <span id="rupst" class="muted"></span></p><div id="rfiles" class="sub"></div>';
+
+  if (r.mass_storage) {
+    h += '<h2>Mass storage</h2><p class="sub">Path <input id="rmscpath" class="txt" size="30" value="/">' +
+         ' <button onclick="rMscList()"' + dis + '>List</button> <button onclick="rMscUp()">Up</button>' +
+         ' <button onclick="rMscMkdir()"' + dis + '>New folder</button> <span id="rmscst" class="muted"></span><br>' +
+         'Upload ' + rFileSel('rmscfile') + ' <button onclick="rMscPut()"' + dis + '>to this folder</button>' +
+         ' <span class="muted">(or pick a local file in Staged files first)</span></p><div id="rmsc"></div>';
+  }
   el.innerHTML = h;
+  rEspImgs = rEspImgs.length ? rEspImgs : [{ file: '', offset: '0x0' }];
+  rEspRenderImgs();
+  rFiles();
+  if (r.monitor && rMonBusid != rBusid) {
+    rMonBusid = rBusid;
+    rMonNext = 0;
+    rMonPoll();
+  }
+}
+
+/* --- staged files ----------------------------------------------------- */
+var rFileNames = [];
+
+function rVal(id) { var e = document.getElementById(id); return e ? e.value.trim() : ''; }
+
+function rFileSel(id) {
+  var h = '<select id="' + id + '" class="rfsel">';
+  rFileNames.forEach(function (n) { h += '<option>' + esc(n) + '</option>'; });
+  return h + '</select>';
+}
+
+function rFiles() {
+  api('GET', '/api/rescue/files', null, function (ok, r) {
+    if (!ok) return;
+    rFileNames = r.files.map(function (f) { return f.name; });
+    var h = '<table><thead><tr><th>Name</th><th>Size</th><th></th></tr></thead><tbody>';
+    r.files.forEach(function (f) {
+      h += '<tr><td>' + esc(f.name) + '</td><td>' + f.size + '</td><td><a href="/api/rescue/files/' + encodeURIComponent(f.name) +
+           '" style="color:#e94560">download</a> <button onclick="rDelFile(\'' + esc(f.name) + '\')">Delete</button></td></tr>';
+    });
+    h += '</tbody></table><span class="muted">' + r.used + ' bytes used, ' + r.space + ' free (PSRAM, lost on reboot)</span>';
+    var el = document.getElementById('rfiles');
+    if (el) el.innerHTML = h;
+    Array.prototype.forEach.call(document.querySelectorAll('select.rfsel'), function (s) {
+      var cur = s.value;
+      s.innerHTML = rFileNames.map(function (n) { return '<option>' + esc(n) + '</option>'; }).join('');
+      if (rFileNames.indexOf(cur) >= 0) s.value = cur;
+    });
+    rEspRenderImgs();
+  });
+}
+
+function rUpload(after) {
+  var f = document.getElementById('rupfile').files[0];
+  if (!f) { alert('Pick a file'); return; }
+  var name = (rVal('rupname') || f.name).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '');
+  var st = document.getElementById('rupst');
+  var x = new XMLHttpRequest();
+  x.open('PUT', '/api/rescue/files/' + encodeURIComponent(name), true);
+  x.upload.onprogress = function (e) { if (e.lengthComputable) st.textContent = Math.round(100 * e.loaded / e.total) + '%'; };
+  x.onload = function () {
+    var r = null;
+    try { r = JSON.parse(x.responseText); } catch (e) {}
+    st.textContent = x.status == 200 ? ('staged ' + name + ' (' + f.size + ' bytes)') : ((r && r.error) || ('HTTP ' + x.status));
+    rFiles();
+    if (x.status == 200 && after) after(name);
+  };
+  x.onerror = function () { st.textContent = 'network error'; };
+  x.send(f);
+}
+
+function rDelFile(n) {
+  if (!confirm('Delete staged ' + n + '?')) return;
+  api('DELETE', '/api/rescue/files/' + encodeURIComponent(n), null, function (ok, r) {
+    if (!ok) alert(r && r.error);
+    rFiles();
+  });
+}
+
+/* --- jobs --------------------------------------------------------------- */
+var rJobId = 0, rJobTimer = null;
+
+function rJob(action, body) {
+  if (body.file === '') { alert('Stage a file first'); return; }
+  body.port = rPort();
+  api('POST', rUrl(action), body, function (ok, r) {
+    if (!ok) { alert((r && r.error) || 'failed'); return; }
+    rJobId = r.job;
+    document.getElementById('rjob').style.display = 'block';
+    rJobPoll();
+  });
+}
+
+function rJobPoll() {
+  clearTimeout(rJobTimer);
+  api('GET', '/api/rescue/jobs/' + rJobId, null, function (ok, j) {
+    if (!ok || !j) return;
+    var p = document.getElementById('rjobp'), s = document.getElementById('rjobs'), l = document.getElementById('rjobl');
+    if (!p) return;
+    p.value = j.progress;
+    s.textContent = j.kind + ': ' + j.state + (j.stage ? ' - ' + j.stage : '') + (j.error ? ' - ' + j.error : '') +
+                    ' (' + j.elapsed_s + ' s)';
+    s.className = j.state == 'failed' ? 'lo' : j.state == 'done' ? 'hi' : '';
+    l.textContent = (j.log || '') + (j.result ? '\nresult: ' + JSON.stringify(j.result) : '');
+    l.scrollTop = l.scrollHeight;
+    if (j.state == 'running' || j.state == 'queued') {
+      rJobTimer = setTimeout(rJobPoll, 700);
+    } else {
+      rFiles();
+      setTimeout(function () { rescueDevList(rBusid); }, 500);
+    }
+  });
+}
+
+function rJobCancel() {
+  api('DELETE', '/api/rescue/jobs/' + rJobId, null, function (ok, r) { if (!ok) alert(r && r.error); });
+}
+
+/* --- ESP images --------------------------------------------------------- */
+var rEspImgs = [];
+
+function rEspRenderImgs() {
+  var el = document.getElementById('respimgs');
+  if (!el) return;
+  var h = '';
+  rEspImgs.forEach(function (im, i) {
+    h += 'file <select onchange="rEspImgs[' + i + '].file=this.value">' + rFileNames.map(function (n) {
+      return '<option' + (n == im.file ? ' selected' : '') + '>' + esc(n) + '</option>';
+    }).join('') + '</select> at <input class="txt" size="8" value="' + esc(im.offset) +
+         '" onchange="rEspImgs[' + i + '].offset=this.value"> <button onclick="rEspImgs.splice(' + i +
+         ',1);rEspRenderImgs()">x</button><br>';
+    if (!im.file && rFileNames.length) im.file = rFileNames[0];
+  });
+  el.innerHTML = h;
+}
+
+function rEspAddImg() { rEspImgs.push({ file: rFileNames[0] || '', offset: '0x10000' }); rEspRenderImgs(); }
+
+function rEspFlash() {
+  if (!rEspImgs.length || rEspImgs.some(function (i) { return !i.file; })) { alert('Stage the images and pick them'); return; }
+  rJob('flash/esp', {
+    images: rEspImgs.map(function (i) { return { file: i.file, offset: i.offset }; }),
+    before: rVal('respbefore'), after: rVal('respafter'), baud: parseInt(rVal('respbaud'), 10),
+    erase_all: document.getElementById('resperase').checked, verify: document.getElementById('respverify').checked
+  });
+}
+
+/* --- serial monitor ------------------------------------------------------- */
+var rMonNext = 0, rMonTimer = null, rMonBusid = '';
+
+function rMonStart() {
+  var body = { serial_baud: parseInt(rVal('rmbaud'), 10), port: rPort() };
+  var d = rTriVal('rmdtr'), t = rTriVal('rmrts');
+  if (d !== undefined) body.dtr = d;
+  if (t !== undefined) body.rts = t;
+  api('POST', rUrl('monitor/start'), body, function (ok, r) {
+    if (!ok) { alert((r && r.error) || 'failed'); return; }
+    rMonNext = r.cursor;
+    rMonBusid = rBusid;
+    rMonPoll();
+  });
+}
+
+function rMonStop() {
+  clearTimeout(rMonTimer);
+  api('POST', rUrl('monitor/stop'), null, function () {
+    var s = document.getElementById('rmst');
+    if (s) s.textContent = 'stopped';
+  });
+}
+
+function rMonPoll() {
+  clearTimeout(rMonTimer);
+  if (rMonBusid != rBusid || !document.getElementById('rmout')) return;
+  api('GET', rUrl('monitor') + '?since=' + rMonNext + '&max=8192', null, function (ok, r) {
+    var o = document.getElementById('rmout'), s = document.getElementById('rmst');
+    if (!ok || !o) return;
+    if (r.text) {
+      var atEnd = o.scrollTop + o.clientHeight >= o.scrollHeight - 4;
+      o.textContent = (o.textContent + r.text).slice(-65536);
+      if (atEnd) o.scrollTop = o.scrollHeight;
+    }
+    rMonNext = r.next;
+    s.textContent = r.state + (r.dropped ? ' (output dropped: too slow)' : '') + (r.reconnects ? ', ' + r.reconnects + ' reconnect(s)' : '');
+    if (r.running) rMonTimer = setTimeout(rMonPoll, 400);
+  });
+}
+
+function rMonSend() {
+  var t = document.getElementById('rmin').value + (document.getElementById('rmnl').checked ? '\r\n' : '');
+  api('POST', rUrl('monitor/send'), { text: t }, function (ok, r) {
+    if (!ok) alert(r && r.error);
+    else document.getElementById('rmin').value = '';
+  });
+}
+
+function rMonSendRaw(hex) { api('POST', rUrl('monitor/send'), { hex: hex }, null); }
+
+/* --- mass storage ---------------------------------------------------------- */
+function rMscPath(name) {
+  var p = rVal('rmscpath') || '/';
+  return (p.charAt(p.length - 1) == '/' ? p : p + '/') + name;
+}
+
+function rMscList() {
+  var st = document.getElementById('rmscst');
+  st.textContent = 'reading...';
+  api('GET', rUrl('msc/list') + '?path=' + encodeURIComponent(rVal('rmscpath') || '/'), null, function (ok, r) {
+    st.textContent = ok ? '' : ((r && r.error) || 'failed');
+    if (!ok) return;
+    var h = '<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead><tbody>';
+    r.files.forEach(function (f) {
+      var p = esc(rMscPath(f.name));
+      h += '<tr><td>' + (f.dir ? '<a href="#" style="color:#e94560" onclick="document.getElementById(\'rmscpath\').value=\'' + p +
+           '\';rMscList();return false">' + esc(f.name) + '/</a>' : esc(f.name)) + '</td><td>' + (f.dir ? '' : f.size) +
+           '</td><td>' + esc(f.modified) + '</td><td>' +
+           (f.dir ? '' : '<button onclick="rMscGet(\'' + p + '\')">Download</button> ') +
+           '<button onclick="rMscRename(\'' + p + '\')">Rename</button> <button onclick="rMscDel(\'' + p + '\')">Delete</button></td></tr>';
+    });
+    document.getElementById('rmsc').innerHTML = h + '</tbody></table>';
+  });
+}
+
+function rMscUp() {
+  var p = rVal('rmscpath').replace(/\/+$/, '');
+  document.getElementById('rmscpath').value = p.substring(0, p.lastIndexOf('/')) || '/';
+  rMscList();
+}
+
+function rMscDone(ok, r) {
+  if (!ok) alert((r && r.error) || 'failed');
+  rMscList();
+}
+
+function rMscDel(p) {
+  if (confirm('Delete ' + p + ' on the device?')) api('POST', rUrl('msc/delete'), { path: p }, rMscDone);
+}
+
+function rMscRename(p) {
+  var to = prompt('Rename / move ' + p + ' to', p);
+  if (to && to != p) api('POST', rUrl('msc/rename'), { from: p, to: to }, rMscDone);
+}
+
+function rMscMkdir() {
+  var n = prompt('New folder name');
+  if (n) api('POST', rUrl('msc/mkdir'), { path: rMscPath(n) }, rMscDone);
+}
+
+function rMscPut() {
+  var f = rVal('rmscfile');
+  if (!f) { alert('Stage a file first'); return; }
+  rJob('msc/write', { file: f, path: rMscPath(f) });
+}
+
+function rMscGet(p) {
+  var name = p.substring(p.lastIndexOf('/') + 1).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '') || 'file';
+  api('POST', rUrl('msc/read'), { path: p, file: name }, function (ok, r) {
+    if (!ok) { alert((r && r.error) || 'failed'); return; }
+    rJobId = r.job;
+    document.getElementById('rjob').style.display = 'block';
+    var wait = function () {
+      api('GET', '/api/rescue/jobs/' + rJobId, null, function (ok2, j) {
+        if (ok2 && j.state == 'done') { rFiles(); window.location = '/api/rescue/files/' + encodeURIComponent(name); }
+        else if (ok2 && (j.state == 'running' || j.state == 'queued')) setTimeout(wait, 500);
+        else alert('Download failed: ' + (j && j.error));
+      });
+    };
+    rJobPoll();
+    wait();
+  });
 }
 
 function rUrl(action) { return '/api/usb/devices/' + encodeURIComponent(rBusid) + '/' + action; }
