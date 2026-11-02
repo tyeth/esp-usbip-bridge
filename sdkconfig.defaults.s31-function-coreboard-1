@@ -81,3 +81,12 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 # Phase 3: parked interrupt listeners (cdc-acm notification endpoints, hub status pipes) bind
 # channels on demand, capped at 4 (bench opt-in; 0 keeps every interrupt channel static).
 CONFIG_USB_HOST_PARKED_INTR_BIND_CAP=4
+
+# 4 MB factory app (the default single-app table has 1 MB); nvs and phy_init
+# stay where they were. See partitions-s31-function-coreboard-1.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-s31-function-coreboard-1.csv"
+
+# esp-serial-flasher: the device rescue flasher brings its own port (USB
+# serial through the bridge), none of the library's built-in ports.
+# CONFIG_SERIAL_FLASHER_PORT_UART is not set

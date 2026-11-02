@@ -1,0 +1,8 @@
+# ESP32-S31-Function-CoreBoard-1 (16 MB flash). nvs and phy_init keep the
+# offsets of the default single-app table, so a bridge keeps its hostname, API
+# token, port power states and mux topology when it moves to this table; the
+# factory app grows from 1 MB to 4 MB (flasher stubs, FatFS, MSC, monitor).
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 4M,
