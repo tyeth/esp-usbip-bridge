@@ -1323,7 +1323,9 @@ function rMscPath(name) {
 function rMscList() {
   var st = document.getElementById('rmscst');
   st.textContent = 'reading...';
+  busyBegin('mass storage listing on ' + rBusid, 10);
   api('GET', rUrl('msc/list') + '?path=' + encodeURIComponent(rVal('rmscpath') || '/'), null, function (ok, r) {
+    busyEnd();
     st.textContent = ok ? '' : ((r && r.error) || 'failed');
     if (!ok) return;
     var h = '<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead><tbody>';
@@ -1346,22 +1348,23 @@ function rMscUp() {
 }
 
 function rMscDone(ok, r) {
+  busyEnd();
   if (!ok) alert((r && r.error) || 'failed');
   rMscList();
 }
 
 function rMscDel(p) {
-  if (confirm('Delete ' + p + ' on the device?')) api('POST', rUrl('msc/delete'), { path: p }, rMscDone);
+  if (confirm('Delete ' + p + ' on the device?')) busyBegin('mass storage delete', 10), api('POST', rUrl('msc/delete'), { path: p }, rMscDone);
 }
 
 function rMscRename(p) {
   var to = prompt('Rename / move ' + p + ' to', p);
-  if (to && to != p) api('POST', rUrl('msc/rename'), { from: p, to: to }, rMscDone);
+  if (to && to != p) busyBegin('mass storage rename', 10), api('POST', rUrl('msc/rename'), { from: p, to: to }, rMscDone);
 }
 
 function rMscMkdir() {
   var n = prompt('New folder name');
-  if (n) api('POST', rUrl('msc/mkdir'), { path: rMscPath(n) }, rMscDone);
+  if (n) busyBegin('mass storage mkdir', 10), api('POST', rUrl('msc/mkdir'), { path: rMscPath(n) }, rMscDone);
 }
 
 function rMscPut() {
@@ -1572,7 +1575,9 @@ function rReset(mode) {
   var o = document.getElementById('rresout');
   o.style.display = 'block';
   o.textContent = 'running ' + mode + ' ...';
+  busyBegin(mode + ' on ' + rBusid, 10);
   api('POST', rUrl('reset'), { mode: mode, port: rPort() }, function (ok, r) {
+    busyEnd();
     var t = (ok ? 'ok' : 'FAILED: ' + ((r && r.error) || '')) + '\n';
     if (r) {
       if (r.ran) t += 'ran: ' + r.ran + '\n';
