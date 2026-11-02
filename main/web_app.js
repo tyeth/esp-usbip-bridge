@@ -812,7 +812,7 @@ function rescueRender() {
   }
   h += '<table class="kv"><tbody>' +
        rKv('Device', esc(r.vid) + ':' + esc(r.pid) + ' ' + esc(r.manufacturer) + ' ' + esc(r.product)) +
-       rKv('Serial number', esc(r.serial)) +
+       rKv('Serial number', r.serial_number ? esc(r.serial_number) : '<span class="muted">none</span>') +
        rKv('Name', esc(r.name)) +
        rKv('Speed / address', esc(r.speed) + ' / ' + esc(r.address)) +
        rKv('bcdDevice / class', esc(r.bcd_device) + ' / ' + esc(r.device_class)) +

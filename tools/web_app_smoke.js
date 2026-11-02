@@ -43,7 +43,7 @@ answers['GET /api/status'] = [200, { active: null, duts: [{ name: 'feather-s3', 
 answers['GET /api/usb/devices'] = [200, { devices: [] }];
 
 const base = { ok: true, busid: '1-1.2', vid: '303a', pid: '1001', bcd_device: '0101', device_class: 'ef',
-  manufacturer: 'Espressif', product: 'USB JTAG/serial debug unit', serial: 'AA', name: 'feather-s3', speed: 'full',
+  manufacturer: 'Espressif', product: 'USB JTAG/serial debug unit', serial_number: 'AA', name: 'feather-s3', speed: 'full',
   address: 3, configuration: 1, interfaces: [{ number: 0, class: '02', subclass: '02', protocol: '00', class_name: 'cdc',
   num_endpoints: 1, intr_in: '82' }], owner: null, imported: false, monitor: false, job_running: false,
   port: { path: '1-1.2', power: 'on', connected: true, over_current: false, saved: 'on', read_only: true },
@@ -71,6 +71,8 @@ for (const [name, info] of Object.entries(cases)) {
     for (const w of want) {
       if (!h.includes(w)) { console.log(`FAIL ${name}: missing "${w}"`); failed++; }
     }
+    if (h.includes('[object Object]')) { console.log(`FAIL ${name}: an object rendered as text`); failed++; }
+    if (name === 'esp' && !h.includes('<td>Serial number</td><td>AA</td>')) { console.log('FAIL esp: serial number not shown'); failed++; }
     if (name === 'bootsel' && h.includes('Flash ESP')) { console.log('FAIL bootsel shows the ESP flasher'); failed++; }
     if (!el('rfiles').innerHTML.includes('app.bin')) { console.log(`FAIL ${name}: staged files not listed`); failed++; }
   } catch (e) {

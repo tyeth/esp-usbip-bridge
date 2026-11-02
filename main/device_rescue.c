@@ -351,7 +351,13 @@ int device_rescue_info(const char *busid, cJSON **out)
     add_hex(j, "device_class", d->device_class, 2);
     cJSON_AddStringToObject(j, "manufacturer", d->manufacturer);
     cJSON_AddStringToObject(j, "product", d->product);
-    cJSON_AddStringToObject(j, "serial", d->serial);
+    /* The iSerial string.  "serial" is the serial-function object below: the
+       string used to be a second "serial" key, which JSON parsers drop. */
+    if (d->serial[0]) {
+        cJSON_AddStringToObject(j, "serial_number", d->serial);
+    } else {
+        cJSON_AddNullToObject(j, "serial_number");
+    }
     char name[DEVICE_NAME_MAX_LEN] = "";
     device_naming_get_device_name(d->busid, name, sizeof(name));
     cJSON_AddStringToObject(j, "name", name);
