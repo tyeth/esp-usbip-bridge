@@ -109,7 +109,15 @@ static int samba_init(samba_t *s)
             break;
         }
     }
-    if (strstr(s->version, "v") == NULL && strstr(s->version, "V") == NULL) {
+    /* A SAM-BA answer ("v1.1 [Arduino:XYZ] May 14 2026 ..."), not an app's
+       console output that happens to contain a v (WipperSnapper's error
+       lines did, and the board was never touched into its bootloader). */
+    const char *v = s->version;
+    while (*v == '\n' || *v == '\r' || *v == ' ') {
+        v++;
+    }
+    const bool version = (v[0] == 'v' || v[0] == 'V') && v[1] >= '0' && v[1] <= '9';
+    if (!version && strstr(v, "[Arduino:") == NULL && strstr(v, "SAM-BA") == NULL) {
         return -1;          /* not a SAM-BA monitor */
     }
     const char *ext = strstr(s->version, "[Arduino:");
