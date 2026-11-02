@@ -525,6 +525,25 @@ only the app at `0x10000` changes `factory`, which it does not boot. Erase
 `ota_data_initial.bin` at `0xC10000`), or `POST /api/ota/boot
 {"partition": "factory"}` first.
 
+**UAT branch and deployment.** The `uat` branch is what bridges under user
+acceptance testing run. Every push to it runs `.github/workflows/uat.yml`: it
+builds `s31-function-coreboard-1`, publishes the rolling `uat-s31` prerelease
+(the OTA image `esp32p4_usbip_bridge.bin`, the wired-flash files,
+`flasher_args.json` and `SHA256SUMS`) and, when the repository variable
+`UAT_BRIDGES` (space-separated addresses) is set and a self-hosted runner
+labelled `bridge-lan` can reach them, deploys it over OTA (`UAT_BRIDGE_TOKEN`
+secret for bridges with an API token). By hand, from anywhere on the bridges'
+network:
+
+```bash
+gh release download uat-s31 -R <owner>/esp-usbip-bridge -p esp32p4_usbip_bridge.bin
+scripts/ota-deploy.sh esp32p4_usbip_bridge.bin 192.168.1.147
+```
+
+`scripts/ota-deploy.sh` uploads to each bridge in turn, then waits until it
+runs the new image from the slot it was written to and has confirmed it
+(`OTA_CONFIRM_TIMEOUT`, 150 s); a rollback or timeout fails the run.
+
 ### Auth
 
 `POST /api/auth/token {"token": "..."}` sets a token (empty clears it). Once set,

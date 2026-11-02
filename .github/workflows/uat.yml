@@ -1,0 +1,109 @@
+name: UAT
+
+# The uat branch is what the S31 bridges under user acceptance testing run.
+# Every push builds the S31 firmware, publishes it as the rolling `uat-s31`
+# prerelease (OTA image plus everything a wired flash needs) and, where a
+# runner on the bridges' LAN is registered, deploys it to them over OTA.
+on:
+  push:
+    branches: [uat]
+  workflow_dispatch:
+
+concurrency:
+  group: uat
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Not recursive: esp-harness declares its own full ESP-IDF submodule the
+      # build never uses (see the README's Cloning section).
+      - name: Init submodules (without esp-harness's ESP-IDF)
+        run: |
+          git submodule update --init esp-idf esp-harness
+          git -C esp-harness submodule update --init components/scpi_parser/upstream
+
+      - name: Install ESP-IDF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip \
+            python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util \
+            libusb-1.0-0
+
+      - name: Cache ESP-IDF tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: espressif-tools-${{ hashFiles('esp-idf/tools/idf_tools.py') }}
+
+      - name: Install ESP-IDF tools
+        run: ./esp-idf/install.sh esp32s31
+
+      - name: Build s31-function-coreboard-1
+        run: |
+          source ./esp-idf/export.sh
+          ./scripts/build-board.sh s31-function-coreboard-1 build
+
+      - name: Package
+        run: |
+          B=build-s31-function-coreboard-1
+          mkdir dist
+          cp "$B/esp32p4_usbip_bridge.bin" "$B/ota_data_initial.bin" "$B/flasher_args.json" dist/
+          cp "$B/bootloader/bootloader.bin" "$B/partition_table/partition-table.bin" dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-uat-s31
+          path: dist/
+
+      - name: Publish the uat-s31 prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Built from \`uat\` at ${GITHUB_SHA} (run ${GITHUB_RUN_ID})."
+            echo
+            cat <<'EOF'
+          - OTA (bridges on the OTA partition table): `scripts/ota-deploy.sh esp32p4_usbip_bridge.bin <bridge>`
+          - Wired: `esptool --chip esp32s31 write-flash 0x2000 bootloader.bin 0x8000 partition-table.bin 0xC10000 ota_data_initial.bin 0x10000 esp32p4_usbip_bridge.bin` (see flasher_args.json)
+          EOF
+          } > notes.md
+          gh release delete uat-s31 --yes --cleanup-tag || true
+          gh release create uat-s31 dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "UAT: S31 bridge ${GITHUB_SHA::7}" --notes-file notes.md
+
+  # Runs only when the repository variable UAT_BRIDGES (space-separated bridge
+  # addresses) is set and a self-hosted runner labelled bridge-lan can reach them.
+  deploy:
+    needs: build
+    if: vars.UAT_BRIDGES != ''
+    runs-on: [self-hosted, bridge-lan]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-uat-s31
+          path: dist
+
+      - name: OTA deploy
+        env:
+          BRIDGE_TOKEN: ${{ secrets.UAT_BRIDGE_TOKEN }}
+          UAT_BRIDGES: ${{ vars.UAT_BRIDGES }}
+        run: |
+          # shellcheck disable=SC2086
+          bash scripts/ota-deploy.sh dist/esp32p4_usbip_bridge.bin $UAT_BRIDGES
