@@ -41,6 +41,9 @@ typedef struct {
     char vendor[9], product[17], revision[5];
     int last_err;               /* last transport error (-ENODEV when the device left) */
     uint32_t ms_inquiry, ms_ready, ms_capacity, ms_mount;   /* how long opening took, per step */
+    uint32_t cmds, slow_ms;     /* SCSI commands since open, and the slowest one */
+    uint8_t slow_op;
+    int slow_rc;
 } msc_dev_t;
 
 static msc_dev_t s_dev;
@@ -99,7 +102,23 @@ static void reset_recovery(msc_dev_t *d)
 
 /* One SCSI command.  Returns 0, 1 (the command failed: check sense), or a
    negative errno (transport). */
+static int bot_once(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *data, uint32_t len, bool in);
+
 static int bot(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *data, uint32_t len, bool in)
+{
+    const int64_t t0 = esp_timer_get_time();
+    const int rc = bot_once(d, cdb, cdb_len, data, len, in);
+    const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    d->cmds++;
+    if (ms >= d->slow_ms) {
+        d->slow_ms = ms;
+        d->slow_op = cdb[0];
+        d->slow_rc = rc;
+    }
+    return rc;
+}
+
+static int bot_once(msc_dev_t *d, const uint8_t *cdb, uint8_t cdb_len, uint8_t *data, uint32_t len, bool in)
 {
     uint8_t cbw[31];
     const uint32_t tag = ++d->tag;
@@ -443,14 +462,18 @@ static cJSON *list_dir(const char *dirpath, int *count)
 
 int msc_info(const char *busid, cJSON **out)
 {
+    const int64_t t0 = esp_timer_get_time();
     int st = take(busid, out);
     if (st != 0) {
         return st;
     }
+    const int64_t t_take = esp_timer_get_time();
     lock();
+    const int64_t t_lock = esp_timer_get_time();
     mount_t m = {0};
     char msg[128] = "";
     st = mount(busid, &m, msg, sizeof(msg));
+    const int64_t t_mount = esp_timer_get_time();
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", st == 0);
     if (s_dev.block_size) {
@@ -460,11 +483,6 @@ int msc_info(const char *busid, cJSON **out)
         cJSON_AddNumberToObject(j, "block_size", s_dev.block_size);
         cJSON_AddNumberToObject(j, "blocks", s_dev.block_count);
         cJSON_AddNumberToObject(j, "capacity", (double)s_dev.block_size * s_dev.block_count);
-        cJSON *t = cJSON_AddObjectToObject(j, "open_ms");
-        cJSON_AddNumberToObject(t, "inquiry", s_dev.ms_inquiry);
-        cJSON_AddNumberToObject(t, "ready", s_dev.ms_ready);
-        cJSON_AddNumberToObject(t, "capacity", s_dev.ms_capacity);
-        cJSON_AddNumberToObject(t, "mount", s_dev.ms_mount);
     }
     if (st == 0) {
         DWORD nclst = 0;
@@ -474,10 +492,26 @@ int msc_info(const char *busid, cJSON **out)
             cJSON_AddStringToObject(j, "fs", fsp->fs_type == FS_FAT12 ? "FAT12" : fsp->fs_type == FS_FAT16 ? "FAT16"
                                     : fsp->fs_type == FS_FAT32 ? "FAT32" : "exFAT");
         }
+        const int64_t t_free = esp_timer_get_time();
         char root[8];
         make_path(&m, "/", root, sizeof(root));
         int n = 0;
         cJSON_AddItemToObject(j, "files", list_dir(root, &n));
+        /* Where the time went (an open of some drives takes seconds). */
+        cJSON *t = cJSON_AddObjectToObject(j, "timing_ms");
+        cJSON_AddNumberToObject(t, "take", (double)((t_take - t0) / 1000));
+        cJSON_AddNumberToObject(t, "lock", (double)((t_lock - t_take) / 1000));
+        cJSON_AddNumberToObject(t, "inquiry", s_dev.ms_inquiry);
+        cJSON_AddNumberToObject(t, "ready", s_dev.ms_ready);
+        cJSON_AddNumberToObject(t, "capacity", s_dev.ms_capacity);
+        cJSON_AddNumberToObject(t, "f_mount", s_dev.ms_mount);
+        cJSON_AddNumberToObject(t, "mount_total", (double)((t_mount - t_lock) / 1000));
+        cJSON_AddNumberToObject(t, "getfree", (double)((t_free - t_mount) / 1000));
+        cJSON_AddNumberToObject(t, "list", (double)((esp_timer_get_time() - t_free) / 1000));
+        cJSON_AddNumberToObject(t, "scsi_commands", s_dev.cmds);
+        cJSON_AddNumberToObject(t, "slowest_ms", s_dev.slow_ms);
+        cJSON_AddNumberToObject(t, "slowest_op", s_dev.slow_op);
+        cJSON_AddNumberToObject(t, "slowest_rc", s_dev.slow_rc);
         /* A UF2 bootloader says so in INFO_UF2.TXT. */
         cJSON_AddBoolToObject(j, "uf2_bootloader", false);
         cJSON *files = cJSON_GetObjectItemCaseSensitive(j, "files");
