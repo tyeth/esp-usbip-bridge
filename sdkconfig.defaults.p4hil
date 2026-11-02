@@ -42,3 +42,8 @@ CONFIG_USBIP_NEOPIXEL_GPIO=27
 # captures there, so without this the logic analyzer falls back to a 16KB
 # internal SRAM buffer and advertises 0 bytes of sample memory over SUMP.
 CONFIG_SPIRAM=y
+
+# The app outgrew the default 1 MB factory partition (device rescue, flashers,
+# FatFS).  The large single-app table keeps nvs at 0x9000 and phy_init at
+# 0xf000, so a bridge keeps its settings; the factory app grows to 1500 KB.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
