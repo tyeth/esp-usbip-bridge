@@ -23,6 +23,8 @@
 #define ESPF_DEFAULT_BAUD   460800
 #define ESPF_STUB_BLOCK     0x4000
 #define ESPF_ROM_BLOCK      0x400
+#define ESPF_PT_OFFSET      0x8000
+#define ESPF_PT_SIZE        0xC00
 #define ESPF_CONNECT_TRIES  3
 #define ESPF_REENUM_WAIT_MS 8000    /* an ESP32-C5 took ~5 s to come back in download mode */
 
@@ -416,8 +418,25 @@ static int espf_connect(espf_t *f, rescue_job_t *job, const char *busid, const c
     return 0;
 }
 
+/* An ESP32-S2/S3 app that rebooted into the ROM loader (Arduino's 1200-baud
+   touch) set RTC_CNTL_OPTION1.FORCE_DOWNLOAD_BOOT, which survives a reset:
+   clear it so the next reset runs the flash, as esptool's hard_reset does
+   (arduino-esp32 issue 6762). */
+static void clear_force_download(espf_t *f, rescue_job_t *job)
+{
+    const target_chip_t chip = esp_loader_get_target(&f->loader);
+    const uint32_t reg = chip == ESP32S3_CHIP ? 0x6000812Cu : chip == ESP32S2_CHIP ? 0x3F408128u : 0;
+    uint32_t v;
+    if (reg != 0 && esp_loader_read_register(&f->loader, reg, &v) == ESP_LOADER_SUCCESS && (v & 1u)) {
+        if (esp_loader_write_register(&f->loader, reg, v & ~1u) == ESP_LOADER_SUCCESS) {
+            rescue_job_log(job, "cleared the forced download boot (RTC_CNTL_OPTION1)");
+        }
+    }
+}
+
 static void espf_after(espf_t *f, rescue_job_t *job, const cJSON *args)
 {
+    clear_force_download(f, job);
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(args, "after");
     const bool no_reset = cJSON_IsString(v) &&
         (strcmp(v->valuestring, "no_reset") == 0 || strcmp(v->valuestring, "no-reset") == 0);
@@ -460,6 +479,60 @@ int esp_flasher_info_job(rescue_job_t *job, const char *busid, const cJSON *args
         espf_after(f, job, args);
     }
     serial_link_close(&f->link);
+    heap_caps_free(f);
+    return rc;
+}
+
+int esp_flasher_boot_uf2(rescue_job_t *job, const char *busid)
+{
+    espf_t *f = heap_caps_calloc(1, sizeof(*f), MALLOC_CAP_DEFAULT);
+    uint8_t *pt = heap_caps_malloc(ESPF_PT_SIZE, MALLOC_CAP_DEFAULT);
+    if (f == NULL || pt == NULL) {
+        heap_caps_free(f);
+        heap_caps_free(pt);
+        return rescue_job_fail(job, "out of memory");
+    }
+    cJSON *args = cJSON_CreateObject();     /* defaults: reset into the ROM loader, stub */
+    int rc = espf_connect(f, job, busid, args);
+    cJSON_Delete(args);
+    uint32_t ota_off = 0, ota_size = 0, factory_off = 0;
+    char factory_label[17] = "";
+    if (rc == 0 && esp_loader_flash_read(&f->loader, pt, ESPF_PT_OFFSET, ESPF_PT_SIZE) != ESP_LOADER_SUCCESS) {
+        rc = rescue_job_fail(job, "could not read the partition table at 0x%x", ESPF_PT_OFFSET);
+    }
+    for (int i = 0; rc == 0 && i + 32 <= ESPF_PT_SIZE; i += 32) {
+        const uint8_t *e = &pt[i];
+        if (e[0] != 0xAA || e[1] != 0x50) {
+            break;                                      /* end of the table (or its MD5 entry) */
+        }
+        const uint32_t off = e[4] | e[5] << 8 | e[6] << 16 | (uint32_t)e[7] << 24;
+        const uint32_t size = e[8] | e[9] << 8 | e[10] << 16 | (uint32_t)e[11] << 24;
+        if (e[2] == 1 && e[3] == 0) {                   /* data, ota */
+            ota_off = off;
+            ota_size = size;
+        } else if (e[2] == 0 && e[3] == 0) {            /* app, factory */
+            factory_off = off;
+            memcpy(factory_label, &e[12], 16);
+        }
+    }
+    if (rc == 0 && (ota_size == 0 || factory_off == 0)) {
+        clear_force_download(f, job);
+        esp_loader_reset_target(&f->loader);           /* back to its app */
+        rc = rescue_job_fail(job, "no UF2 bootloader to start: the partition table has %s",
+                             ota_size == 0 ? "no otadata" : "no factory app (TinyUF2's uf2 partition)");
+    }
+    if (rc == 0) {
+        rescue_job_log(job, "factory app '%s' at 0x%lx: erasing otadata (0x%lx, %lu bytes) so it boots",
+                       factory_label, (unsigned long)factory_off, (unsigned long)ota_off, (unsigned long)ota_size);
+        if (esp_loader_flash_erase_region(&f->loader, ota_off, ota_size) != ESP_LOADER_SUCCESS) {
+            rc = rescue_job_fail(job, "erasing otadata failed");
+        } else {
+            clear_force_download(f, job);
+            esp_loader_reset_target(&f->loader);
+        }
+    }
+    serial_link_close(&f->link);
+    heap_caps_free(pt);
     heap_caps_free(f);
     return rc;
 }

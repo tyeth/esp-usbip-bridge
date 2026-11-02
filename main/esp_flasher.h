@@ -20,5 +20,10 @@
 int esp_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args);
 /* Connect and report chip, MAC, flash size, security info (no writes). */
 int esp_flasher_info_job(rescue_job_t *job, const char *busid, const cJSON *args);
+/* Within another job: start an ESP32-S2/S3 board's TinyUF2.  Its partition
+   table has the UF2 bootloader as the factory app, which the second-stage
+   bootloader runs when otadata is blank: connect, check the table, erase
+   otadata, reset.  TinyUF2 selects the new app again after a UF2 copy. */
+int esp_flasher_boot_uf2(rescue_job_t *job, const char *busid);
 
 #endif

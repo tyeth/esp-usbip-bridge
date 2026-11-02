@@ -17,6 +17,7 @@
 #include "blob_store.h"
 #include "busid_owner.h"
 #include "device_rescue.h"
+#include "esp_flasher.h"
 #include "rescue_logic.h"
 #include "serial_link.h"
 #include "serial_monitor.h"
@@ -30,6 +31,7 @@ static const char *TAG = "msc";
 #define MSC_READY_WAIT_MS   4000
 #define MSC_PATH_MAX        256
 #define MSC_COPY_CHUNK      4096
+#define MSC_META_SECTORS    4096    /* metadata cache: the first sectors of a volume (FAT16: all of it) */
 
 typedef struct {
     bool open;
@@ -299,17 +301,59 @@ static DSTATUS msc_disk_status(BYTE pdrv)
     return s_dev.open ? 0 : STA_NOINIT;
 }
 
+/* Write-through cache of the metadata sectors written while mounted (boot
+   sector, FATs, FAT12/16 root directory: everything before the data area),
+   as a PC's page cache keeps them.  FatFS has a one-sector window and reads
+   a FAT sector back from the device each time it returns to it; a UF2
+   bootloader's FAT and directory are synthetic and ignore writes, so
+   without this a large file's cluster chain fell apart mid-copy. */
+static uint8_t **s_meta;
+static uint32_t s_meta_n;
+
+static void meta_cache_begin(uint32_t sectors)
+{
+    s_meta_n = sectors > MSC_META_SECTORS ? MSC_META_SECTORS : sectors;
+    s_meta = s_meta_n ? heap_caps_calloc(s_meta_n, sizeof(uint8_t *), MALLOC_CAP_DEFAULT) : NULL;
+    if (s_meta == NULL) {
+        s_meta_n = 0;
+    }
+}
+
+static void meta_cache_end(void)
+{
+    for (uint32_t i = 0; i < s_meta_n; i++) {
+        heap_caps_free(s_meta[i]);
+    }
+    heap_caps_free(s_meta);
+    s_meta = NULL;
+    s_meta_n = 0;
+}
+
 static DRESULT msc_disk_rw(BYTE *buff, uint32_t sector, UINT count, bool write)
 {
+    const uint32_t bs = s_dev.block_size;
     while (count > 0) {
         const UINT n = count > MSC_CMD_SECTORS_MAX ? MSC_CMD_SECTORS_MAX : count;
         uint8_t cdb[10];
         rescue_scsi_rw10(write ? 0x2A : 0x28, sector, (uint16_t)n, cdb);
-        const int rc = bot(&s_dev, cdb, 10, buff, n * s_dev.block_size, !write);
+        const int rc = bot(&s_dev, cdb, 10, buff, n * bs, !write);
         if (rc != 0) {
             return RES_ERROR;
         }
-        buff += n * s_dev.block_size;
+        for (uint32_t i = 0; i < n && sector + i < s_meta_n; i++) {
+            uint8_t **slot = &s_meta[sector + i];
+            if (write) {
+                if (*slot == NULL) {
+                    *slot = heap_caps_malloc(bs, MALLOC_CAP_SPIRAM);
+                }
+                if (*slot != NULL) {
+                    memcpy(*slot, buff + i * bs, bs);
+                }
+            } else if (*slot != NULL) {
+                memcpy(buff + i * bs, *slot, bs);   /* what we wrote, not what the device shows */
+            }
+        }
+        buff += n * bs;
         sector += n;
         count -= n;
     }
@@ -382,8 +426,12 @@ static int mount(const char *busid, mount_t *m, char *msg, size_t msg_len)
         return 503;
     }
     const int64_t ts = esp_timer_get_time();
+    meta_cache_end();
     const FRESULT fr = f_mount(m->fs, m->drive, 1);
     s_dev.ms_mount = (uint32_t)((esp_timer_get_time() - ts) / 1000);
+    if (fr == FR_OK) {
+        meta_cache_begin((uint32_t)m->fs->database);
+    }
     if (fr != FR_OK) {
         snprintf(msg, msg_len, fr == FR_NO_FILESYSTEM ? "no FAT file system on the volume"
                                : "mount failed (FatFS error %d)", (int)fr);
@@ -402,6 +450,7 @@ static void unmount(mount_t *m)
         heap_caps_free(m->fs);
         m->fs = NULL;
     }
+    meta_cache_end();
     if (s_pdrv != 0xFF) {
         ff_diskio_unregister(s_pdrv);
     }
@@ -756,6 +805,12 @@ static int write_uf2_raw(rescue_job_t *job, const mount_t *m, const char *busid,
     return 0;
 }
 
+/* An Espressif ROM download port (USB-Serial/JTAG, S2/S3 USB-OTG ROM). */
+static bool is_esp_rom(uint16_t vid, uint16_t pid)
+{
+    return vid == 0x303a && (pid == 0x1001 || pid == 0x0002 || pid == 0x0009);
+}
+
 static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, bool uf2)
 {
     const cJSON *file = cJSON_GetObjectItemCaseSensitive(args, "file");
@@ -808,7 +863,11 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
                 rescue_caps_t caps;
                 rescue_classify(d.id_vendor, d.id_product, d.bcd_device, &cfg, 0, &caps);
                 rescue_job_progress(job, 2, "entering the bootloader");
-                if (caps.rp_reset_if >= 0) {
+                usbip_backend_device_t now = d;
+                bool dropped = false;
+                if (is_esp_rom(d.id_vendor, d.id_product)) {
+                    /* Already at an ESP ROM port: TinyUF2 is started below. */
+                } else if (caps.rp_reset_if >= 0) {
                     rescue_ctrl_t r;
                     rescue_rp_reset_request(caps.rp_reset_if, true, &r);
                     usb_setup_packet_t setup = { .bmRequestType = r.bm, .bRequest = r.req, .wValue = r.value, .wIndex = r.index };
@@ -827,14 +886,32 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
                     free(l);
                     rescue_job_log(job, "1200-baud touch");
                 }
-                usbip_backend_device_t now;
-                bool dropped;
-                if (!device_rescue_wait_reenumeration(busid, d.devnum, 6000, &now, &dropped)) {
-                    free(cfgbuf);
-                    blob_release(file->valuestring);
-                    return rescue_job_fail(job, "no mass storage on the device and it did not re-enumerate into a bootloader");
+                if (!is_esp_rom(d.id_vendor, d.id_product)) {
+                    if (!device_rescue_wait_reenumeration(busid, d.devnum, 6000, &now, &dropped)) {
+                        free(cfgbuf);
+                        blob_release(file->valuestring);
+                        return rescue_job_fail(job, "no mass storage on the device and it did not re-enumerate into a bootloader");
+                    }
+                    rescue_job_log(job, "bootloader: %04x:%04x %s", now.id_vendor, now.id_product, now.product);
                 }
-                rescue_job_log(job, "bootloader: %04x:%04x %s", now.id_vendor, now.id_product, now.product);
+                /* An ESP32-S2/S3 app's 1200-baud touch lands in the ROM loader,
+                   not TinyUF2 (a PC user would double-tap reset): start it. */
+                if (is_esp_rom(now.id_vendor, now.id_product)) {
+                    rescue_job_log(job, "an ESP ROM loader, not a UF2 drive: starting TinyUF2");
+                    const uint32_t rom_devnum = now.devnum;
+                    const int brc = esp_flasher_boot_uf2(job, busid);
+                    if (brc != 0) {
+                        free(cfgbuf);
+                        blob_release(file->valuestring);
+                        return brc;
+                    }
+                    if (!device_rescue_wait_reenumeration(busid, rom_devnum, 8000, &now, &dropped)) {
+                        free(cfgbuf);
+                        blob_release(file->valuestring);
+                        return rescue_job_fail(job, "TinyUF2 did not come up after otadata was erased");
+                    }
+                    rescue_job_log(job, "bootloader: %04x:%04x %s", now.id_vendor, now.id_product, now.product);
+                }
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
         }
@@ -852,7 +929,13 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
         rc = rescue_job_fail(job, "%s", msg);
     }
     const uint32_t devnum = s_dev.devnum;
-    if (rc == 0 && uf2 && s_dev.block_size == RESCUE_UF2_BLOCK && !cJSON_IsString(path)) {
+    /* UF2: copied as a file, as a PC does (the metadata cache keeps FatFS
+       consistent on the bootloader's synthetic FAT); "raw" writes the blocks
+       to sectors, and "auto" (the default) falls back to that if the copy fails. */
+    const cJSON *method = cJSON_GetObjectItemCaseSensitive(args, "method");
+    const char *how = cJSON_IsString(method) ? method->valuestring : "auto";
+    const bool raw_ok = uf2 && s_dev.block_size == RESCUE_UF2_BLOCK;
+    if (rc == 0 && raw_ok && strcmp(how, "raw") == 0) {
         rc = write_uf2_raw(job, &m, busid, data, len, devnum);
         unmount(&m);
         unlock();
@@ -892,8 +975,10 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
     if (rc == 0) {
         const FRESULT fc = (fr == FR_OK) ? f_close(f) : fr;
         bool dropped = false;
-        if (fc != FR_OK && uf2 && written >= len - RESCUE_UF2_BLOCK) {
-            /* A UF2 bootloader reboots after the last block: the closing FAT writes fail. */
+        if (uf2 && (fc == FR_OK || written + MSC_COPY_CHUNK >= len)) {
+            /* A UF2 bootloader reboots once it has the last block: during the
+               last chunk or the closing FAT writes (which then fail), or just
+               after the copy. */
             usbip_backend_device_t now;
             device_rescue_wait_reenumeration(busid, devnum, 3000, &now, &dropped);
         }
@@ -906,6 +991,12 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
             cJSON_AddNumberToObject(res, "bytes", (double)written);
             cJSON_AddBoolToObject(res, "device_rebooted", dropped);
             cJSON_AddNumberToObject(res, "seconds", secs);
+        } else if (raw_ok && strcmp(how, "auto") == 0) {
+            rescue_job_log(job, "file copy failed after %u of %u bytes (%s, %s); writing the blocks to sectors instead",
+                           (unsigned)written, (unsigned)len, fr_name(fc), serial_link_errno_name(s_dev.last_err));
+            rc = write_uf2_raw(job, &m, busid, data, len, devnum);
+            /* A UF2 copy should not fail: say so, so it gets fixed. */
+            cJSON_AddBoolToObject(rescue_job_result(job), "file_copy_failed", true);
         } else {
             rc = rescue_job_fail(job, "write failed after %u of %u bytes: %s (%s; SCSI 0x%02x lba %lu x%lu, %s phase after %lu bytes)",
                                  (unsigned)written, (unsigned)len, fr_name(fc), serial_link_errno_name(s_dev.last_err),
