@@ -3,8 +3,8 @@ name: Build
 on:
   push:
     branches: [main, s31-function-coreboard-ethernet]
+  # Every PR, including stacked ones whose base is another feature branch.
   pull_request:
-    branches: [main, s31-function-coreboard-ethernet]
   workflow_dispatch:
 
 jobs:
