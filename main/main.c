@@ -6,6 +6,7 @@
 #include "nvs_flash.h"
 
 #include "analog_mux.h"
+#include "capture.h"
 #include "controller_api.h"
 #include "hub_control.h"
 #include "device_naming.h"
@@ -81,6 +82,8 @@ void app_main(void)
 #endif
     ESP_ERROR_CHECK(discovery_service_start());
     ESP_ERROR_CHECK(usbip_server_start());
+    /* Serial capture: armed ports, the watcher and the TCP stream server. */
+    capture_init();
 
     ESP_LOGI(TAG, "USB/IP bridge started");
 }

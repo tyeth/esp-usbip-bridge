@@ -38,6 +38,7 @@ vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
 
 answers['GET /api/rescue/files'] = [200, { files: [{ name: 'app.bin', size: 1000, age_s: 1, in_use: false }], used: 1000, space: 9000000 }];
+answers['GET /api/capture'] = [200, { total_limit: 2097152, default_size: 262144, reserved: 0, captures: [], armed: [] }];
 answers['GET /api/status'] = [200, { active: null, duts: [{ name: 'feather-s3', group: 'g', channel: 1, active: false }], groups: [] }];
 answers['GET /api/usb/devices'] = [200, { devices: [] }];
 
@@ -65,7 +66,7 @@ for (const [name, info] of Object.entries(cases)) {
   try {
     vm.runInContext("rescueSel('1-1.2')", sandbox);
     const h = el('rinfo').innerHTML;
-    const want = { esp: ['Flash ESP', 'Serial monitor', 'Staged files', 'esp_usb_jtag_bootloader'],
+    const want = { esp: ['Flash ESP', 'Serial capture', 'Staged files', 'esp_usb_jtag_bootloader'],
                    imported: ['Imported over USB/IP', 'disabled'], bootsel: ['Load', 'Mass storage', 'Copy UF2'] }[name];
     for (const w of want) {
       if (!h.includes(w)) { console.log(`FAIL ${name}: missing "${w}"`); failed++; }

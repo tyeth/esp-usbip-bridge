@@ -317,6 +317,42 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
     }
     const bool verify = !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(args, "verify"));
     uint8_t cmd[32];
+    /* erase_all: wipe the whole flash first (old firmware, secrets, file
+       systems).  The size is not guessed: erasing past the end of the part
+       is undefined, and RP2040 cannot report it. */
+    bool erased = false;
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(args, "erase_all"))) {
+        const cJSON *fs = cJSON_GetObjectItemCaseSensitive(args, "flash_size");
+        uint32_t size = 0;
+        if (cJSON_IsNumber(fs)) {
+            size = (uint32_t)fs->valuedouble;
+        } else if (cJSON_IsString(fs)) {
+            char *end = NULL;
+            size = (uint32_t)strtoul(fs->valuestring, &end, 0);
+            if (end && (*end == 'M' || *end == 'm')) {
+                size <<= 20;
+            } else if (end && (*end == 'K' || *end == 'k')) {
+                size <<= 10;
+            }
+        }
+        if (size < PB_SECTOR || size > PB_FLASH_END - PB_FLASH_BASE || (size % PB_SECTOR)) {
+            rc = rescue_job_fail(job, "erase_all needs flash_size (e.g. \"2MB\", \"4MB\", \"16MB\"): the size of this board's flash");
+            goto done;
+        }
+        rescue_job_log(job, "erasing the whole flash: %lu KB", (unsigned long)(size >> 10));
+        const uint32_t step = 0x10000;
+        for (uint32_t off = 0; off < size; off += step) {
+            const uint32_t n = size - off < step ? size - off : step;
+            rescue_picoboot_range_cmd(RESCUE_PC_FLASH_ERASE, ++p.token, PB_FLASH_BASE + off, n, 0, cmd);
+            if (pb_exec(&p, cmd, NULL, NULL, 0, "erase") != 0) {
+                rc = rescue_job_fail(job, "erasing 0x%08lx failed", (unsigned long)(PB_FLASH_BASE + off));
+                goto done;
+            }
+            rescue_job_progress(job, 3 + (int)(20 * (off + n) / size), "erasing flash");
+        }
+        erased = true;
+        cJSON_AddNumberToObject(rescue_job_result(job), "erased", size);
+    }
     const int64_t t0 = esp_timer_get_time();
     for (size_t k = 0; k < nsec && rc == 0; k++) {
         if (rescue_job_cancelled(job)) {
@@ -350,7 +386,7 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
                 covered |= 1u << pg;
             }
         }
-        if (covered != 0xFFFF) {
+        if (covered != 0xFFFF && !erased) {
             /* Keep the parts of this sector the image does not cover. */
             rescue_picoboot_range_cmd(RESCUE_PC_READ, ++p.token, s, PB_SECTOR, PB_SECTOR, cmd);
             if (pb_exec(&p, cmd, NULL, rd, PB_SECTOR, "read sector") != 0) {
@@ -364,7 +400,7 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
             }
         }
         rescue_picoboot_range_cmd(RESCUE_PC_FLASH_ERASE, ++p.token, s, PB_SECTOR, 0, cmd);
-        if (pb_exec(&p, cmd, NULL, NULL, 0, "erase") != 0) {
+        if (!erased && pb_exec(&p, cmd, NULL, NULL, 0, "erase") != 0) {
             rc = rescue_job_fail(job, "erasing sector 0x%08lx failed", (unsigned long)s);
             break;
         }
@@ -380,7 +416,7 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
                 break;
             }
         }
-        rescue_job_progress(job, 5 + (int)(90 * (k + 1) / nsec), "writing flash");
+        rescue_job_progress(job, (erased ? 25 : 5) + (int)((erased ? 70 : 90) * (k + 1) / nsec), "writing flash");
     }
     if (rc == 0) {
         const double secs = (double)(esp_timer_get_time() - t0) / 1e6;

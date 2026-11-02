@@ -22,6 +22,7 @@ typedef struct {
 } blob_t;
 
 static blob_t s_blobs[BLOB_SLOTS];
+static size_t s_reserved;           /* capture buffers (blob_reserve) */
 static SemaphoreHandle_t s_mutex;
 static portMUX_TYPE s_init_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -72,7 +73,7 @@ static blob_t *find_locked(const char *name, bool pending)
 
 static size_t used_locked(void)
 {
-    size_t n = 0;
+    size_t n = s_reserved;
     for (int i = 0; i < BLOB_SLOTS; i++) {
         if (s_blobs[i].data != NULL) {
             n += s_blobs[i].len;
@@ -88,6 +89,32 @@ static size_t space_locked(void)
     const size_t free_ps = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     const size_t ps_left = free_ps > BLOB_PSRAM_RESERVE ? free_ps - BLOB_PSRAM_RESERVE : 0;
     return cap_left < ps_left ? cap_left : ps_left;
+}
+
+void *blob_reserve(size_t size, const char *owner)
+{
+    (void)owner;
+    lock();
+    void *buf = NULL;
+    if (size > 0 && size <= space_locked()) {
+        buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf != NULL) {
+            s_reserved += size;
+        }
+    }
+    unlock();
+    return buf;
+}
+
+void blob_unreserve(void *buf, size_t size)
+{
+    if (buf == NULL) {
+        return;
+    }
+    lock();
+    heap_caps_free(buf);
+    s_reserved = s_reserved >= size ? s_reserved - size : 0;
+    unlock();
 }
 
 size_t blob_space(void)
@@ -233,6 +260,7 @@ cJSON *blob_list_json(void)
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddNumberToObject(j, "used", (double)used_locked());
+    cJSON_AddNumberToObject(j, "capture_reserved", (double)s_reserved);
     cJSON_AddNumberToObject(j, "space", (double)space_locked());
     unlock();
     cJSON_AddStringToObject(j, "note", "held in PSRAM, lost on reboot");

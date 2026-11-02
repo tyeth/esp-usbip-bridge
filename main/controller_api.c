@@ -20,6 +20,7 @@
 #include "busid_owner.h"
 #include "device_naming.h"
 #include "blob_store.h"
+#include "capture.h"
 #include "device_rescue.h"
 #include "esp_flasher.h"
 #include "msc_host.h"
@@ -1421,6 +1422,27 @@ static api_result_t core_device_tools(const char *method, const char *busid, con
         st = msc_rename(busid, json, &j);
     } else if (post && strcmp(rest, "/msc/mkdir") == 0) {
         st = msc_mkdir(busid, json, &j);
+    } else if (post && strcmp(rest, "/capture/start") == 0) {
+        st = capture_start(busid, json, &j);
+    } else if (post && strcmp(rest, "/capture/stop") == 0) {
+        st = capture_stop(busid, json, &j);
+    } else if (post && strcmp(rest, "/capture/send") == 0) {
+        int port = 0;
+        json_int(json, "port", &port);
+        st = capture_send(busid, port, json, &j);
+    } else if (get && strcmp(rest, "/capture") == 0) {
+        char v[24] = "";
+        uint64_t since = 0;
+        const int port = query_int(query, "port", 0);
+        if (query_str(query, "since", v, sizeof(v))) {
+            since = strtoull(v, NULL, 10);
+        } else if (query_str(query, "from", v, sizeof(v))) {
+            uint64_t oldest = 0, epoch = 0, total = 0;
+            capture_cursor_info(busid, port, &oldest, &epoch, &total);
+            since = strcmp(v, "epoch") == 0 ? epoch : strcmp(v, "tail") == 0 ? total : oldest;
+        }
+        query_str(query, "format", v, sizeof(v));
+        st = capture_poll(busid, port, since, query_int(query, "max", 16384), strcmp(v, "lines") == 0, &j);
     } else if (get && strcmp(rest, "/monitor") == 0) {
         char v[24] = "0";
         query_str(query, "since", v, sizeof(v));
@@ -1455,6 +1477,19 @@ static api_result_t core_rescue_files(const char *method, const char *name)
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
     return result(200, j);
+}
+
+static api_result_t core_capture(const char *method, const char *path, const cJSON *json)
+{
+    if (strcmp(path, "/api/capture") == 0 && is_method(method, "GET")) {
+        return result(200, capture_status_json());
+    }
+    if (strcmp(path, "/api/capture/config") == 0 && is_method(method, "POST")) {
+        cJSON *j = NULL;
+        const int st = capture_set_config(json, &j);
+        return result(st, j);
+    }
+    return fail(404, "GET /api/capture, POST /api/capture/config");
 }
 
 static api_result_t core_rescue_jobs(const char *method, const char *id_str)
@@ -1649,6 +1684,13 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/usb/devices/{busid}/msc/mkdir", true,  "Make a directory", "{\"path\":str}" },
     { "POST", "/api/usb/devices/{busid}/msc/write", true,  "Job: copy a staged file to the volume (replaces an existing file)", "{\"file\":str,\"path\":str}" },
     { "POST", "/api/usb/devices/{busid}/msc/read",  true,  "Job: copy a file off the volume into the staged files (then GET /api/rescue/files/{name})", "{\"path\":str,\"file\":str?}" },
+    { "POST", "/api/usb/devices/{busid}/capture/start", true, "Capture every serial function of the device into PSRAM (timestamped, follows resets / re-enumeration / port-count changes); arm: keep capturing it whenever it is present, across bridge reboots. baud: a rate, a list tried in order, or \"auto\" (UART bridges). source gpio_uart is planned (501)", "{\"size\":int?,\"baud\":int|[int|\"auto\"]|\"auto\",\"dtr\":bool?,\"rts\":bool?,\"arm\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/capture/stop", true, "Stop capturing (the buffer stays readable); disarm stops re-arming, clear frees the buffer", "{\"disarm\":bool?,\"clear\":bool?}" },
+    { "GET",  "/api/usb/devices/{busid}/capture",   false, "Captured output of one port: ?port=0&since=<cursor> | from=epoch|oldest|tail &max=<bytes>&format=lines (uptime timestamps). Answers carry next, epoch, epoch_cursor, uptime_ms", NULL },
+    { "POST", "/api/usb/devices/{busid}/capture/send", true, "Send text or hex to one captured port", "{\"port\":int?,\"text\":str}|{\"hex\":str}" },
+    { "GET",  "/api/rescue/capture/{busid}/{port}.log", false, "Download a port's whole buffer as a text file with [uptime] line timestamps", NULL },
+    { "GET",  "/api/capture",                       false, "Capture limits (total_limit, default_size), PSRAM reserved, armed ports and every capture with its ports and cursors; live streams on TCP 3241", NULL },
+    { "POST", "/api/capture/config",                true,  "Capture budget, saved in NVS: total_limit (all captures together, up to 12 MB) and default_size per port", "{\"total_limit\":int?,\"default_size\":int?}" },
     { "GET",  "/api/rescue/files",                  false, "Staged files (PSRAM, lost on reboot) with size and space left", NULL },
     { "PUT",  "/api/rescue/files/{name}",           true,  "Upload a staged file: the raw body (streamed into PSRAM; POST also accepted). Names [A-Za-z0-9._-]", "raw bytes" },
     { "GET",  "/api/rescue/files/{name}",           false, "Download a staged file", NULL },
@@ -2178,7 +2220,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
                        path_is(path, "/api/probe") || strncmp(path, "/api/auth", 9) == 0 ||
                        strncmp(path, "/api/settings", 13) == 0 ||
                        path_is(path, "/api/reboot") || strncmp(path, "/api/rescue/", 12) == 0 ||
-                       path_is(path, "/api/rescue/files") || path_is(path, "/api/rescue/jobs");
+                       path_is(path, "/api/rescue/files") || path_is(path, "/api/rescue/jobs") ||
+                       path_is(path, "/api/capture") || strncmp(path, "/api/capture/", 13) == 0;
     if (!known) {
         return false;
     }
@@ -2252,6 +2295,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
             seg[0] = '\0';
         }
         r = core_rescue_files(method, seg);
+    } else if (path_is(path, "/api/capture") || strncmp(path, "/api/capture/", 13) == 0) {
+        r = core_capture(method, path, json);
     } else if (path_is(path, "/api/rescue/jobs") || strncmp(path, "/api/rescue/jobs/", 17) == 0) {
         if (path[16] == '/') {
             take_segment(path + 17, seg, sizeof(seg));

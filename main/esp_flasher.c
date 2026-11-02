@@ -423,6 +423,13 @@ static void espf_after(espf_t *f, rescue_job_t *job, const cJSON *args)
         rescue_job_log(job, "staying in the %s", f->stub ? "flasher stub" : "bootloader");
         return;
     }
+    if (cJSON_GetObjectItemCaseSensitive(args, "capture_after") != NULL) {
+        /* Reset once the capture is reading, so the first boot is recorded. */
+        rescue_job_log(job, "hard reset deferred until the capture is running");
+        cJSON_AddStringToObject(rescue_job_result(job), "deferred_reset",
+                                f->link.caps.esp_usb_jtag ? "esp_usb_jtag_reset" : "esp_hard_reset");
+        return;
+    }
     rescue_job_log(job, "hard resetting");
     esp_loader_reset_target(&f->loader);
 }

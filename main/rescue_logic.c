@@ -825,6 +825,46 @@ uint32_t rescue_samba_flash_size(uint32_t nvm_param, uint32_t *page_size)
 }
 
 /* ===========================================================================
+ *  Auto-baud
+ * ======================================================================== */
+
+static size_t utf8_seq_len(const uint8_t *p, size_t n);
+
+/* 115200 first (ESP ROM and most firmware), then the fast rates a test
+   build may use, then the slow ones; 74880 is the ESP8266/ESP32 ROM rate. */
+const uint32_t k_rescue_auto_bauds[] = {
+    115200, 921600, 460800, 230400, 74880, 57600, 38400, 19200, 9600, 2000000, 1500000, 1000000,
+};
+const int k_rescue_num_auto_bauds = (int)(sizeof(k_rescue_auto_bauds) / sizeof(k_rescue_auto_bauds[0]));
+
+int rescue_baud_score(const uint8_t *buf, size_t len)
+{
+    if (len < 8) {
+        return -1;
+    }
+    size_t good = 0;
+    size_t i = 0;
+    while (i < len) {
+        const uint8_t b = buf[i];
+        if ((b >= 0x20 && b < 0x7F) || b == '\r' || b == '\n' || b == '\t' || b == 0x1B /* ANSI colour */) {
+            good++;
+            i++;
+            continue;
+        }
+        if (b >= 0xC2 && b <= 0xF4) {           /* a valid UTF-8 sequence counts as text */
+            const size_t n = utf8_seq_len(&buf[i], len - i);
+            if (n > 0) {
+                good += n;
+                i += n;
+                continue;
+            }
+        }
+        i++;                                    /* NUL, 0xFF, stray high or control byte */
+    }
+    return (int)(good * 100 / len);
+}
+
+/* ===========================================================================
  *  Console helpers
  * ======================================================================== */
 

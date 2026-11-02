@@ -18,6 +18,12 @@
 
 #define BLOB_NAME_MAX   64
 
+/* One PSRAM budget for staged files and serial capture buffers: a capture
+   reserves its ring here so neither can starve the other.  reserve returns
+   the PSRAM (or NULL when it does not fit); release frees it. */
+void *blob_reserve(size_t size, const char *owner);
+void blob_unreserve(void *buf, size_t size);
+
 bool blob_name_valid(const char *name);
 /* Bytes that one more blob may take (PSRAM headroom and the store cap). */
 size_t blob_space(void);

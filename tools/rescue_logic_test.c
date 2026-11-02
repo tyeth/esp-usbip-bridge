@@ -495,8 +495,26 @@ static void test_samba(void)
     CHECK(c.family == NULL);
 }
 
+static void test_baud_score(void)
+{
+    const char *text = "I (2165) network: Installing Ethernet driver...\r\n";
+    CHECK_EQ(rescue_baud_score((const uint8_t *)text, strlen(text)), 100);
+    const uint8_t ansi[] = "\x1b[0;32mI (13) boot: ESP-IDF v6.2\x1b[0m\r\n";
+    CHECK(rescue_baud_score(ansi, sizeof(ansi) - 1) >= RESCUE_BAUD_SCORE_GOOD);
+    const uint8_t utf8[] = "temp 21.5 \xc2\xb0" "C ok \xe2\x82\xac\r\n";
+    CHECK(rescue_baud_score(utf8, sizeof(utf8) - 1) >= RESCUE_BAUD_SCORE_GOOD);
+    /* What 921600 text looks like when read at 115200: framing garbage. */
+    const uint8_t wrong[] = { 0x00, 0xF8, 0x80, 0x00, 0xFE, 0x78, 0x80, 0xF8, 0x00, 0x00, 0xE0, 0x86,
+                              0x1E, 0x00, 0xF0, 0x80, 0x98, 0x00, 0xFC, 0x06, 0x00, 0x60, 0x80, 0xF8 };
+    CHECK(rescue_baud_score(wrong, sizeof(wrong)) < RESCUE_BAUD_SCORE_BAD);
+    CHECK_EQ(rescue_baud_score((const uint8_t *)"abc", 3), -1);
+    CHECK_EQ(k_rescue_auto_bauds[0], 115200);
+    CHECK(k_rescue_num_auto_bauds >= 9);
+}
+
 int main(void)
 {
+    test_baud_score();
     test_picoboot_uf2();
     test_msc();
     test_samba();

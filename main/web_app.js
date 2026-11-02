@@ -755,12 +755,20 @@ function rescueRender() {
   }
 
   if (r.console) {
-    h += '<h2>Serial monitor</h2><p class="sub">Baud <input id="rmbaud" class="txt" type="number" value="115200" style="width:90px">' +
+    h += '<h2>Serial capture</h2><p class="sub">Baud <input id="rmbaud" class="txt" value="auto" size="14"' +
+         ' title="a rate, rates tried in order (921600,115200), or auto; auto/lists only matter on UART bridges">' +
+         ' buffer <input id="rmsize" class="txt" type="number" value="256" style="width:60px"> KB/port' +
          ' DTR ' + rTriSel('rmdtr') + ' RTS ' + rTriSel('rmrts') +
-         ' <button onclick="rMonStart()"' + dis + '>Start</button> <button onclick="rMonStop()">Stop</button>' +
+         ' <label><input type="checkbox" id="rmarm"> arm (always capture this port)</label>' +
+         ' <button onclick="rMonStart()"' + dis + '>Start</button> <button onclick="rMonStop(false)">Stop</button>' +
+         ' <button onclick="rMonStop(true)">Stop &amp; disarm</button><br>' +
+         'Port <select id="rmport" onchange="rMonSwitch()"><option>0</option></select>' +
+         ' <label><input type="checkbox" id="rmts" checked onchange="rMonSwitch()"> timestamps</label>' +
+         ' <a id="rmdl" href="#" style="color:#e94560">download log</a>' +
          ' <span id="rmst" class="muted">' + (r.monitor ? 'running' : 'stopped') + '</span><br>' +
-         '<span class="muted">Keeps reading in the background and follows the device through resets (the reset buttons above' +
-         ' work while it runs). USB/IP imports are refused while it runs.</span></p>' +
+         '<span class="muted">Captured into the bridge\'s PSRAM in the background (every serial port of the device, through resets' +
+         ' and re-enumeration, with [uptime s] timestamps); also live on TCP 3241: <code>echo "' + esc(r.busid) +
+         ':0 from=epoch ts" | nc &lt;bridge&gt; 3241</code>. Reset buttons work while it runs; USB/IP imports are refused.</span></p>' +
          '<pre id="rmout" class="con" style="height:260px"></pre>' +
          '<p class="sub"><input id="rmin" class="txt" size="40" onkeydown="if(event.key==\'Enter\')rMonSend()">' +
          ' <label><input type="checkbox" id="rmnl" checked> + CR LF</label> <button onclick="rMonSend()">Send</button>' +
@@ -778,7 +786,10 @@ function rescueRender() {
          '<button onclick="rEspAddImg()">+ image</button> before <select id="respbefore"><option>default_reset</option>' +
          '<option>usb_reset</option><option>no_reset</option></select> after <select id="respafter"><option>hard_reset</option>' +
          '<option>no_reset</option></select> baud <input id="respbaud" class="txt" type="number" value="460800" style="width:80px">' +
-         ' <label><input type="checkbox" id="resperase"> erase all</label> <label><input type="checkbox" id="respverify" checked> verify</label>' +
+         ' <label title="wipe the whole flash first: old firmware, NVS secrets, file systems"><input type="checkbox" id="resperase">' +
+         ' erase all</label> <label><input type="checkbox" id="respverify" checked> verify</label>' +
+         ' <label title="start a serial capture before the final reset, so the first boot is recorded">' +
+         '<input type="checkbox" id="respcap" checked> capture first boot</label>' +
          ' <button class="act" onclick="rEspFlash()"' + dis + '>Flash ESP</button> <button onclick="rJob(\'esp/info\',{})"' + dis + '>Chip info</button></p>';
     h += '<p class="sub"><strong>SAM-BA (bossac)</strong> <span class="muted">SAMD21/SAMD51 .bin; offset blank = after the bootloader</span><br>' +
          rFileSel('rsbfile') + ' offset <input id="rsboff" class="txt" size="8" placeholder="auto">' +
@@ -791,15 +802,19 @@ function rescueRender() {
     h += '<p class="sub"><strong>RP2040/RP2350 (picotool load)</strong> <span class="muted">UF2, or .bin at an address; enters BOOTSEL first</span><br>' +
          rFileSel('rpbfile') + ' address (.bin) <input id="rpbaddr" class="txt" size="10" placeholder="0x10000000">' +
          ' <label><input type="checkbox" id="rpbverify" checked> verify</label>' +
+         ' <label><input type="checkbox" id="rpberase"> erase all, flash size</label>' +
+         ' <input id="rpbsize" class="txt" size="6" placeholder="2MB">' +
          ' <button class="act" onclick="rJob(\'flash/picoboot\',{file:rVal(\'rpbfile\'),address:rVal(\'rpbaddr\')||undefined,' +
-         'verify:document.getElementById(\'rpbverify\').checked})"' + dis + '>Load</button>' +
+         'verify:document.getElementById(\'rpbverify\').checked,erase_all:document.getElementById(\'rpberase\').checked,' +
+         'flash_size:rVal(\'rpbsize\')||undefined,capture_after:{baud:\'auto\'}})"' + dis + '>Load</button>' +
          ' <button onclick="rJob(\'picoboot/info\',{})"' + dis + '>BOOTSEL info</button></p>';
   }
   h += '<p class="sub"><strong>UF2 drive</strong> <span class="muted">copy to the UF2 bootloader drive (enters the bootloader first if needed)</span><br>' +
        rFileSel('ruf2file') + ' <button class="act" onclick="rJob(\'flash/uf2\',{file:rVal(\'ruf2file\')})"' + dis + '>Copy UF2</button></p>';
 
   h += '<h2>Staged files</h2><p class="sub"><input type="file" id="rupfile"> as <input id="rupname" class="txt" size="20" placeholder="name">' +
-       ' <button onclick="rUpload()">Upload</button> <span id="rupst" class="muted"></span></p><div id="rfiles" class="sub"></div>';
+       ' <button onclick="rUpload()">Upload</button> <span id="rupst" class="muted"></span></p><div id="rfiles" class="sub"></div>' +
+       '<p class="sub" id="rcapcfg"></p>';
 
   if (r.mass_storage) {
     h += '<h2>Mass storage</h2><p class="sub">Path <input id="rmscpath" class="txt" size="30" value="/">' +
@@ -812,9 +827,11 @@ function rescueRender() {
   rEspImgs = rEspImgs.length ? rEspImgs : [{ file: '', offset: '0x0' }];
   rEspRenderImgs();
   rFiles();
+  rCapCfg();
   if (r.monitor && rMonBusid != rBusid) {
     rMonBusid = rBusid;
-    rMonNext = 0;
+    rMonNext = -1;
+    rMonPortN = 0;
     rMonPoll();
   }
 }
@@ -942,60 +959,112 @@ function rEspFlash() {
   rJob('flash/esp', {
     images: rEspImgs.map(function (i) { return { file: i.file, offset: i.offset }; }),
     before: rVal('respbefore'), after: rVal('respafter'), baud: parseInt(rVal('respbaud'), 10),
-    erase_all: document.getElementById('resperase').checked, verify: document.getElementById('respverify').checked
+    erase_all: document.getElementById('resperase').checked, verify: document.getElementById('respverify').checked,
+    capture_after: document.getElementById('respcap').checked ? { baud: 'auto' } : undefined
   });
 }
 
-/* --- serial monitor ------------------------------------------------------- */
-var rMonNext = 0, rMonTimer = null, rMonBusid = '';
+/* --- serial capture ------------------------------------------------------- */
+var rMonNext = -1, rMonTimer = null, rMonBusid = '', rMonPortN = 0;
+
+function rMonBauds() {
+  var v = rVal('rmbaud') || 'auto';
+  if (v == 'auto') return 'auto';
+  var list = v.split(',').map(function (x) { x = x.trim(); return x == 'auto' ? 'auto' : parseInt(x, 10); });
+  return list.length == 1 ? list[0] : list;
+}
+
+function rMonPort() { var e = document.getElementById('rmport'); return e ? (parseInt(e.value, 10) || 0) : 0; }
 
 function rMonStart() {
-  var body = { serial_baud: parseInt(rVal('rmbaud'), 10), port: rPort() };
+  var body = { baud: rMonBauds(), size: (parseInt(rVal('rmsize'), 10) || 256) * 1024,
+               arm: document.getElementById('rmarm').checked };
   var d = rTriVal('rmdtr'), t = rTriVal('rmrts');
   if (d !== undefined) body.dtr = d;
   if (t !== undefined) body.rts = t;
-  api('POST', rUrl('monitor/start'), body, function (ok, r) {
+  api('POST', rUrl('capture/start'), body, function (ok, r) {
     if (!ok) { alert((r && r.error) || 'failed'); return; }
-    rMonNext = r.cursor;
+    rMonNext = -1;                      /* from this epoch */
     rMonBusid = rBusid;
-    rMonPoll();
+    document.getElementById('rmout').textContent = '';
+    setTimeout(rMonPoll, 300);
   });
 }
 
-function rMonStop() {
+function rMonStop(disarm) {
   clearTimeout(rMonTimer);
-  api('POST', rUrl('monitor/stop'), null, function () {
+  api('POST', rUrl('capture/stop'), { disarm: !!disarm }, function (ok, r) {
     var s = document.getElementById('rmst');
-    if (s) s.textContent = 'stopped';
+    if (s) s.textContent = ok ? ('stopped' + (r.armed ? ' (still armed)' : '')) : ((r && r.error) || 'failed');
   });
+}
+
+function rMonSwitch() {
+  rMonNext = -1;
+  rMonBusid = rBusid;
+  document.getElementById('rmout').textContent = '';
+  rMonPoll();
 }
 
 function rMonPoll() {
   clearTimeout(rMonTimer);
   if (rMonBusid != rBusid || !document.getElementById('rmout')) return;
-  api('GET', rUrl('monitor') + '?since=' + rMonNext + '&max=8192', null, function (ok, r) {
+  var port = rMonPort(), ts = document.getElementById('rmts').checked;
+  var from = rMonNext < 0 ? 'from=epoch' : 'since=' + rMonNext;
+  document.getElementById('rmdl').href = '/api/rescue/capture/' + encodeURIComponent(rBusid) + '/' + port + '.log';
+  api('GET', rUrl('capture') + '?port=' + port + '&' + from + '&max=8192' + (ts ? '&format=lines' : ''), null, function (ok, r) {
     var o = document.getElementById('rmout'), s = document.getElementById('rmst');
-    if (!ok || !o) return;
+    if (!o) return;
+    if (!ok) { s.textContent = (r && r.error) || 'no capture'; return; }
     if (r.text) {
       var atEnd = o.scrollTop + o.clientHeight >= o.scrollHeight - 4;
-      o.textContent = (o.textContent + r.text).slice(-65536);
+      o.textContent = (o.textContent + r.text).slice(-131072);
       if (atEnd) o.scrollTop = o.scrollHeight;
     }
     rMonNext = r.next;
-    s.textContent = r.state + (r.dropped ? ' (output dropped: too slow)' : '') + (r.reconnects ? ', ' + r.reconnects + ' reconnect(s)' : '');
-    if (r.running) rMonTimer = setTimeout(rMonPoll, 400);
+    if (r.ports != rMonPortN) {         /* the device came back with a different number of ports */
+      rMonPortN = r.ports;
+      var sel = document.getElementById('rmport'), cur = sel.value, opts = '';
+      for (var i = 0; i < Math.max(1, r.ports); i++) opts += '<option>' + i + '</option>';
+      sel.innerHTML = opts;
+      sel.value = cur;
+    }
+    s.textContent = r.state + ', ' + r.device + ', epoch ' + r.epoch + ', ' + r.serial_baud + ' baud' +
+                    (r.auto_baud ? ' (auto)' : '') + (r.dropped ? ', output dropped (buffer wrapped)' : '') +
+                    (r.reconnects ? ', ' + r.reconnects + ' reconnect(s)' : '');
+    if (r.running || r.text) rMonTimer = setTimeout(rMonPoll, r.text ? 150 : 500);
   });
 }
 
 function rMonSend() {
   var t = document.getElementById('rmin').value + (document.getElementById('rmnl').checked ? '\r\n' : '');
-  api('POST', rUrl('monitor/send'), { text: t }, function (ok, r) {
+  api('POST', rUrl('capture/send'), { port: rMonPort(), text: t }, function (ok, r) {
     if (!ok) alert(r && r.error);
     else document.getElementById('rmin').value = '';
   });
 }
 
-function rMonSendRaw(hex) { api('POST', rUrl('monitor/send'), { hex: hex }, null); }
+function rMonSendRaw(hex) { api('POST', rUrl('capture/send'), { port: rMonPort(), hex: hex }, null); }
+
+function rCapCfg() {
+  api('GET', '/api/capture', null, function (ok, r) {
+    var e = document.getElementById('rcapcfg');
+    if (!ok || !e) return;
+    e.innerHTML = 'Capture budget: total <input id="rcaptot" class="txt" type="number" style="width:70px" value="' +
+      Math.round(r.total_limit / 1024) + '"> KB, default <input id="rcapdef" class="txt" type="number" style="width:60px" value="' +
+      Math.round(r.default_size / 1024) + '"> KB/port <button onclick="rCapCfgSave()">Save</button> <span class="muted">' +
+      Math.round(r.reserved / 1024) + ' KB in use by ' + r.captures.length + ' capture(s); armed: ' +
+      (r.armed.map(function (a) { return esc(a.busid); }).join(', ') || 'none') + '</span>';
+  });
+}
+
+function rCapCfgSave() {
+  api('POST', '/api/capture/config', { total_limit: parseInt(rVal('rcaptot'), 10) * 1024,
+                                       default_size: parseInt(rVal('rcapdef'), 10) * 1024 }, function (ok, r) {
+    if (!ok) alert(r && r.error);
+    rCapCfg();
+  });
+}
 
 /* --- mass storage ---------------------------------------------------------- */
 function rMscPath(name) {

@@ -232,6 +232,17 @@ void rescue_samba_chip(uint32_t cpuid, uint32_t device_id, uint32_t flash_size, 
 /* Flash size from NVMCTRL PARAM (0x41004008): NVMP pages of 8 << PSZ bytes. */
 uint32_t rescue_samba_flash_size(uint32_t nvm_param, uint32_t *page_size);
 
+/* Auto-baud: how much a burst of bytes looks like text received at the
+   right baud rate, 0-100 (-1 when there are too few bytes to tell).
+   Wrong rates show up as framing garbage: NULs, 0xFF, stray high bytes and
+   control characters, invalid UTF-8. */
+int rescue_baud_score(const uint8_t *buf, size_t len);
+#define RESCUE_BAUD_SCORE_GOOD 85   /* accept a candidate at or above this */
+#define RESCUE_BAUD_SCORE_BAD  50   /* re-probe a running stream below this */
+/* The rates tried by "auto", in order, after any the caller prefers. */
+extern const uint32_t k_rescue_auto_bauds[];
+extern const int k_rescue_num_auto_bauds;
+
 /* Console helpers */
 /* A named poke ("enter", "ctrl_c", "ctrl_d") into out; returns its length, -1 if unknown. */
 int rescue_named_poke(const char *name, uint8_t *out, size_t cap);

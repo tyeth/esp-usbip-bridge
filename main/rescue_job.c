@@ -13,6 +13,8 @@
 #include "freertos/task.h"
 
 #include "busid_owner.h"
+#include "capture.h"
+#include "device_rescue.h"
 #include "serial_monitor.h"
 
 static const char *TAG = "rescue_job";
@@ -179,6 +181,28 @@ static void job_task(void *arg)
     job->finished_us = esp_timer_get_time();
     s_running = NULL;
     unlock();
+    /* "capture_after": start capturing the device's serial output once the
+       job has let go of it (a freshly flashed board's first boot). */
+    const cJSON *after = cJSON_GetObjectItemCaseSensitive(job->args, "capture_after");
+    if (job->state == JOB_DONE && (cJSON_IsObject(after) || cJSON_IsTrue(after))) {
+        cJSON *res = NULL;
+        const int st = capture_start(job->busid, cJSON_IsObject(after) ? after : NULL, &res);
+        rescue_job_log(job, "capture_after: %s", st == 200 ? "capturing" : "could not start capture");
+        if (res != NULL) {
+            cJSON_AddItemToObject(rescue_job_result(job), "capture", res);
+        }
+        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(job->result, "deferred_reset");
+        if (st == 200 && cJSON_IsString(mode)) {
+            vTaskDelay(pdMS_TO_TICKS(500));         /* the capture opens the port */
+            cJSON *rargs = cJSON_CreateObject();
+            cJSON_AddStringToObject(rargs, "mode", mode->valuestring);
+            cJSON *rres = NULL;
+            const int rs = device_rescue_reset(job->busid, rargs, &rres);
+            rescue_job_log(job, "deferred %s: %s", mode->valuestring, rs == 200 ? "done" : "failed");
+            cJSON_Delete(rres);
+            cJSON_Delete(rargs);
+        }
+    }
     rescue_job_log(job, "%s", job->state == JOB_DONE ? "done" : "failed");
     vTaskDelete(NULL);
 }

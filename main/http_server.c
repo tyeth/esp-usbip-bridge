@@ -24,6 +24,7 @@
 
 #include "board_pins.h"
 #include "blob_store.h"
+#include "capture.h"
 #include "cJSON.h"
 #include "controller_api.h"
 #include "device_naming.h"
@@ -1496,6 +1497,49 @@ static void handle_rescue_file(int fd, const http_request_t *req, const char *he
     cJSON_Delete(j);
 }
 
+/* GET /api/rescue/capture/{busid}/{port}.log: everything still in the
+   port's buffer, "[uptime] " at each line start.  ?from=epoch for the
+   current epoch only. */
+static void handle_capture_download(int fd, const char *rest)
+{
+    char busid[32];
+    const char *slash = strchr(rest, '/');
+    if (slash == NULL || (size_t)(slash - rest) >= sizeof(busid)) {
+        send_status_json(fd, 400, "use /api/rescue/capture/<busid>/<port>.log");
+        return;
+    }
+    memcpy(busid, rest, (size_t)(slash - rest));
+    busid[slash - rest] = '\0';
+    const int port = atoi(slash + 1);
+    uint64_t oldest = 0, epoch = 0, total = 0;
+    if (!capture_cursor_info(busid, port, &oldest, &epoch, &total)) {
+        send_status_json(fd, 404, "no capture on that busid/port");
+        return;
+    }
+    uint64_t cursor = strstr(slash, "from=epoch") ? epoch : oldest;
+    char hdr[320];
+    /* No Content-Length: the size of the rendered text is not known up front. */
+    const int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Content-Disposition: attachment; filename=\"capture-%s-port%d.log\"\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n", busid, port);
+    int err = 0;
+    send_all(fd, hdr, hn, &err);
+    char *buf = malloc(4096);
+    while (buf != NULL && err == 0 && cursor < total) {
+        bool dropped = false;
+        const int n = capture_render(busid, port, &cursor, true, buf, 4096, &dropped);
+        if (n <= 0) {
+            break;
+        }
+        send_all(fd, buf, n, &err);
+    }
+    free(buf);
+}
+
 static void handle_connection(int fd)
 {
     char *buf = malloc(HTTP_BUF_SIZE);
@@ -1523,6 +1567,13 @@ static void handle_connection(int fd)
 
     http_request_t req;
     if (!parse_request(buf, total, &req)) { free(buf); http_400(fd, "Bad request"); return; }
+
+    /* A capture buffer as a timestamped log file, streamed from PSRAM. */
+    if (strncmp(req.url, "/api/rescue/capture/", 20) == 0 && strcmp(req.method, "GET") == 0) {
+        handle_capture_download(fd, req.url + 20);
+        free(buf);
+        return;
+    }
 
     /* Staged rescue files are streamed straight into and out of PSRAM:
        they are megabytes, the request buffers here are kilobytes. */

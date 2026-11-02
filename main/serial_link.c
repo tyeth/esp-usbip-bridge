@@ -250,7 +250,7 @@ void serial_link_close(serial_link_t *l)
     free(l->tx);
     l->tx = NULL;
     /* Free the data interface's host channels for USB/IP sessions. */
-    if (l->busid[0]) {
+    if (l->busid[0] && !l->keep_claims) {
         usb_backend_session_ended(l->busid);
     }
 }

@@ -34,6 +34,8 @@ typedef struct {
     rescue_config_t cfg;
     rescue_caps_t caps;
     cJSON *log;                 /* optional: control requests are appended here */
+    bool keep_claims;           /* close does not release the device's interfaces (a sibling
+                                   port of a composite device is still reading) */
 
     /* persistent bulk IN */
     usb_backend_req_t in_req;
