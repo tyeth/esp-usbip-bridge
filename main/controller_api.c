@@ -1980,7 +1980,7 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
     } else if (strncmp(path, "/api/usb/devices/", 17) == 0) {
         const char *rest = take_segment(path + 17, seg, sizeof(seg));
         if (*rest == '\0') {
-            r = is_method(method, "GET") ? core_device(seg) : fail(405, "use GET");
+            r = (is_method(method, "GET") || is_method(method, "HEAD")) ? core_device(seg) : fail(405, "use GET");
         } else if (strcmp(rest, "/rescue") == 0) {
             r = is_method(method, "GET") ? core_rescue_info(seg) : fail(405, "use GET");
         } else if (!is_method(method, "POST")) {
