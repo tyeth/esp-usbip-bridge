@@ -18,7 +18,9 @@ CONFIG_USBIP_S3_USB_SEL_GPIO=18
 # Disable virtual logic analyzer on this board
 # CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER is not set
 # The ESP32-S3-USB-OTG devkit has 8 MB flash; the firmware outgrew the
-# default 1 MB factory partition (CI caught the 0x1c400 overflow), so use
-# the large single-app table (1.5 MB factory).
+# default 1 MB factory partition (CI caught the 0x1c400 overflow), then the
+# large single-app table's 1.5 MB (device rescue + DUT file systems), so use
+# partitions-s3-usb-otg.csv: 4 MB factory, nvs/phy_init offsets unchanged.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-s3-usb-otg.csv"

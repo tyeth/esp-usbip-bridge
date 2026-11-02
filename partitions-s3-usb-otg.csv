@@ -1,0 +1,10 @@
+# ESP32-S3 USB-OTG bridge (8 MB flash).
+#
+# nvs and phy_init keep the offsets of the single-app tables, so a bridge keeps
+# its hostname, API token, port power states and mux topology; the factory app
+# grows from 1500 KB (single-app large) to 4 MB for the device rescue and DUT
+# flash/filesystem code.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 4M,
