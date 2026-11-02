@@ -32,6 +32,12 @@ void rescue_job_progress(rescue_job_t *job, int percent, const char *stage);
 int rescue_job_fail(rescue_job_t *job, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 /* The job's result object (created on first use; returned with the job). */
 cJSON *rescue_job_result(rescue_job_t *job);
+/* For a job that keeps running while it is polled: set or replace a result
+   key, or append to a result array (keeping the last `keep`, 0 = all), under
+   the job lock.  Takes `item`. */
+void rescue_job_result_set(rescue_job_t *job, const char *key, cJSON *item);
+void rescue_job_result_append(rescue_job_t *job, const char *key, cJSON *item, int keep);
+uint32_t rescue_job_id(const rescue_job_t *job);
 /* Set by DELETE /api/rescue/jobs/{id}: long loops should check and stop. */
 bool rescue_job_cancelled(const rescue_job_t *job);
 

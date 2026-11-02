@@ -806,11 +806,10 @@ esp_loader_error_t esp_loader_get_security_info(esp_loader_t *loader,
         (resp.flags & GET_SECURITY_INFO_HARD_DIS_JTAG) != 0;
     security_info->usb_disabled = (resp.flags & GET_SECURITY_INFO_DIS_USB) != 0;
 
-    uint32_t key_purposes_bit_cnt = 0;
-    for (size_t byte = 0; byte < sizeof(resp.key_purposes); byte++) {
-        key_purposes_bit_cnt += byte_popcnt(resp.key_purposes[byte]);
-    }
-    security_info->flash_encryption_enabled = key_purposes_bit_cnt % 2;
+    /* Bridge change: SPI_BOOT_CRYPT_CNT with an odd number of bits set means
+       flash encryption is on (esptool get-security-info); 2.1.0 counted the
+       key purpose bits instead. */
+    security_info->flash_encryption_enabled = byte_popcnt(resp.flash_crypt_cnt) % 2;
 
     security_info->dcache_in_uart_download_disabled =
         (resp.flags & GET_SECURITY_INFO_DIS_DOWNLOAD_DCACHE) != 0;

@@ -153,6 +153,43 @@ cJSON *rescue_job_result(rescue_job_t *job)
     return r;
 }
 
+void rescue_job_result_set(rescue_job_t *job, const char *key, cJSON *item)
+{
+    lock();
+    if (job->result == NULL) {
+        job->result = cJSON_CreateObject();
+    }
+    if (cJSON_HasObjectItem(job->result, key)) {
+        cJSON_ReplaceItemInObjectCaseSensitive(job->result, key, item);
+    } else {
+        cJSON_AddItemToObject(job->result, key, item);
+    }
+    unlock();
+}
+
+void rescue_job_result_append(rescue_job_t *job, const char *key, cJSON *item, int keep)
+{
+    lock();
+    if (job->result == NULL) {
+        job->result = cJSON_CreateObject();
+    }
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(job->result, key);
+    if (!cJSON_IsArray(arr)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(job->result, key);
+        arr = cJSON_AddArrayToObject(job->result, key);
+    }
+    cJSON_AddItemToArray(arr, item);
+    while (keep > 0 && cJSON_GetArraySize(arr) > keep) {
+        cJSON_DeleteItemFromArray(arr, 0);
+    }
+    unlock();
+}
+
+uint32_t rescue_job_id(const rescue_job_t *job)
+{
+    return job->id;
+}
+
 bool rescue_job_cancelled(const rescue_job_t *job)
 {
     return job->cancel;

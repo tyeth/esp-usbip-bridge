@@ -439,12 +439,83 @@ it is a UF2 bootloader), `GET .../msc/list?path=/lib`, `POST .../msc/delete
 `.../msc/write {"file": <staged>, "path"}` (create or replace) and `.../msc/read
 {"path", "file": <staged name>}` (then download it from the staged files).
 
-MCP tools: `rescue_start_job` (kind `esp_flash`, `esp_info`, `picoboot_load`,
-`picoboot_info`, `samba_flash`, `samba_info`, `uf2_copy`, `msc_write`, `msc_read`),
-`rescue_get_job`, `rescue_list_files`, `rescue_monitor`, `rescue_msc`.
+**Device flash: partitions and file systems through the bootloader.** The
+bridge reads a device's own flash through the bootloader it already talks to,
+maps it, reads partitions into staged files, and browses and edits the FAT,
+LittleFS or SPIFFS inside them. It is the MSC explorer for boards whose files
+live in their own flash: an Arduino LittleFS `secrets.json`, a CircuitPython
+or MicroPython file system, an ESP `ffat`.
 
-Not supported yet: PICOBOOT flashing of RAM-only UF2s and the RP2350 partition
-table / GET_INFO commands; SAM-BA without the Arduino extensions (genuine ROM
+| Platform | Through | Map | Writes |
+|---|---|---|---|
+| ESP32 family | esp-serial-flasher (stub) | the partition table at 0x8000, plus `flash`, `bootloader` and `partition_table` | yes |
+| RP2040 / RP2350 | PICOBOOT (enters BOOTSEL) | the RP2350 partition table (PICOBOOT `GET_INFO`); arduino-pico's layout words at 0x10002ff0 (`sketch`, `fs`, `eeprom`); otherwise a scan of 4 KB boundaries for a LittleFS superblock or a FAT boot sector (CircuitPython, MicroPython) | yes |
+| SAMD21 / SAMD51 | SAM-BA (1200-baud touch) | `bootloader`, `application`, and file systems found by the same scan | no: the Arduino `X` command erases from an address to the end of the flash, so there is no sector rewrite |
+
+Only internal flash is reachable: a SAMD51 board's QSPI flash (CIRCUITPY on a
+Metro M4) is not, through SAM-BA. With ESP flash encryption on, partitions are
+listed but not browsed (the loader reads ciphertext). RP2040 cannot report its
+flash size: arduino-pico's words give it, otherwise it is found by address
+mirroring, or give `flash_size`.
+
+File systems are found by content, never by label or subtype (Arduino's
+`spiffs` partition usually holds LittleFS):
+
+- **LittleFS**: block size, count and on-disk version come from the superblock.
+  Writes keep the device's on-disk version (no upgrade the firmware cannot read).
+  The prog size is the platform's (128 for arduino-esp32, 256 for arduino-pico)
+  when the first commit lines up with it.
+- **FAT**: FatFS with the BPB's sector size (512 as Adafruit_SPIFlash and TinyUSB
+  use, or 4096). FAT behind ESP-IDF wear levelling (Arduino `FFat`) is detected
+  and reported, not mounted.
+- **SPIFFS**: ESP-IDF's defaults (256-byte pages, 4 KB blocks, 32-byte names,
+  magic with length).
+
+A session is one job: `POST /api/usb/devices/{busid}/dutflash` connects, maps
+the flash into `result.regions`, runs the `ops` and, with `keep_open_s`, waits
+for more. Another POST adds its ops to the open session, so browsing does not
+reset the device each time. The device stays in its bootloader until the
+session closes (idle timeout, `POST .../dutflash/close`, or cancelling the job),
+then is reset to its app (`"after": "no_reset"` leaves it). `GET .../dutflash`
+says whether a session is open and its job.
+
+```json
+{"platform": "auto", "keep_open_s": 120,
+ "ops": [{"op": "fs_info", "part": "spiffs"},
+         {"op": "write", "part": "spiffs", "path": "/secrets.json", "file": "secrets.json"}]}
+```
+
+| op | args | result |
+|---|---|---|
+| `partitions` | | re-maps the flash |
+| `read_region` | `part` (name or index) or `offset` + `size`; `file` | the region as a staged file (`download`) |
+| `fs_info` | `part`, `path` | file system, `total`, `free`, the listing |
+| `list` | `part`, `path` | `files: [{name, dir, size}]` |
+| `read` | `part`, `path`, `file` | the file as a staged file |
+| `write` | `part`, `path`, `file` (staged) or `text` | creates or replaces it |
+| `delete`, `mkdir` | `part`, `path` | |
+| `rename` | `part`, `from`, `to` | |
+| `format` | `part`, `fs`: `littlefs`, `fat` or `spiffs`; `confirm: true` unless blank; `sector_size` (FAT) | the new file system |
+
+Each op's result is appended to `result.ops` (`index`, `ok`, `status`,
+`error`). Changes are made in a RAM shadow of the region (PSRAM, from the
+staged-file budget), then each 4 KB sector they touched is read, modified,
+erased and written back when the op ends: ESP writes are MD5-verified, PICOBOOT
+writes are read back. Read-only ops never write to the flash. Code and system
+regions (`app`, `bootloader`, `nvs`, `otadata`, `sketch`, `flash`) refuse
+file system writes and formatting without `"force": true`.
+The web page has this as **Device flash** on the rescue tab. MCP:
+`rescue_dut_flash` (`action: close` ends it), or `rescue_start_job` kind
+`dut_flash`.
+
+MCP tools: `rescue_start_job` (kind `esp_flash`, `esp_info`, `picoboot_load`,
+`picoboot_info`, `samba_flash`, `samba_info`, `uf2_copy`, `msc_write`, `msc_read`,
+`dut_flash`), `rescue_get_job`, `rescue_list_files`, `rescue_monitor`, `rescue_msc`,
+`rescue_dut_flash`.
+
+Not supported yet: PICOBOOT flashing of RAM-only UF2s and writing the RP2350
+partition table (it is read, through GET_INFO); FAT behind ESP-IDF wear levelling;
+file system writes through SAM-BA; SAM-BA without the Arduino extensions (genuine ROM
 SAM-BA, SAM3/SAM4); the ESP ROM-USB-OTG CDC (`303a:0002`, ESP32-S2/S3 download
 mode over native USB, which needs smaller RAM blocks for the stub upload);
 ESP8266; GPIO UART capture.

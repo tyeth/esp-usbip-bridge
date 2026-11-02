@@ -10,6 +10,11 @@ Copied unchanged except:
   `USB_RAM_BLOCK`), not 0x1800, so the stub uploads to an ESP32-S2/S3 in ROM
   USB-OTG download mode (`303a:0002`/`303a:0009`); the larger blocks fail there
   with "RAM write failed". Re-apply after an update.
+- `src/esp_loader.c`, `esp_loader_get_security_info()`: `flash_encryption_enabled`
+  is the parity of `flash_crypt_cnt` (SPI_BOOT_CRYPT_CNT), as esptool reports it;
+  2.1.0 took the parity of the key purpose bits, so an ESP32-C5 and an ESP32-C61
+  with plaintext flash reported encryption on.  Re-apply after an update unless
+  upstream fixed it.
 
 Also `idf_component.yml`, examples, tests and docs are
 left out. The manifest is dropped on purpose: 2.1.0 declares

@@ -25,13 +25,14 @@
 #define PB_CMD_TIMEOUT_MS   3000
 #define PB_BOOTSEL_WAIT_MS  6000
 
-typedef struct {
+struct pb_session {
     char busid[32];
     uint32_t devnum;
     rescue_caps_t caps;
     rescue_job_t *job;
     uint32_t token;
-} pb_t;
+};
+typedef struct pb_session pb_t;
 
 static int load_caps(pb_t *p)
 {
@@ -69,6 +70,10 @@ static void report_status(pb_t *p, const char *what)
         rescue_job_log(p->job, "%s: PICOBOOT status %lu %s", what, (unsigned long)code, rescue_picoboot_status_name(code));
     }
     ctrl(p, 0x41, 0x41, (uint16_t)p->caps.picoboot_if, NULL, 0);     /* PICOBOOT_IF_RESET */
+    /* The stalled bulk endpoint stays halted on the host side until cleared:
+       without this every later command failed with EPIPE too. */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_in, NULL, 0);            /* CLEAR_FEATURE(ENDPOINT_HALT) */
+    ctrl(p, 0x02, 0x01, p->caps.picoboot_ep_out, NULL, 0);
 }
 
 /* One command: 32-byte header OUT, data phase (OUT or IN), then the ACK in
@@ -471,4 +476,110 @@ done:
     free(rd);
     blob_release(file->valuestring);
     return rc;
+}
+
+/* ===========================================================================
+ *  A connection for the DUT flash browser
+ * ======================================================================== */
+
+pb_t *picoboot_open(rescue_job_t *job, const char *busid, const cJSON *args)
+{
+    pb_t *p = calloc(1, sizeof(*p));
+    if (p == NULL) {
+        rescue_job_fail(job, "out of memory");
+        return NULL;
+    }
+    p->job = job;
+    strlcpy(p->busid, busid, sizeof(p->busid));
+    if (ensure_bootsel(p, !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(args, "enter_bootsel"))) != 0 ||
+            pb_begin(p) != 0) {
+        usb_backend_session_ended(busid);
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+bool picoboot_is_rp2350(const pb_t *p)
+{
+    return p->caps.rp_chip == RESCUE_CHIP_RP2350;
+}
+
+int picoboot_read(pb_t *p, uint32_t addr, uint8_t *buf, uint32_t len)
+{
+    uint8_t cmd[32];
+    if ((addr | len) & (PB_PAGE - 1)) {
+        /* The bootrom reads flash in whole 256-byte pages (BAD_ALIGNMENT
+           otherwise): read the pages around it. */
+        const uint32_t a = addr & ~(PB_PAGE - 1);
+        const uint32_t n = ((addr + len + PB_PAGE - 1) & ~(PB_PAGE - 1)) - a;
+        uint8_t *bounce = malloc(n);
+        int rc = bounce ? picoboot_read(p, a, bounce, n) : -1;
+        if (rc == 0) {
+            memcpy(buf, bounce + (addr - a), len);
+        }
+        free(bounce);
+        return rc;
+    }
+    for (uint32_t pos = 0; pos < len; pos += PB_SECTOR) {
+        const uint32_t n = len - pos < PB_SECTOR ? len - pos : PB_SECTOR;
+        rescue_picoboot_range_cmd(RESCUE_PC_READ, ++p->token, addr + pos, n, n, cmd);
+        if (pb_exec(p, cmd, NULL, buf + pos, n, "read flash") != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int picoboot_write(pb_t *p, uint32_t addr, const uint8_t *buf, uint32_t len)
+{
+    uint8_t cmd[32];
+    uint8_t *rd = malloc(PB_SECTOR);
+    int rc = rd ? 0 : -1;
+    for (uint32_t pos = 0; rc == 0 && pos < len; pos += PB_SECTOR) {
+        const uint32_t s = addr + pos;
+        rescue_picoboot_range_cmd(RESCUE_PC_FLASH_ERASE, ++p->token, s, PB_SECTOR, 0, cmd);
+        rc = pb_exec(p, cmd, NULL, NULL, 0, "erase");
+        if (rc == 0) {
+            rescue_picoboot_range_cmd(RESCUE_PC_WRITE, ++p->token, s, PB_SECTOR, PB_SECTOR, cmd);
+            rc = pb_exec(p, cmd, buf + pos, NULL, PB_SECTOR, "write");
+        }
+        if (rc == 0) {
+            rescue_picoboot_range_cmd(RESCUE_PC_READ, ++p->token, s, PB_SECTOR, PB_SECTOR, cmd);
+            rc = pb_exec(p, cmd, NULL, rd, PB_SECTOR, "verify read");
+            if (rc == 0 && memcmp(rd, buf + pos, PB_SECTOR) != 0) {
+                rescue_job_log(p->job, "verify failed at 0x%08lx", (unsigned long)s);
+                rc = -1;
+            }
+        }
+    }
+    free(rd);
+    return rc;
+}
+
+int picoboot_get_info(pb_t *p, uint8_t type, const uint32_t params[3], uint8_t *buf, uint32_t len)
+{
+    uint8_t a[16] = { type };
+    for (int i = 0; i < 3; i++) {
+        a[4 + 4 * i] = (uint8_t)params[i];
+        a[5 + 4 * i] = (uint8_t)(params[i] >> 8);
+        a[6 + 4 * i] = (uint8_t)(params[i] >> 16);
+        a[7 + 4 * i] = (uint8_t)(params[i] >> 24);
+    }
+    uint8_t cmd[32];
+    rescue_picoboot_cmd(RESCUE_PC_GET_INFO, ++p->token, a, sizeof(a), len, cmd);
+    return pb_exec(p, cmd, NULL, buf, len, "get info");
+}
+
+void picoboot_close(pb_t *p, bool reboot)
+{
+    if (p == NULL) {
+        return;
+    }
+    if (reboot) {
+        rescue_job_log(p->job, "rebooting into the application");
+        pb_reboot(p);
+    }
+    usb_backend_session_ended(p->busid);
+    free(p);
 }

@@ -1,5 +1,5 @@
 set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns esp_driver_i2c
-                   fatfs esp-serial-flasher app_update esp_app_format esp_partition
+                   fatfs esp-serial-flasher app_update esp_app_format esp_partition littlefs spiffs
                    harness_io harness_scpi harness_dut harness_io_expander)
 
 set(srcs
@@ -31,6 +31,9 @@ set(srcs
     "msc_host.c"
     "ota_logic.c"
     "ota_update.c"
+    "dut_part_logic.c"
+    "dut_fs.c"
+    "dut_flash.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
@@ -70,6 +73,12 @@ idf_component_register(
     PRIV_REQUIRES ${req_components}
     EMBED_TXTFILES "web_app.js"
 )
+
+# dut_fs.c drives the SPIFFS core of ESP-IDF's spiffs component directly
+# (spiffs.h, and spiffs_api.h for the lock its SPIFFS_LOCK takes), which the
+# component keeps in private include directories.
+idf_component_get_property(spiffs_dir spiffs COMPONENT_DIR)
+target_include_directories(${COMPONENT_LIB} PRIVATE "${spiffs_dir}" "${spiffs_dir}/spiffs/src")
 
 # Syntax-check the embedded browser JS at build time when node is available.
 # This is best-effort: hosts without node simply skip the check so CI and

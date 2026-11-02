@@ -435,6 +435,7 @@ static int mount(const char *busid, mount_t *m, char *msg, size_t msg_len)
     if (fr != FR_OK) {
         snprintf(msg, msg_len, fr == FR_NO_FILESYSTEM ? "no FAT file system on the volume"
                                : "mount failed (FatFS error %d)", (int)fr);
+        f_mount(NULL, m->drive, 0);     /* a failed f_mount leaves the object registered: the next one writes to it */
         heap_caps_free(m->fs);
         m->fs = NULL;
         return fr == FR_NO_FILESYSTEM ? 409 : 502;
@@ -451,9 +452,8 @@ static void unmount(mount_t *m)
         m->fs = NULL;
     }
     meta_cache_end();
-    if (s_pdrv != 0xFF) {
-        ff_diskio_unregister(s_pdrv);
-    }
+    /* The drive stays registered (NOINIT while closed) so the DUT flash
+       browser's FatFS drive (dut_fs.c) is never given the same number. */
     if (s_dev.busid[0]) {
         usb_backend_session_ended(s_dev.busid);    /* release the claimed interface */
     }
