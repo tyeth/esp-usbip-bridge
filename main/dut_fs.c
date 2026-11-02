@@ -368,6 +368,9 @@ int dut_fs_mount(const dut_bd_t *bd, const dpl_fs_info_t *info, uint32_t lfs_pro
             st = fat_status(f_mount(fs->fat, fs->drive, 1), err, err_len);
         }
         if (st != 0) {
+            if (fs->fat != NULL) {
+                f_mount(NULL, fs->drive, 0);            /* FatFS keeps the object registered after a failed mount */
+            }
             heap_caps_free(fs->fat);
             fat_detach();
         }

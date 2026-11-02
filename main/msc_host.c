@@ -435,6 +435,7 @@ static int mount(const char *busid, mount_t *m, char *msg, size_t msg_len)
     if (fr != FR_OK) {
         snprintf(msg, msg_len, fr == FR_NO_FILESYSTEM ? "no FAT file system on the volume"
                                : "mount failed (FatFS error %d)", (int)fr);
+        f_mount(NULL, m->drive, 0);     /* a failed f_mount leaves the object registered: the next one writes to it */
         heap_caps_free(m->fs);
         m->fs = NULL;
         return fr == FR_NO_FILESYSTEM ? 409 : 502;
