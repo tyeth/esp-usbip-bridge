@@ -322,6 +322,10 @@ static uint32_t probe_baud(cap_dev_t *d, cap_link_t *cl, int port)
             best = cand[i];
         }
         if (score >= RESCUE_BAUD_SCORE_GOOD) {
+            /* Read at the right rate: keep it (the probe must not lose boot output). */
+            lock();
+            ring_put_locked(&d->ports[port], buf, got, false);
+            unlock();
             break;
         }
     }
