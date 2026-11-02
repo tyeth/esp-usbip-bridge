@@ -22,11 +22,15 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
+#include "busid_owner.h"
 #include "usb_backend.h"
 #include "usbip_protocol.h"
 #include "virtual_device.h"
 
 static const char *TAG = "usbip";
+
+/* OP_REP_IMPORT status: device busy (usbip_common.h ST_DEV_BUSY) */
+#define USBIP_ST_DEV_BUSY 2
 
 /* Track active client connections for debugging FD exhaustion. */
 static atomic_int active_connections;
@@ -952,7 +956,27 @@ static bool handle_import_request(int fd)
 
     ESP_LOGD(TAG, "IMPORT: device lookup %s (busid='%.32s')", found ? "FOUND" : "NOT FOUND", requested_busid);
 
+    /* The bridge's own rescue tools exclude a USB/IP session (and the
+       other way round): answer ST_DEV_BUSY while one runs on the device. */
+    if (found) {
+        char peer[48] = "usbip";
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        if (getpeername(fd, (struct sockaddr *)&addr, &addr_len) == 0) {
+            inet_ntoa_r(addr.sin_addr, peer, sizeof(peer));
+        }
+        busid_owner_info_t owner;
+        if (!busid_owner_try_begin(device.busid, BUSID_OWNER_USBIP, peer, &owner)) {
+            ESP_LOGW(TAG, "IMPORT: %s is busy (%s), refusing", device.busid, owner.peer);
+            (void)send_op_common(fd, USBIP_OP_REP_IMPORT, USBIP_ST_DEV_BUSY);
+            return true;
+        }
+    }
+
     if (!send_op_common(fd, USBIP_OP_REP_IMPORT, found ? 0 : 1)) {
+        if (found) {
+            busid_owner_end(device.busid, BUSID_OWNER_USBIP);
+        }
         ESP_LOGD(TAG, "IMPORT: failed to send reply header");
         return false;
     }
@@ -971,11 +995,14 @@ static bool handle_import_request(int fd)
     usbip_device_desc_t wire_device;
     fill_wire_device_desc(&device, &wire_device);
     if (!write_all(fd, &wire_device, sizeof(wire_device))) {
+        busid_owner_end(device.busid, BUSID_OWNER_USBIP);
         return false;
     }
 
     ESP_LOGD(TAG, "Client imported %s", device.busid);
-    return handle_urb_stream(fd, requested_busid, make_devid(&device));
+    const bool ret = handle_urb_stream(fd, requested_busid, make_devid(&device));
+    busid_owner_end(device.busid, BUSID_OWNER_USBIP);
+    return ret;
 }
 
 static void handle_client(int fd)

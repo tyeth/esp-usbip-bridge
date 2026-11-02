@@ -11,3 +11,8 @@ CONFIG_USBIP_ETH_MDC_GPIO=31
 CONFIG_USBIP_ETH_MDIO_GPIO=52
 CONFIG_USBIP_ETH_PHY_ADDR=1
 CONFIG_USBIP_ETH_PHY_RST_GPIO=51
+
+# The app outgrew the default 1 MB factory partition (device rescue, flashers,
+# FatFS).  The large single-app table keeps nvs at 0x9000 and phy_init at
+# 0xf000, so a bridge keeps its settings; the factory app grows to 1500 KB.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
