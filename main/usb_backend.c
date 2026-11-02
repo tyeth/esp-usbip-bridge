@@ -1,6 +1,7 @@
 #include "usb_backend.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -122,6 +123,8 @@ typedef struct {
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
     bool ep0_round_logged;          /* the control-IN MPS rounding quirk was logged once (issue #37) */
+    uint8_t *config_desc;           /* copy of the active configuration descriptor (malloc'd), or NULL */
+    uint16_t config_desc_len;
 } usb_backend_device_slot_t;
 
 typedef struct {
@@ -416,6 +419,7 @@ static void clear_slot_locked(int slot)
     /* Pipe slots are allocated dynamically per URB and freed by the
        caller — no per-device pipe state to clean up here. */
 
+    free(s_state.devices[slot].config_desc);
     memset(&s_state.devices[slot], 0, sizeof(s_state.devices[slot]));
 }
 
@@ -630,6 +634,19 @@ static void export_new_device(uint8_t address)
     resolve_topology(&dev_info, &device.parent_hub_addr, &device.parent_port,
                      port_path, sizeof(port_path));
 
+    /* Keep a copy of the configuration descriptor for the rescue tools
+       (interface numbers and endpoints), so they never call into the host
+       library from another task. */
+    uint8_t *config_copy = NULL;
+    uint16_t config_copy_len = 0;
+    if (config_desc != NULL && config_desc->wTotalLength > 0) {
+        config_copy = malloc(config_desc->wTotalLength);
+        if (config_copy != NULL) {
+            memcpy(config_copy, config_desc, config_desc->wTotalLength);
+            config_copy_len = config_desc->wTotalLength;
+        }
+    }
+
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
 
     strlcpy(device.busid, port_path, sizeof(device.busid));
@@ -648,6 +665,7 @@ static void export_new_device(uint8_t address)
     if (free_slot < 0) {
         xSemaphoreGive(s_state.state_mutex);
         ESP_LOGD(TAG, "No free export slots left (max=%d)", CONFIG_USBIP_MAX_DEVICES);
+        free(config_copy);
         usb_host_device_close(s_state.client_hdl, dev_hdl);
         return;
     }
@@ -659,6 +677,8 @@ static void export_new_device(uint8_t address)
            sizeof(s_state.devices[free_slot].claimed_interfaces));
     s_state.devices[free_slot].claim_failures = 0;
     s_state.devices[free_slot].last_claim_err = ESP_OK;
+    s_state.devices[free_slot].config_desc = config_copy;
+    s_state.devices[free_slot].config_desc_len = config_copy_len;
 
     /* Pipe slots are allocated dynamically per URB — no per-device
        pre-allocation needed. */
@@ -2008,36 +2028,43 @@ bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uin
     return false;
 }
 
-/* Diagnostics (issue #37): submit one control transfer through the same backend request
-   path as a forwarded EP0 request (usb_backend_submit -> admit -> prepare/round/submit ->
-   complete) and wait for its completion. The request and buffers stay on this stack until
-   done() has run; a transfer the device never answers is cancelled and waited for. */
+/* One transfer through usb_backend_submit(), waited for: the request and
+   buffers stay on this stack until done() has run.  A transfer still
+   pending at timeout_ms (a bulk IN with no data, a control request the
+   device never finishes) is cancelled, and done() is waited for, which
+   always follows a cancel. */
 typedef struct {
     SemaphoreHandle_t done;
     int status;
     size_t in_len;
     const char *error_detail;
-} debug_ctrl_t;
+} sync_xfer_t;
 
-static void debug_ctrl_done(usb_backend_req_t *req, int status, size_t in_len)
+static void sync_xfer_done(usb_backend_req_t *req, int status, size_t in_len)
 {
-    debug_ctrl_t *d = (debug_ctrl_t *)req->ctx;
+    sync_xfer_t *d = (sync_xfer_t *)req->ctx;
     d->status = status;
     d->in_len = in_len;
     d->error_detail = req->error_detail;
     xSemaphoreGive(d->done);
 }
 
-int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *setup,
-                              uint8_t *in_buf, size_t in_capacity,
+int usb_backend_transfer_sync(const char busid[32], uint8_t endpoint_addr,
+                              const usb_setup_packet_t *setup,
+                              const uint8_t *out_data, size_t out_len,
+                              uint8_t *in_buf, size_t in_capacity, uint32_t timeout_ms,
                               size_t *in_len, const char **error_detail)
 {
     if (!backend_started()) {
-        *in_len = 0;
-        *error_detail = NULL;
+        if (in_len != NULL) {
+            *in_len = 0;
+        }
+        if (error_detail != NULL) {
+            *error_detail = NULL;
+        }
         return -ENODEV;
     }
-    debug_ctrl_t d = {0};
+    sync_xfer_t d = {0};
     d.done = xSemaphoreCreateBinary();
     if (d.done == NULL) {
         return -ENOMEM;
@@ -2045,23 +2072,63 @@ int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *se
     usb_backend_req_t req;
     memset(&req, 0, sizeof(req));
     strlcpy(req.busid, busid, sizeof(req.busid));
-    req.endpoint_addr = 0;
-    req.setup = *setup;
+    req.endpoint_addr = endpoint_addr;
+    if (setup != NULL) {
+        req.setup = *setup;
+    }
+    req.out_data = out_data;
+    req.out_len = out_len;
     req.in_data = in_buf;
     req.in_capacity = in_capacity;
-    req.done = debug_ctrl_done;
+    req.done = sync_xfer_done;
     req.ctx = &d;
 
     usb_backend_submit(&req);
-    const TickType_t wait = pdMS_TO_TICKS(CONFIG_USBIP_CTRL_XFER_TIMEOUT_MS + USB_BACKEND_CANCEL_WAIT_MS + 2000);
-    if (xSemaphoreTake(d.done, wait) != pdTRUE) {
+    if (xSemaphoreTake(d.done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         usb_backend_cancel(&req);
         xSemaphoreTake(d.done, portMAX_DELAY);     /* done() always follows a cancel */
     }
     vSemaphoreDelete(d.done);
-    *in_len = d.in_len;
-    *error_detail = d.error_detail;
+    if (in_len != NULL) {
+        *in_len = d.in_len;
+    }
+    if (error_detail != NULL) {
+        *error_detail = d.error_detail;
+    }
     return d.status;
+}
+
+/* Diagnostics (issue #37): submit one control transfer through the same backend request
+   path as a forwarded EP0 request (usb_backend_submit -> admit -> prepare/round/submit ->
+   complete) and wait for its completion. */
+int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *setup,
+                              uint8_t *in_buf, size_t in_capacity,
+                              size_t *in_len, const char **error_detail)
+{
+    return usb_backend_transfer_sync(busid, 0, setup, NULL, 0, in_buf, in_capacity,
+                                     CONFIG_USBIP_CTRL_XFER_TIMEOUT_MS + USB_BACKEND_CANCEL_WAIT_MS + 2000,
+                                     in_len, error_detail);
+}
+
+size_t usb_backend_get_config_descriptor(const char busid[32], uint8_t *buf, size_t cap)
+{
+    if (busid == NULL || buf == NULL || !backend_started()) {
+        return 0;
+    }
+    char key[32] = {0};
+    strlcpy(key, busid, sizeof(key));
+    size_t n = 0;
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int slot = find_slot_by_busid_locked(key);
+    if (slot >= 0 && s_state.devices[slot].config_desc != NULL) {
+        n = s_state.devices[slot].config_desc_len;
+        if (n > cap) {
+            n = cap;
+        }
+        memcpy(buf, s_state.devices[slot].config_desc, n);
+    }
+    xSemaphoreGive(s_state.state_mutex);
+    return n;
 }
 
 void usb_backend_arm_ep0_dump(int dev_addr, int count)

@@ -222,7 +222,7 @@ Virtual devices are on bus 2.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/usb/devices` | VID/PID, manufacturer/product/serial strings, speed, MaxPower, interfaces, hub/port and port power state |
+| GET | `/api/usb/devices` | VID/PID, manufacturer/product/serial strings, speed, MaxPower, interfaces, hub/port and port power state, `imported` (a USB/IP client has it) and `owner` |
 | GET | `/api/usb/devices/{busid}` | one device, 404 when absent (presence check) |
 | GET | `/api/usb/hubs` | hubs with their decoded `wHubCharacteristics` (power switching `per-port`/`ganged`/`none`, over-current mode, compound, TT think time, port indicators, PwrOn2PwrGood, controller current) and every port's state, saved state and mismatch |
 | GET | `/api/ports`, `/api/ports/{port}` | flat port list (also at `/ports`) |
@@ -277,6 +277,68 @@ ESP32-S31-Function-CoreBoard-1, unset elsewhere). The bus needs external pull-up
 (about 4.7 kOhm); with only the internal ones `/api/probe` reports phantom
 devices.
 
+### Device rescue (interrogate, serial lines, reset, console peek)
+
+Each bridge can interrogate and rescue a device on its own, with no host tools:
+the web page's **Device Rescue** tab (or `http://<bridge>/#rescue=<busid>`, or
+the **Rescue** button on a USB Devices row) and these endpoints, which the HIL
+controller can call too. The bridge drives the device through its own USB host
+(control and bulk transfers on the same backend path as USB/IP).
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/usb/devices/{busid}/rescue` | identity, interfaces (numbers, classes, endpoints), `owner`/`imported`, the port's power state (**read-only**), the serial function (`cdc_acm`, `cp210x`, `ch34x`, `ftdi`, with interface numbers and endpoints), RP2 reset / PICOBOOT interfaces, the reset `modes` that apply, `bootloader_mode`, and the baud/DTR/RTS the bridge last set. No bus traffic |
+| POST | `/api/usb/devices/{busid}/serial` | `{"baud": int?, "dtr": bool?, "rts": bool?, "port": int?}`: line coding (8N1) and/or DTR and RTS, both lines in one request. A line not given keeps what the bridge last set (deasserted if never). 1200 baud needs `"allow_1200": true` |
+| POST | `/api/usb/devices/{busid}/reset` | `{"mode": str, "port": int?, "wait_ms": int?}`: run a reset sequence, then wait up to `wait_ms` (default 3000 when the device is expected to drop, max 10000) for it to re-enumerate and report `dropped` and `reenumerated` (VID:PID, product) |
+| POST | `/api/usb/devices/{busid}/console` | `{"serial_baud": 115200, "pokes": ["enter", "ctrl_c", "ctrl_d", {"hex": "0d0a"}], "settle_s": 1, "capture_s": 3, "dtr": bool?, "rts": bool?, "max_bytes": 4096, "port": int?}`: set the baud, optionally DTR/RTS, send the pokes `settle_s` apart while reading, capture `capture_s` more. Returns `text` (UTF-8, invalid bytes as `?`), `data_hex`, `bytes`, `truncated` and the controller's `serial_probe` `classification` (`silent`, `circuitpython_repl`, `micropython_repl`, `circuitpython_safe_mode`, `boot_banner_detected`, `other`) |
+
+Reset modes (`GET .../rescue` lists the ones that apply; the DTR/RTS ones can be
+sent to any serial function):
+
+| Mode | Device | What it does |
+|---|---|---|
+| `esp_bootloader` | ESP behind a UART bridge (CP210x, CH34x, FTDI, CH9102/CH343) with the DTR→IO0 / RTS→EN circuit | esptool's tight reset: (DTR,RTS) 00, 11, 01 for 100 ms, 10 for 50 ms, 00 — download mode |
+| `esp_hard_reset` | same | RTS (EN) pulse for 100 ms with IO0 high |
+| `esp_usb_jtag_bootloader` | ESP USB-Serial/JTAG `303a:1001` | esptool's USB-JTAG sequence: 00 100 ms, 10 100 ms, 11, 01 100 ms, 00 — download mode |
+| `esp_usb_jtag_reset` | `303a:1001` | 01 for 200 ms, 00, 200 ms |
+| `touch_1200` | CDC-ACM (RP2040/SAMD UF2, SAM-BA, Arduino native USB) | DTR+RTS on, line coding 1200 8N1, DTR+RTS off |
+| `rp_bootsel` / `rp_reboot` | pico-sdk reset interface (FF/00/01) | `RESET_REQUEST_BOOTSEL` / `RESET_REQUEST_FLASH`, as picotool sends them |
+| `picoboot_reboot` | RP2040/RP2350 in BOOTSEL (`2e8a:0003` / `000f`) | PICOBOOT interface reset, then `PC_REBOOT` (RP2040) or `PC_REBOOT2` normal (RP2350): back to the app |
+| `picoboot_bootsel` | RP2350 in BOOTSEL | `PC_REBOOT2` into BOOTSEL again |
+| `bootloader` | any | picks one: USB-Serial/JTAG → `esp_usb_jtag_bootloader`, reset interface → `rp_bootsel`, UART bridge or WCH CDC → `esp_bootloader`, other CDC → `touch_1200` |
+
+The line requests follow the Linux drivers: CDC `SET_LINE_CODING` /
+`SET_CONTROL_LINE_STATE`; CP210x `IFC_ENABLE`, `SET_LINE_CTL`, `SET_BAUDRATE`,
+`SET_MHS` with both write masks; CH34x version read, quirk probe and
+`SERIAL_INIT` once per enumeration, then the divisor/LCR registers and
+`MODEM_CTRL` (active low); FTDI `SET_BAUD_RATE` (232BM divisor, or the 120 MHz
+one on H-series), `SET_DATA`, `SET_FLOW_CTRL` and `MODEM_CTRL` with both masks
+(the two status bytes of every IN packet are stripped). FT232A/SIO baud rates
+are not supported. Multi-port bridges (CP2105, FT2232) and composite CDC
+devices take `port` (0 = first).
+
+Notes:
+
+- **Never changes port power.** The port's power state is reported only; switch
+  it on the Hubs & Power tab or with `/api/ports/{port}/...`.
+- **USB/IP excludes rescue and back.** Every POST is refused (`409`) while a
+  client has the device imported (`owner.kind == "usbip"`, with its address); an
+  import is answered `ST_DEV_BUSY` while a rescue action runs. Detach first.
+- **The console does not touch DTR/RTS unless asked** (some transitions reset an
+  ESP USB-Serial/JTAG chip). TinyUSB CDC devices send nothing until DTR is on:
+  pass `"dtr": true`. It never uses 1200 baud.
+- **The HTTP server handles one request at a time**, so a console peek blocks
+  the bridge API (not USB/IP) for up to 12 s: `capture_s` ≤ 10 and pokes ×
+  `settle_s` + `capture_s` ≤ 12. Resets wait at most 10 s.
+- After a peek the claimed data interface is released again, so its host
+  channels go back to USB/IP. A read that fails because no host channel was free
+  says so (see `/api/usb/claims`).
+- Failures after a reset's commit step (the device leaving the bus) are expected
+  and reported as `dropped`, not as errors. `requests` lists every control and
+  bulk transfer sent with its status.
+- The I2C strand-mux section stays as it was; the rescue panel links to it and
+  offers **Route strand here** when a mux DUT has the device's friendly name.
+
 ### Auth
 
 `POST /api/auth/token {"token": "..."}` sets a token (empty clears it). Once set,
@@ -290,7 +352,9 @@ JSON responses) with tools `list_usb_devices`, `get_usb_device`, `list_hubs`,
 `set_port_power`, `power_cycle_port`, `set_device_name`, `mux_status`,
 `mux_select`, `mux_isolate`, `mux_set_channel`, `mux_get_topology`,
 `mux_set_topology`, `get_port_power_settings`, `set_port_power_settings`,
-`set_enum_timeout`, `restore_port_power` and `get_bridge_info`. For example with Claude Code:
+`set_enum_timeout`, `restore_port_power`, `get_bridge_info` and the device
+rescue tools `rescue_device_info`, `rescue_serial_lines`, `rescue_reset_device`
+and `rescue_console_peek`. For example with Claude Code:
 
 ```bash
 claude mcp add --transport http usbip-bridge http://usbip-xxxxxx.local/mcp

@@ -17,7 +17,9 @@
 #include "sdkconfig.h"
 
 #include "analog_mux.h"
+#include "busid_owner.h"
 #include "device_naming.h"
+#include "device_rescue.h"
 #include "discovery_service.h"
 #include "hub_control.h"
 #include "port_events.h"
@@ -102,6 +104,7 @@ const char *controller_api_status_text(int status)
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
     default:  return "Internal Server Error";
     }
@@ -438,6 +441,16 @@ static cJSON *device_json(const usbip_backend_device_t *d, const hub_ctl_hub_sta
             cJSON_AddNullToObject(o, "hub");
             cJSON_AddNullToObject(o, "port");
         }
+    }
+    busid_owner_info_t owner;
+    const bool owned = busid_owner_get(d->busid, &owner);
+    cJSON_AddBoolToObject(o, "imported", owned && owner.kind == BUSID_OWNER_USBIP);
+    if (owned) {
+        cJSON *ow = cJSON_AddObjectToObject(o, "owner");
+        cJSON_AddStringToObject(ow, "kind", owner.kind == BUSID_OWNER_USBIP ? "usbip" : "rescue");
+        cJSON_AddStringToObject(ow, "peer", owner.peer);
+    } else {
+        cJSON_AddNullToObject(o, "owner");
     }
     const hub_ctl_port_t *port = is_virtual ? NULL : find_port(snap, n_hubs, d->busid);
     if (port) {
@@ -1280,6 +1293,36 @@ static api_result_t core_set_device_name(const char *busid, const char *name)
 
 /* --- analog mux (response shapes follow mux_api/server.py) --- */
 
+/* Device rescue (device_rescue.c): identity, serial line control, resets
+   and a console peek, refused while the device is imported over USB/IP. */
+static api_result_t core_rescue_info(const char *busid)
+{
+    cJSON *j = NULL;
+    const int st = device_rescue_info(busid, &j);
+    return result(st, j);
+}
+
+static api_result_t core_rescue_serial(const char *busid, const cJSON *args)
+{
+    cJSON *j = NULL;
+    const int st = device_rescue_serial(busid, args, &j);
+    return result(st, j);
+}
+
+static api_result_t core_rescue_reset(const char *busid, const cJSON *args)
+{
+    cJSON *j = NULL;
+    const int st = device_rescue_reset(busid, args, &j);
+    return result(st, j);
+}
+
+static api_result_t core_rescue_console(const char *busid, const cJSON *args)
+{
+    cJSON *j = NULL;
+    const int st = device_rescue_console(busid, args, &j);
+    return result(st, j);
+}
+
 static api_result_t core_mux_status(void)
 {
     return result(200, analog_mux_describe());
@@ -1431,6 +1474,10 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/schema",                        false, "This endpoint list", NULL },
     { "GET",  "/api/usb/devices",                   false, "Exported USB devices with descriptors, topology and port power state. busid is the Linux style port path used by usbip", NULL },
     { "GET",  "/api/usb/devices/{busid}",           false, "One device; 404 when absent (presence check)", NULL },
+    { "GET",  "/api/usb/devices/{busid}/rescue",    false, "Interrogate a device for rescue (no bus traffic): identity, interfaces with numbers and endpoints, owner (imported over USB/IP?), port power (read-only), serial function (cdc_acm, cp210x, ch34x, ftdi), RP2 reset/PICOBOOT interfaces, the reset modes that apply and the bridge's last-set baud/DTR/RTS", NULL },
+    { "POST", "/api/usb/devices/{busid}/serial",    true,  "Set line coding and/or DTR and RTS on the device's serial function (lines not given keep their last-set state). 409 while imported over USB/IP", "{\"baud\":int?,\"dtr\":bool?,\"rts\":bool?,\"port\":int?,\"allow_1200\":bool?}" },
+    { "POST", "/api/usb/devices/{busid}/reset",     true,  "Run a reset sequence: esp_bootloader, esp_hard_reset (classic DTR/RTS circuit), esp_usb_jtag_bootloader, esp_usb_jtag_reset (303a:1001), touch_1200, rp_bootsel, rp_reboot (RP2 reset interface), picoboot_reboot, picoboot_bootsel (RP2350), or bootloader (pick the fitting one). Waits up to wait_ms for the device to re-enumerate and reports what came back. 409 while imported over USB/IP", "{\"mode\":str,\"port\":int?,\"wait_ms\":int?}" },
+    { "POST", "/api/usb/devices/{busid}/console",   true,  "Console peek: set serial_baud (default 115200), optionally DTR/RTS, send pokes (enter, ctrl_c, ctrl_d or {hex}) settle_s apart, capture capture_s (max 10; the whole call max 12 s, blocking the bridge API) and return text (sanitised UTF-8), data_hex and the serial_probe classification. 409 while imported over USB/IP", "{\"serial_baud\":int?,\"pokes\":[str|{\"hex\":str}]?,\"settle_s\":num?,\"capture_s\":num?,\"dtr\":bool?,\"rts\":bool?,\"max_bytes\":int?,\"port\":int?}" },
     { "POST", "/api/devices/{busid}/name",          true,  "Set a friendly name for the device on a port", "{\"name\":str}" },
     { "GET",  "/api/usb/hubs",                      false, "Hubs with power switching mode and per-port status", NULL },
     { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
@@ -1509,6 +1556,32 @@ static const mcp_tool_t k_tools[] = {
       "path to pass to `usbip attach -r <bridge> -b <busid>`.", NO_ARGS },
     { "get_usb_device", "Details of one exported USB device. Errors if no device is on that port.",
       "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\",\"description\":\"Port path, e.g. 1-1.3\"}},\"required\":[\"busid\"]}" },
+    { "rescue_device_info",
+      "Interrogate one USB device for rescue without touching the bus: identity, interfaces, whether it is "
+      "imported over USB/IP (rescue actions are refused then), its port power (read-only), its serial function "
+      "(cdc_acm / cp210x / ch34x / ftdi), RP2040/RP2350 reset or PICOBOOT interfaces and the reset modes that apply.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"}},\"required\":[\"busid\"]}" },
+    { "rescue_serial_lines",
+      "Set the baud rate and/or DTR and RTS on a device's serial function (CDC-ACM, CP210x, CH34x, FTDI). "
+      "DTR/RTS not given keep their last-set state.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"baud\":{\"type\":\"integer\"},"
+      "\"dtr\":{\"type\":\"boolean\"},\"rts\":{\"type\":\"boolean\"},\"port\":{\"type\":\"integer\"}},\"required\":[\"busid\"]}" },
+    { "rescue_reset_device",
+      "Reset a device or put it into its bootloader without host tools: esp_bootloader / esp_hard_reset (DTR/RTS "
+      "auto-reset circuit behind a UART bridge), esp_usb_jtag_bootloader / esp_usb_jtag_reset (ESP USB-Serial/JTAG), "
+      "touch_1200 (UF2 / SAM-BA / Arduino), rp_bootsel / rp_reboot (RP2 reset interface), picoboot_reboot / "
+      "picoboot_bootsel (device in BOOTSEL), or bootloader to pick the fitting one. Reports whether the device "
+      "re-enumerated and as what. Never changes port power.",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},"
+      "\"port\":{\"type\":\"integer\"},\"wait_ms\":{\"type\":\"integer\"}},\"required\":[\"busid\",\"mode\"]}" },
+    { "rescue_console_peek",
+      "Open a device's serial console on the bridge, send optional pokes (enter, ctrl_c, ctrl_d or {hex}) and "
+      "capture the output for capture_s seconds (max 10). Returns the text, hex and a classification (silent, "
+      "circuitpython_repl, micropython_repl, circuitpython_safe_mode, boot_banner_detected, other).",
+      "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"serial_baud\":{\"type\":\"integer\",\"default\":115200},"
+      "\"pokes\":{\"type\":\"array\"},\"settle_s\":{\"type\":\"number\",\"default\":1},"
+      "\"capture_s\":{\"type\":\"number\",\"default\":3},\"dtr\":{\"type\":\"boolean\"},\"rts\":{\"type\":\"boolean\"},"
+      "\"max_bytes\":{\"type\":\"integer\"},\"port\":{\"type\":\"integer\"}},\"required\":[\"busid\"]}" },
     { "list_hubs",
       "List USB hubs with their power switching mode (per-port, ganged or none) and the state of every "
       "port: power, connection, speed, over-current and what is attached.", NO_ARGS },
@@ -1601,6 +1674,18 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
     }
     if (strcmp(name, "list_hubs") == 0) {
         return core_hubs();
+    }
+    if (strcmp(name, "rescue_device_info") == 0) {
+        return core_rescue_info(json_string(args, "busid"));
+    }
+    if (strcmp(name, "rescue_serial_lines") == 0) {
+        return core_rescue_serial(json_string(args, "busid"), args);
+    }
+    if (strcmp(name, "rescue_reset_device") == 0) {
+        return core_rescue_reset(json_string(args, "busid"), args);
+    }
+    if (strcmp(name, "rescue_console_peek") == 0) {
+        return core_rescue_console(json_string(args, "busid"), args);
     }
     if (strcmp(name, "set_port_power") == 0) {
         const char *port = json_string(args, "port");
@@ -1705,7 +1790,8 @@ static cJSON *mcp_dispatch(const cJSON *req)
             "USB/IP hardware-in-the-loop bridge. USB devices behind its hubs are exported over USB/IP "
             "(TCP 3240); attach them from Linux with `usbip attach -r <bridge> -b <busid>`. Use list_hubs "
             "and set_port_power/power_cycle_port to switch DUT power per hub port, and the mux_* tools to "
-            "route the shared I2C sensor chain to one DUT.");
+            "route the shared I2C sensor chain to one DUT. The rescue_* tools interrogate a device, set its serial "
+            "lines, reset it into its bootloader and peek at its console (refused while it is imported over USB/IP).");
         return r;
     }
     if (strcmp(method, "ping") == 0) {
@@ -1892,8 +1978,22 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
     } else if (path_is(path, "/api/usb/devices")) {
         r = core_devices();
     } else if (strncmp(path, "/api/usb/devices/", 17) == 0) {
-        take_segment(path + 17, seg, sizeof(seg));
-        r = core_device(seg);
+        const char *rest = take_segment(path + 17, seg, sizeof(seg));
+        if (*rest == '\0') {
+            r = is_method(method, "GET") ? core_device(seg) : fail(405, "use GET");
+        } else if (strcmp(rest, "/rescue") == 0) {
+            r = is_method(method, "GET") ? core_rescue_info(seg) : fail(405, "use GET");
+        } else if (!is_method(method, "POST")) {
+            r = fail(405, "use POST");
+        } else if (strcmp(rest, "/serial") == 0) {
+            r = core_rescue_serial(seg, json);
+        } else if (strcmp(rest, "/reset") == 0) {
+            r = core_rescue_reset(seg, json);
+        } else if (strcmp(rest, "/console") == 0) {
+            r = core_rescue_console(seg, json);
+        } else {
+            r = fail(404, "unknown device action (rescue, serial, reset, console)");
+        }
     } else if (path_is(path, "/api/usb/hubs")) {
         r = core_hubs();
     } else if (path_is(path, "/api/usb/enum_events")) {

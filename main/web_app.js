@@ -58,7 +58,7 @@ function spul(sel) {
 
 /* Switch between the GPIO-pins and USB-devices tabs. */
 function st(n) {
-  ['p', 'u', 'h', 'm'].forEach(function (x) {
+  ['p', 'u', 'h', 'm', 'r'].forEach(function (x) {
     document.getElementById('t' + x).className = '';
     document.getElementById('s' + x).className = 'sec';
   });
@@ -421,7 +421,9 @@ function loadDevs() {
       var pwr = d.virtual ? '<span class="muted">virtual</span>'
               : d.hub ? (esc(d.port_power_status || '?') + ' ' + powerButtons(d.busid))
               : '<span class="muted">root port</span>';
-      h += '<tr><td><strong>' + esc(d.busid) + '</strong></td>' +
+      var rb = d.virtual ? '' : ' <button onclick="rescueOpen(\'' + esc(d.busid) + '\')">Rescue</button>' +
+               (d.imported ? ' <span class="warn" title="imported over USB/IP">imported</span>' : '');
+      h += '<tr><td><strong>' + esc(d.busid) + '</strong>' + rb + '</td>' +
            '<td>' + esc(d.name) + '</td>' +
            '<td>' + esc(d.vid) + ':' + esc(d.pid) + '</td>' +
            '<td>' + esc(d.manufacturer) + ' ' + esc(d.product) + '</td>' +
@@ -590,6 +592,248 @@ function topoSave() {
   });
 }
 
+/* ---------------------------------------------------------------------
+ *  Device rescue: identity, serial lines, resets and a console peek run by
+ *  the bridge itself (/api/usb/devices/{busid}/rescue|serial|reset|console).
+ *  Nothing here polls: each request is a button press.  Port power is
+ *  shown read-only.
+ * ------------------------------------------------------------------- */
+var rBusid = '';
+var rInfo = null;
+var rDuts = [];
+
+function rescueOpen(busid) {
+  st('r');
+  rescueSel(busid);
+}
+
+function rescueDevList(sel) {
+  api('GET', '/api/usb/devices', null, function (ok, r) {
+    var e = document.getElementById('rdev');
+    if (!e || !ok) return;
+    var h = '<option value="">&mdash; pick a device &mdash;</option>';
+    r.devices.forEach(function (d) {
+      if (d.virtual) return;
+      h += '<option value="' + esc(d.busid) + '"' + (d.busid == sel ? ' selected' : '') + '>' +
+           esc(d.busid) + ' ' + esc(d.vid) + ':' + esc(d.pid) + ' ' + esc(d.product || d.manufacturer || '') +
+           (d.name ? ' (' + esc(d.name) + ')' : '') + (d.imported ? ' [imported]' : '') + '</option>';
+    });
+    e.innerHTML = h;
+  });
+}
+
+function rescueSel(busid) {
+  rBusid = busid || '';
+  try { history.replaceState(null, '', rBusid ? '#rescue=' + encodeURIComponent(rBusid) : '#'); } catch (e) {}
+  rescueDevList(rBusid);
+  rescueLoad();
+}
+
+function rescueLoad() {
+  var el = document.getElementById('rinfo');
+  if (!rBusid) { el.innerHTML = 'Pick a device'; return; }
+  api('GET', '/api/usb/devices/' + encodeURIComponent(rBusid) + '/rescue', null, function (ok, r) {
+    if (!ok) {
+      rInfo = null;
+      el.innerHTML = '<span class="lo">' + esc((r && r.error) || 'failed') + '</span>';
+      return;
+    }
+    rInfo = r;
+    /* mux DUT names, to offer routing the I2C strand to this device */
+    api('GET', '/api/status', null, function (ok2, m) {
+      rDuts = ok2 && m && m.duts ? m.duts : [];
+      rescueRender();
+    });
+  });
+}
+
+function rKv(k, v) { return '<tr><td>' + esc(k) + '</td><td>' + v + '</td></tr>'; }
+function rTri(v) { return v === null || v === undefined ? '?' : (v ? 'on' : 'off'); }
+function rTriSel(id) {
+  return '<select id="' + id + '"><option value="">leave</option><option value="1">on</option><option value="0">off</option></select>';
+}
+
+function rPortText(p) {
+  if (!p) return '';
+  if (p.power === null) return '<span class="muted">' + esc(p.note) + '</span>';
+  return '<span class="' + (p.power == 'on' ? 'hi' : 'lo') + '">' + esc(p.power) + '</span>' +
+         (p.over_current ? ' <span class="lo">OVER-CURRENT</span>' : '') +
+         ' <span class="muted">(saved ' + esc(p.saved) + '; read-only here: port power is switched on the Hubs &amp; Power tab)</span>';
+}
+
+function rSerialText(s) {
+  if (!s || s.kind == 'none') return '<span class="muted">none</span>';
+  return esc(s.kind) + (s.esp_usb_jtag ? ' (ESP USB-Serial/JTAG)' : '') +
+         ' &mdash; control if ' + s.control_interface + ', data if ' + s.data_interface +
+         ' (bulk in ' + esc(s.bulk_in) + ', out ' + esc(s.bulk_out) + ')' + (s.ports > 1 ? ', ' + s.ports + ' ports' : '') +
+         (s.baud_supported === false ? ' <span class="warn">baud not supported for this FTDI chip</span>' : '');
+}
+
+function rRpText(p) {
+  if (!p || (p.reset_interface < 0 && p.picoboot_interface < 0)) return '<span class="muted">none</span>';
+  return (p.reset_interface >= 0 ? 'reset interface ' + p.reset_interface + ' ' : '') +
+         (p.picoboot_interface >= 0 ? 'PICOBOOT interface ' + p.picoboot_interface + ' (' + esc(p.chip) + ', in BOOTSEL)' : '');
+}
+
+function rescueRender() {
+  var r = rInfo, el = document.getElementById('rinfo');
+  if (!r || !el) return;
+  var dis = r.owner ? ' disabled' : '';
+  var h = '';
+  if (r.owner) {
+    h += '<p class="sub warn">' + (r.owner.kind == 'usbip'
+      ? 'Imported over USB/IP by ' + esc(r.owner.peer) + ' &mdash; detach it (usbip detach) to use the actions below.'
+      : 'Busy: ' + esc(r.owner.peer)) + '</p>';
+  }
+  h += '<table class="kv"><tbody>' +
+       rKv('Device', esc(r.vid) + ':' + esc(r.pid) + ' ' + esc(r.manufacturer) + ' ' + esc(r.product)) +
+       rKv('Serial number', esc(r.serial)) +
+       rKv('Name', esc(r.name)) +
+       rKv('Speed / address', esc(r.speed) + ' / ' + esc(r.address)) +
+       rKv('bcdDevice / class', esc(r.bcd_device) + ' / ' + esc(r.device_class)) +
+       rKv('Port power', rPortText(r.port)) +
+       rKv('Serial function', rSerialText(r.serial)) +
+       rKv('RP2 interfaces', rRpText(r.rp)) +
+       '</tbody></table>';
+  h += '<table><thead><tr><th>If</th><th>Class</th><th>Subclass</th><th>Protocol</th><th>Endpoints</th></tr></thead><tbody>';
+  r.interfaces.forEach(function (i) {
+    var eps = [];
+    if (i.bulk_in) eps.push('bulk in ' + i.bulk_in);
+    if (i.bulk_out) eps.push('bulk out ' + i.bulk_out);
+    if (i.intr_in) eps.push('intr in ' + i.intr_in);
+    h += '<tr><td>' + i.number + '</td><td>' + esc(i['class']) + ' ' + esc(i.class_name) + '</td><td>' + esc(i.subclass) +
+         '</td><td>' + esc(i.protocol) + '</td><td>' + esc(eps.join(', ')) + '</td></tr>';
+  });
+  h += '</tbody></table>';
+
+  var dut = null;
+  rDuts.forEach(function (d) { if (r.name && d.name == r.name) dut = d; });
+  h += '<h2>I2C strand</h2><p class="sub">' + (dut
+      ? 'Mux DUT <strong>' + esc(dut.name) + '</strong> (' + esc(dut.group) + ':' + dut.channel + ')' +
+        (dut.active ? ' &mdash; connected' : '') +
+        ' <button onclick="muxSel(\'' + esc(dut.name) + '\');setTimeout(rescueLoad,500)">Route strand here</button>'
+      : '<span class="muted">No mux DUT is named after this device.</span>') +
+       ' <a href="#" onclick="st(\'m\');return false" style="color:#e94560">Open the I2C strand mux</a></p>';
+
+  if (r.serial && r.serial.kind != 'none') {
+    var ls = r.serial.last_set || {};
+    h += '<h2>Serial lines</h2><p class="sub">' +
+         (r.serial.ports > 1 ? 'Port <input id="rport" class="txt" type="number" min="0" max="' + (r.serial.ports - 1) +
+                               '" value="0" style="width:45px"> ' : '') +
+         'Baud <input id="rbaud" class="txt" type="number" value="' + esc(ls.baud || 115200) + '" style="width:90px">' +
+         ' <button onclick="rSetSerial(true,false)"' + dis + '>Set baud</button> &nbsp; ' +
+         '<label><input type="checkbox" id="rdtr"' + (ls.dtr ? ' checked' : '') + '> DTR</label> ' +
+         '<label><input type="checkbox" id="rrts"' + (ls.rts ? ' checked' : '') + '> RTS</label>' +
+         ' <button onclick="rSetSerial(false,true)"' + dis + '>Apply DTR/RTS</button>' +
+         ' <span class="muted">last set by the bridge: baud ' + esc(ls.baud === null || ls.baud === undefined ? '?' : ls.baud) +
+         ', DTR ' + rTri(ls.dtr) + ', RTS ' + rTri(ls.rts) + '</span> <span id="rserst" class="muted"></span></p>';
+  }
+
+  if (r.modes.length) {
+    h += '<h2>Reset / bootloader</h2><p class="sub">';
+    if (r.bootloader_mode) {
+      h += '<button class="act" onclick="rReset(\'bootloader\')"' + dis + '>Enter bootloader</button> <span class="muted">(' +
+           esc(r.bootloader_mode) + ')</span><br>';
+    }
+    r.modes.forEach(function (m) {
+      h += '<button onclick="rReset(\'' + esc(m.name) + '\')" title="' + esc(m.description) + '"' + dis + '>' + esc(m.name) + '</button> ';
+    });
+    h += '</p><pre id="rresout" class="con" style="display:none"></pre>';
+  }
+
+  if (r.console) {
+    h += '<h2>Console peek</h2><p class="sub">Baud <input id="rcbaud" class="txt" type="number" value="115200" style="width:90px">' +
+         ' Pokes <input id="rpokes" class="txt" value="enter" size="18" title="comma separated: enter, ctrl_c, ctrl_d, hex:0d0a">' +
+         ' settle <input id="rsettle" class="txt" type="number" step="0.1" min="0" value="1" style="width:50px"> s' +
+         ' capture <input id="rcap" class="txt" type="number" step="0.5" min="0" max="' + r.limits.capture_s_max +
+         '" value="3" style="width:50px"> s' +
+         ' DTR ' + rTriSel('rcdtr') + ' RTS ' + rTriSel('rcrts') +
+         ' <button onclick="rConsole()"' + dis + '>Peek</button> <span id="rconst" class="muted"></span><br>' +
+         '<span class="muted">DTR/RTS are left alone unless set here (some ESP USB-Serial/JTAG transitions reset the chip);' +
+         ' TinyUSB CDC sends nothing until DTR is on. The bridge API is blocked while it captures.</span></p>' +
+         '<pre id="rconout" class="con" style="display:none"></pre>';
+  }
+  el.innerHTML = h;
+}
+
+function rUrl(action) { return '/api/usb/devices/' + encodeURIComponent(rBusid) + '/' + action; }
+function rPort() { var e = document.getElementById('rport'); return e ? (parseInt(e.value, 10) || 0) : 0; }
+
+function rSetSerial(baud, lines) {
+  var body = { port: rPort() };
+  if (baud) body.baud = parseInt(document.getElementById('rbaud').value, 10);
+  if (lines) {
+    body.dtr = document.getElementById('rdtr').checked;
+    body.rts = document.getElementById('rrts').checked;
+  }
+  var s = document.getElementById('rserst');
+  s.textContent = '...';
+  api('POST', rUrl('serial'), body, function (ok, r) {
+    s.textContent = ok ? 'ok' : ((r && r.error) || 'failed');
+    if (ok) setTimeout(rescueLoad, 300);
+  });
+}
+
+function rReset(mode) {
+  if (!confirm('Run ' + mode + ' on ' + rBusid + '? The device may reset and re-enumerate.')) return;
+  var o = document.getElementById('rresout');
+  o.style.display = 'block';
+  o.textContent = 'running ' + mode + ' ...';
+  api('POST', rUrl('reset'), { mode: mode, port: rPort() }, function (ok, r) {
+    var t = (ok ? 'ok' : 'FAILED: ' + ((r && r.error) || '')) + '\n';
+    if (r) {
+      if (r.ran) t += 'ran: ' + r.ran + '\n';
+      if (r.dropped !== undefined) {
+        t += 'dropped off the bus: ' + r.dropped + (r.waited_ms !== undefined ? ' (waited ' + r.waited_ms + ' ms)' : '') + '\n';
+      }
+      if (r.reenumerated) {
+        t += 'came back as: ' + r.reenumerated.vid + ':' + r.reenumerated.pid + ' ' + r.reenumerated.product + '\n';
+      }
+      if (r.requests) t += r.requests.join('\n');
+    }
+    o.textContent = t;
+    rescueDevList(rBusid);
+    loadDevs();
+  });
+}
+
+function rPokes() {
+  var out = [];
+  document.getElementById('rpokes').value.split(',').forEach(function (p) {
+    p = p.trim();
+    if (!p) return;
+    out.push(p.indexOf('hex:') === 0 ? { hex: p.slice(4) } : p);
+  });
+  return out;
+}
+
+function rTriVal(id) {
+  var v = document.getElementById(id).value;
+  return v === '' ? undefined : v == '1';
+}
+
+function rConsole() {
+  var body = {
+    port: rPort(),
+    serial_baud: parseInt(document.getElementById('rcbaud').value, 10),
+    pokes: rPokes(),
+    settle_s: parseFloat(document.getElementById('rsettle').value),
+    capture_s: parseFloat(document.getElementById('rcap').value)
+  };
+  var d = rTriVal('rcdtr'), t = rTriVal('rcrts');
+  if (d !== undefined) body.dtr = d;
+  if (t !== undefined) body.rts = t;
+  var s = document.getElementById('rconst'), o = document.getElementById('rconout');
+  s.textContent = 'capturing ...';
+  api('POST', rUrl('console'), body, function (ok, r) {
+    s.textContent = ok ? (r.bytes + ' bytes, ' + r.classification + (r.truncated ? ' (truncated)' : '') +
+                          (r.warning ? ' - ' + r.warning : ''))
+                       : ((r && r.error) || 'failed');
+    o.style.display = 'block';
+    o.textContent = r && r.text !== undefined ? (r.text || '(nothing received)') : '';
+  });
+}
+
 /* Refresh pin values, wire names, directions and pull states on initial
    load.  Wire names are also pre-filled server-side in the HTML, but this
    keeps the live state (values/pulls) current too. */
@@ -599,6 +843,12 @@ authStatus();
 refreshUsb();
 loadMux();
 topoLoad();
+/* Deep link: http://<bridge>/#rescue=<busid> opens the rescue panel */
+(function () {
+  var m = /^#rescue=(.+)$/.exec(location.hash);
+  if (m) rescueOpen(decodeURIComponent(m[1]));
+  else rescueDevList('');
+})();
 setInterval(function () {
   var u = document.getElementById('su'), hb = document.getElementById('sh');
   if ((u && u.className.indexOf('on') >= 0) || (hb && hb.className.indexOf('on') >= 0)) refreshUsb();

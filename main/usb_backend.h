@@ -123,6 +123,21 @@ int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *se
                               uint8_t *in_buf, size_t in_capacity,
                               size_t *in_len, const char **error_detail);
 
+/* One transfer to a connected device through usb_backend_submit(), waited
+   for (control when endpoint_addr is 0, else bulk/interrupt).  A transfer
+   still pending after timeout_ms is cancelled (and its completion waited
+   for).  Returns 0 or a negative errno; -EIO from a bulk/interrupt transfer
+   can mean its interface could not be claimed (see usb_backend_get_claims). */
+int usb_backend_transfer_sync(const char busid[32], uint8_t endpoint_addr,
+                              const usb_setup_packet_t *setup,
+                              const uint8_t *out_data, size_t out_len,
+                              uint8_t *in_buf, size_t in_capacity, uint32_t timeout_ms,
+                              size_t *in_len, const char **error_detail);
+
+/* Copy of the device's active configuration descriptor (wTotalLength bytes,
+   at most cap), taken when it was exported.  Returns the length, 0 if none. */
+size_t usb_backend_get_config_descriptor(const char busid[32], uint8_t *buf, size_t cap);
+
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 
 /* The client's USB/IP session for a device has ended: release its claimed

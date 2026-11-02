@@ -16,6 +16,9 @@ set(srcs
     "port_events.c"
     "analog_mux.c"
     "controller_api.c"
+    "busid_owner.c"
+    "rescue_logic.c"
+    "device_rescue.c"
 )
 
 if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
