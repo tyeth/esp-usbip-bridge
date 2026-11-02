@@ -501,7 +501,8 @@ static void test_baud_score(void)
     CHECK_EQ(rescue_baud_score((const uint8_t *)text, strlen(text)), 100);
     const uint8_t ansi[] = "\x1b[0;32mI (13) boot: ESP-IDF v6.2\x1b[0m\r\n";
     CHECK(rescue_baud_score(ansi, sizeof(ansi) - 1) >= RESCUE_BAUD_SCORE_GOOD);
-    const uint8_t utf8[] = "temp 21.5 \xc2\xb0" "C ok \xe2\x82\xac\r\n";
+    const uint8_t utf8[] = "sensor temp 21.5 \xc2\xb0" "C ok, cost \xe2\x82\xac" "0\r\n";
+    CHECK_EQ(rescue_baud_score((const uint8_t *)"looks like text, 23 b\r\n", 23), -1);   /* too few to judge */
     CHECK(rescue_baud_score(utf8, sizeof(utf8) - 1) >= RESCUE_BAUD_SCORE_GOOD);
     /* What 921600 text looks like when read at 115200: framing garbage. */
     const uint8_t wrong[] = { 0x00, 0xF8, 0x80, 0x00, 0xFE, 0x78, 0x80, 0xF8, 0x00, 0x00, 0xE0, 0x86,

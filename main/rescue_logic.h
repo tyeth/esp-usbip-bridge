@@ -237,6 +237,7 @@ uint32_t rescue_samba_flash_size(uint32_t nvm_param, uint32_t *page_size);
    Wrong rates show up as framing garbage: NULs, 0xFF, stray high bytes and
    control characters, invalid UTF-8. */
 int rescue_baud_score(const uint8_t *buf, size_t len);
+#define RESCUE_BAUD_MIN_SAMPLE 24   /* fewer bytes: -1 (cannot tell) */
 #define RESCUE_BAUD_SCORE_GOOD 85   /* accept a candidate at or above this */
 #define RESCUE_BAUD_SCORE_BAD  50   /* re-probe a running stream below this */
 /* The rates tried by "auto", in order, after any the caller prefers. */

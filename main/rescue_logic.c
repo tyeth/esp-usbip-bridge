@@ -839,7 +839,9 @@ const int k_rescue_num_auto_bauds = (int)(sizeof(k_rescue_auto_bauds) / sizeof(k
 
 int rescue_baud_score(const uint8_t *buf, size_t len)
 {
-    if (len < 8) {
+    /* A few bytes read at a wrong rate can look like text by chance
+       (seen: 115200 output read at 19200), so judge only a real sample. */
+    if (len < RESCUE_BAUD_MIN_SAMPLE) {
         return -1;
     }
     size_t good = 0;

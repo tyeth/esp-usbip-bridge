@@ -593,6 +593,23 @@ void capture_halt(const char *busid)
     }
 }
 
+bool capture_wait_ready(const char *busid, uint32_t timeout_ms)
+{
+    const int64_t until = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < until) {
+        lock();
+        const cap_dev_t *d = find_locked(busid);
+        const bool ready = d != NULL && d->running && strcmp(d->state, "starting") != 0;
+        const bool gone = d == NULL || !d->running;
+        unlock();
+        if (ready || gone) {
+            return ready;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
 bool capture_active(const char *busid)
 {
     lock();

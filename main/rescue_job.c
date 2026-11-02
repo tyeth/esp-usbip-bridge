@@ -193,7 +193,12 @@ static void job_task(void *arg)
         }
         const cJSON *mode = cJSON_GetObjectItemCaseSensitive(job->result, "deferred_reset");
         if (st == 200 && cJSON_IsString(mode)) {
-            vTaskDelay(pdMS_TO_TICKS(500));         /* the capture opens the port */
+            /* Reset only once the capture is reading at its chosen rate: a
+               reset during the auto-baud probe let a wrong rate win. */
+            if (!capture_wait_ready(job->busid, 10000)) {
+                rescue_job_log(job, "capture not ready after 10 s, resetting anyway");
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
             cJSON *rargs = cJSON_CreateObject();
             cJSON_AddStringToObject(rargs, "mode", mode->valuestring);
             cJSON *rres = NULL;

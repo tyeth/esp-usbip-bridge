@@ -55,6 +55,9 @@ cJSON *capture_status_json(void);
 int capture_set_config(const cJSON *args, cJSON **out);
 
 bool capture_active(const char *busid);
+/* Wait until a just-started capture has its ports open and configured (the
+   auto-baud probe done), e.g. before resetting the device it watches. */
+bool capture_wait_ready(const char *busid, uint32_t timeout_ms);
 /* Stop a running capture (armed ports are restarted by the watcher later). */
 void capture_halt(const char *busid);
 
