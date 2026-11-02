@@ -24,6 +24,7 @@
 #include "device_rescue.h"
 #include "esp_flasher.h"
 #include "msc_host.h"
+#include "ota_update.h"
 #include "picoboot_flasher.h"
 #include "rescue_job.h"
 #include "samba_flasher.h"
@@ -374,6 +375,7 @@ static api_result_t core_info(void)
     }
     cJSON_AddStringToObject(j, "target", CONFIG_IDF_TARGET);
     cJSON_AddStringToObject(j, "version", HARNESS_FW_VERSION);
+    ota_update_add_summary(j);
     cJSON_AddNumberToObject(j, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(j, "free_heap", esp_get_free_heap_size());
     cJSON_AddBoolToObject(j, "auth_required", s_token[0] != '\0');
@@ -1731,6 +1733,9 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/auth",                          false, "Whether a token is required for mutating requests", NULL },
     { "POST", "/api/auth/token",                    true,  "Set the API token (empty string clears it)", "{\"token\":str}" },
     { "POST", "/api/reboot",                        true,  "Restart the bridge", NULL },
+    { "GET",  "/api/ota",                           false, "Firmware update status: running, boot and next OTA slot, each app slot's state (valid, pending_verify, invalid, aborted) and image (version, date, ELF SHA-256), the last rolled-back slot, the new image's confirm check and the last upload", NULL },
+    { "PUT",  "/api/ota",                           true,  "Firmware update: the raw app .bin as the body (Content-Length required), streamed into the next OTA slot; the image header, chip, project and size are checked before writing and the whole image is verified after. It boots on the next restart (?reboot=1 restarts now), pending verification: it confirms itself once Ethernet and HTTP are up, or rolls back. ?force=1 accepts another project's app. POST also accepted", "raw bytes" },
+    { "POST", "/api/ota/boot",                      true,  "Boot another app slot next (its image is verified first; an OTA slot boots pending verification, factory clears otadata)", "{\"partition\":\"factory|ota_0|ota_1\",\"reboot\":bool?}" },
     { "POST", "/mcp",                               true,  "Model Context Protocol endpoint (Streamable HTTP, JSON responses, stateless)", "JSON-RPC 2.0" },
 };
 
@@ -1770,6 +1775,10 @@ typedef struct {
 
 static const mcp_tool_t k_tools[] = {
     { "get_bridge_info", "Bridge identity, firmware version, uptime and whether auth is required.", NO_ARGS },
+    { "get_ota_status",
+      "Firmware update (OTA) status: running / boot / next slot, each app slot's state and image version, the "
+      "last rolled-back slot and the new image's confirm check. Upload new firmware with PUT /api/ota (raw .bin).",
+      NO_ARGS },
     { "list_usb_devices",
       "List USB devices exported over USB/IP with VID/PID, strings, serial, speed, topology "
       "(hub and port) and the power state of the port they are on. busid is the Linux style port "
@@ -1905,6 +1914,9 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
 {
     if (strcmp(name, "get_bridge_info") == 0) {
         return core_info();
+    }
+    if (strcmp(name, "get_ota_status") == 0) {
+        return result(200, ota_update_status_json());
     }
     if (strcmp(name, "list_usb_devices") == 0) {
         return core_devices();
@@ -2180,6 +2192,32 @@ static api_result_t core_reboot(void)
     return result(200, j);
 }
 
+/* POST /api/ota/boot {"partition":"ota_0","reboot":true} */
+static api_result_t core_ota_boot(const cJSON *json)
+{
+    const cJSON *p = cJSON_GetObjectItemCaseSensitive(json, "partition");
+    ota_update_err_t e = { 0 };
+    if (ota_update_set_boot(cJSON_IsString(p) ? p->valuestring : NULL, &e) != ESP_OK) {
+        api_result_t r = fail(e.status, e.message);
+        cJSON_AddStringToObject(r.json, "reason", e.error);
+        return r;
+    }
+    const bool reboot = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "reboot"));
+    if (reboot) {
+        cJSON_Delete(core_reboot().json);
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddStringToObject(j, "boot", p->valuestring);
+    cJSON_AddBoolToObject(j, "rebooting", reboot);
+    return result(200, j);
+}
+
+void controller_api_schedule_reboot(void)
+{
+    cJSON_Delete(core_reboot().json);
+}
+
 static bool is_method(const char *method, const char *m)
 {
     return strcmp(method, m) == 0;
@@ -2221,7 +2259,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
                        strncmp(path, "/api/settings", 13) == 0 ||
                        path_is(path, "/api/reboot") || strncmp(path, "/api/rescue/", 12) == 0 ||
                        path_is(path, "/api/rescue/files") || path_is(path, "/api/rescue/jobs") ||
-                       path_is(path, "/api/capture") || strncmp(path, "/api/capture/", 13) == 0;
+                       path_is(path, "/api/capture") || strncmp(path, "/api/capture/", 13) == 0 ||
+                       path_is(path, "/api/ota") || strncmp(path, "/api/ota/", 9) == 0;
     if (!known) {
         return false;
     }
@@ -2417,6 +2456,10 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         }
     } else if (path_is(path, "/api/reboot") && is_method(method, "POST")) {
         r = core_reboot();
+    } else if (path_is(path, "/api/ota") && is_method(method, "GET")) {
+        r = result(200, ota_update_status_json());
+    } else if (path_is(path, "/api/ota/boot") && is_method(method, "POST")) {
+        r = core_ota_boot(json);
     } else {
         r = mux_fail(404, "Not Found");
     }

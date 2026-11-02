@@ -1,8 +1,23 @@
-# ESP32-S31-Function-CoreBoard-1 (16 MB flash). nvs and phy_init keep the
-# offsets of the default single-app table, so a bridge keeps its hostname, API
-# token, port power states and mux topology when it moves to this table; the
-# factory app grows from 1 MB to 4 MB (flasher stubs, FatFS, MSC, monitor).
-# Name,   Type, SubType, Offset,  Size
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 4M,
+# ESP32-S31-Function-CoreBoard-1 (16 MB flash), with OTA updates.
+#
+# nvs and phy_init keep the offsets of the default single-app table, so a
+# bridge keeps its hostname, API token, port power states and mux topology
+# when it moves to this table.
+#
+# factory stays at 0x10000 (4 MB). It is the image written over the wire and
+# OTA never touches it, so:
+#  - right after the one wired migration flash (bootloader, this table, a blank
+#    otadata and the app at 0x10000) the bridge boots factory, the same as
+#    with the old table;
+#  - a first OTA image that fails its checks rolls back to factory, and
+#    POST /api/ota/boot {"partition":"factory"} goes back to it on purpose.
+# OTA updates alternate between ota_0 and ota_1 (4 MB each; the app is about
+# 1.1 MB). otadata cannot sit below 0x10000 (nvs and phy_init fill
+# 0x9000-0x10000), so it follows the app slots. 0xC12000-0xFFFFFF is unused.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  4M,
+ota_0,    app,  ota_0,   0x410000, 4M,
+ota_1,    app,  ota_1,   0x810000, 4M,
+otadata,  data, ota,     0xC10000, 0x2000,

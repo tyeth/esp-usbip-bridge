@@ -142,11 +142,14 @@ ESPPORT=$ESPPORT ./scripts/build-board.sh s31-function-coreboard-1 monitor
 ```
 
 The S31 build uses its own partition table (`partitions-s31-function-coreboard-1.csv`):
-a 4 MB factory app (the device rescue tools need more than the default 1 MB) with
-`nvs` and `phy_init` at the default offsets. A bridge moving to it from an older
-build needs the partition table written too (`0x8000`, which `flash` does);
-NVS (hostname, API token, port power states, mux topology, capture settings)
-is kept.
+a 4 MB factory app at `0x10000` (the device rescue tools need more than the
+default 1 MB), two 4 MB OTA slots (`ota_0` at `0x410000`, `ota_1` at
+`0x810000`) and `otadata` at `0xC10000`, with `nvs` and `phy_init` at the
+default offsets. NVS (hostname, API token, port power states, mux topology,
+capture settings) is kept across every table change. Once a bridge has this
+table it is updated over the network (see
+[Firmware updates over the network](#firmware-updates-over-the-network-ota));
+moving a bridge to it is one wired flash, described there.
 
 `components/esp-serial-flasher` is a vendored copy of Espressif's host-side
 flasher (see its `VENDORED.md` for why the registry package is not used).
@@ -446,6 +449,75 @@ SAM-BA, SAM3/SAM4); the ESP ROM-USB-OTG CDC (`303a:0002`, ESP32-S2/S3 download
 mode over native USB, which needs smaller RAM blocks for the stub upload);
 ESP8266; GPIO UART capture.
 
+### Firmware updates over the network (OTA)
+
+S31 bridges with the OTA partition table take a new app image over HTTP:
+
+```bash
+curl -T build-s31-function-coreboard-1/esp32p4_usbip_bridge.bin \
+     -H "Authorization: Bearer $TOKEN" "http://<bridge>/api/ota?reboot=1"
+curl http://<bridge>/api/ota
+```
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/ota` | running / boot / next slot, each app slot's state (`valid`, `pending_verify`, `invalid`, `aborted`, `null` for factory) and image (`version`, `date`, `time`, `elf_sha256`), `fw_version` (git describe + build time of the running image), `last_invalid` (the last slot rolled back), the new image's `confirm` check and the `last_upload` since boot |
+| PUT | `/api/ota` | the raw app `.bin` as the body (`Content-Length` required; POST also accepted). `?reboot=1` restarts into it after answering, `?force=1` accepts another project's app |
+| POST | `/api/ota/boot` | `{"partition": "factory" \| "ota_0" \| "ota_1", "reboot": true}`: boot another slot next (its image is verified first) |
+
+The upload is streamed straight into the next OTA slot (`ota_0` and `ota_1`
+alternate; `factory` is never written over the network). Before anything is
+written the image header is checked: an ESP image (`0xE9`), built for this
+chip, an app (has an app description, so a `bootloader.bin` or
+`partition-table.bin` is refused), the same project as the running app, and
+no larger than the slot. After the last byte `esp_ota_end()` verifies the
+whole image (checksum, SHA-256, chip revision) before the slot is made the
+boot partition. Errors answer `{"ok": false, "error", "reason"}` with 400
+(bad image), 413 (too big), 409 (the running image is still pending
+verification), 501 (no OTA slots: the old table). The HTTP server serves
+nothing else while it writes (about 1.1 MB), and USB/IP traffic can stall
+briefly during flash writes. The web page header has a Firmware update row.
+
+**Rollback.** A new image boots pending verification
+(`CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP`). It marks itself valid once
+`app_main` has started every service, a network interface has an address and
+its own HTTP server answers `GET /ping` over loopback (`confirm.state`
+`confirmed`, usually a few seconds after boot). If that has not happened
+`CONFIG_USBIP_OTA_CONFIRM_TIMEOUT_S` (90) seconds after boot, it marks itself
+invalid and reboots into the previous image; a crash or reset before then
+does the same through the bootloader. The previous image is the other OTA
+slot, or factory after the first update. So a bridge that is power-cycled
+with no Ethernet link right after an update goes back to the image it ran
+before, by design. `last_invalid` names the slot that was rolled back.
+
+The bootloader needs nothing new for this: with this ESP-IDF,
+`CONFIG_BOOTLOADER_APP_ROLLBACK` (the bootloader side) is on by default and
+already was in the single-factory builds; `..._CONFIRM_BY_APP` only changes
+the app (it drops IDF's automatic confirmation before `app_main`).
+
+**Moving a bridge to the OTA table: one wired flash.** The old table had a
+single factory app at `0x10000`; the bootloader at `0x2000` and the table at
+`0x8000` change, and `otadata` must start blank (the old table never owned
+`0xC10000`, so whatever bytes are there could look like OTA data). Flash all
+four from the build directory, e.g. through the bridge's USB-Serial/JTAG:
+
+```bash
+esptool --chip esp32s31 -p <port> -b 460800 --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
+  0x2000 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin \
+  0xC10000 ota_data_initial.bin 0x10000 esp32p4_usbip_bridge.bin
+```
+
+(`idf.py flash` writes the same four.) The bridge then boots `factory`, the
+image just written, keeps its NVS, and takes every later update with
+`PUT /api/ota`. The factory image stays as the fallback.
+
+**Wired app-only flashes after that.** Once a bridge boots an OTA slot, writing
+only the app at `0x10000` changes `factory`, which it does not boot. Erase
+`otadata` in the same esptool call (`erase-region 0xC10000 0x2000`, or write
+`ota_data_initial.bin` at `0xC10000`), or `POST /api/ota/boot
+{"partition": "factory"}` first.
+
 ### Auth
 
 `POST /api/auth/token {"token": "..."}` sets a token (empty clears it). Once set,
@@ -459,7 +531,7 @@ JSON responses) with tools `list_usb_devices`, `get_usb_device`, `list_hubs`,
 `set_port_power`, `power_cycle_port`, `set_device_name`, `mux_status`,
 `mux_select`, `mux_isolate`, `mux_set_channel`, `mux_get_topology`,
 `mux_set_topology`, `get_port_power_settings`, `set_port_power_settings`,
-`set_enum_timeout`, `restore_port_power`, `get_bridge_info` and the device
+`set_enum_timeout`, `restore_port_power`, `get_bridge_info`, `get_ota_status` and the device
 rescue tools `rescue_device_info`, `rescue_serial_lines`, `rescue_reset_device`
 and `rescue_console_peek`. For example with Claude Code:
 

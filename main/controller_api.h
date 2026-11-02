@@ -30,6 +30,9 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
 /* Whether a request carrying `auth` may mutate state (true when no token is set). */
 bool controller_api_authorized(const char *auth);
 
+/* Restart the bridge shortly (after the current response has gone out). */
+void controller_api_schedule_reboot(void);
+
 /* Reason phrase for an HTTP status code. */
 const char *controller_api_status_text(int status);
 
