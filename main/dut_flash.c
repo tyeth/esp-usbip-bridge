@@ -778,6 +778,7 @@ static cJSON *regions_json(df_t *df)
             } else if (r->fs.kind == DPL_FS_FAT) {
                 cJSON_AddNumberToObject(o, "fat_bits", r->fs.fat_bits);
                 cJSON_AddNumberToObject(o, "sector_size", r->fs.block_size);
+                cJSON_AddNumberToObject(o, "volume_size", (double)r->fs.block_size * r->fs.block_count);
                 cJSON_AddStringToObject(o, "label", r->fs.label);
             }
         }
@@ -1031,6 +1032,18 @@ static int op_fs(df_t *df, const char *op, const cJSON *a, op_t *o)
     if (writes && r->protect && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(a, "force"))) {
         dut_fs_unmount(fs);
         return op_fail(o, 409, "%s holds code or system data (force: true to write anyway)", r->name);
+    }
+    /* A FAT whose boot sector describes more than the region (left from an
+       older, larger partition): what lies past the end is not its own. */
+    const bool too_big = r->fs.kind == DPL_FS_FAT && (uint64_t)r->fs.block_size * r->fs.block_count > r->size;
+    if (too_big) {
+        cJSON_AddNumberToObject(o->res, "volume_size", (double)r->fs.block_size * r->fs.block_count);
+        cJSON_AddBoolToObject(o->res, "volume_exceeds_region", true);
+        if (writes) {
+            dut_fs_unmount(fs);
+            return op_fail(o, 409, "the FAT volume (%llu bytes) is larger than %s (%lu): reads only, or format it",
+                           (unsigned long long)r->fs.block_size * r->fs.block_count, r->name, (unsigned long)r->size);
+        }
     }
     const char *path = str_arg(a, "path");
     int st = 0;
