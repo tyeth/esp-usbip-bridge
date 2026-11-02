@@ -35,6 +35,8 @@
 #include "harness_dut.h"
 
 #include "neopixel.h"
+#include "ota_logic.h"
+#include "ota_update.h"
 
 /* Auto-generated firmware version (from git describe + build timestamp). */
 #include "version_autogen.h"
@@ -943,6 +945,11 @@ static void stream_html_page(stream_t *s)
         " <span id=\"authst\" class=\"muted\"></span>"
         " &mdash; <a href=\"/api/schema\" style=\"color:#888\">API</a>"
         " &middot; MCP at <code>/mcp</code></p>\n"
+        "<p class=\"sub\">Firmware update: <span id=\"otast\" class=\"muted\">&hellip;</span><br>"
+        "<input id=\"otafile\" type=\"file\" accept=\".bin\" style=\"font-size:0.7rem\">"
+        " <label class=\"muted\"><input type=\"checkbox\" id=\"otareboot\" checked> reboot into it</label>"
+        " <button onclick=\"otaUpload()\" style=\"font-size:0.7rem\">Upload app .bin</button>"
+        " <span id=\"otaprog\" class=\"muted\"></span></p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
@@ -1497,6 +1504,135 @@ static void handle_rescue_file(int fd, const http_request_t *req, const char *he
     cJSON_Delete(j);
 }
 
+/* Read and drop what is left of a request body, so a client that is still
+   sending sees the error answer rather than a reset connection. */
+static void drain_body(int fd, size_t left)
+{
+    char tmp[512];
+    const int64_t deadline = esp_timer_get_time() + 30 * 1000000LL;
+    while (left > 0 && esp_timer_get_time() < deadline) {
+        const int r = read(fd, tmp, left < sizeof(tmp) ? left : sizeof(tmp));
+        if (r <= 0) {
+            break;
+        }
+        left -= (size_t)r;
+    }
+}
+
+static void send_ota_error(int fd, const ota_update_err_t *e)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", false);
+    cJSON_AddStringToObject(j, "error", e->message);
+    cJSON_AddStringToObject(j, "reason", e->error ? e->error : "");
+    api_response_t r = { .status = e->status ? e->status : 500 };
+    r.body = cJSON_PrintUnformatted(j);
+    r.len = r.body ? strlen(r.body) : 0;
+    send_api_response(fd, &r);
+    cJSON_free(r.body);
+    cJSON_Delete(j);
+}
+
+/* PUT/POST /api/ota[?reboot=1][&force=1]: an app image as the raw body,
+   streamed into the next OTA slot (ota_update.c).  The headers are checked
+   before anything is written; the HTTP server serves nothing else meanwhile. */
+static void handle_ota_upload(int fd, const http_request_t *req, const char *head, size_t head_len)
+{
+    const size_t size = req->content_length > 0 ? (size_t)req->content_length : 0;
+    const char *start = memmem(head, head_len, "\r\n\r\n", 4);
+    size_t already = 0;
+    if (start != NULL) {
+        start += 4;
+        already = head + head_len - start;
+        if (already > size) {
+            already = size;
+        }
+    }
+    if (!controller_api_authorized(req->auth[0] ? req->auth : NULL)) {
+        drain_body(fd, size - already);
+        http_401(fd);
+        return;
+    }
+    if (size == 0) {
+        send_status_json(fd, 411, "Content-Length required (the app .bin is the raw request body)");
+        return;
+    }
+    const char *q = strchr(req->url, '?');
+    const bool reboot = ota_query_flag(q ? q + 1 : NULL, "reboot");
+    const bool force = ota_query_flag(q ? q + 1 : NULL, "force");
+    enum { CHUNK = 4096 };
+    uint8_t *buf = malloc(CHUNK);
+    if (buf == NULL) {
+        drain_body(fd, size - already);
+        send_status_json(fd, 503, "out of memory");
+        return;
+    }
+    if (already > 0) {
+        memcpy(buf, start, already);
+    }
+    size_t have = already;
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* The image header, first segment header and app description first. */
+    const size_t need = size < OTA_IMG_CHECK_LEN ? size : OTA_IMG_CHECK_LEN;
+    while (have < need) {
+        const size_t want = (size < CHUNK ? size : CHUNK) - have;
+        const int r = read(fd, buf + have, want);
+        if (r <= 0) {
+            break;
+        }
+        have += (size_t)r;
+    }
+    ota_update_err_t e = { 0 };
+    if (have < need) {
+        free(buf);
+        send_status_json(fd, 400, "upload ended early");
+        return;
+    }
+    if (ota_update_begin(size, buf, have, force, &e) != ESP_OK) {
+        free(buf);
+        drain_body(fd, size - have);
+        send_ota_error(fd, &e);
+        return;
+    }
+    size_t got = have;
+    esp_err_t err = ota_update_write(buf, have, &e);
+    while (err == ESP_OK && got < size) {
+        const size_t want = (size - got) < CHUNK ? (size - got) : CHUNK;
+        const int r = read(fd, buf, want);
+        if (r <= 0) {
+            break;
+        }
+        got += (size_t)r;
+        err = ota_update_write(buf, (size_t)r, &e);
+    }
+    free(buf);
+    if (err != ESP_OK) {
+        send_ota_error(fd, &e);             /* the write already aborted the update */
+        return;
+    }
+    if (got < size) {
+        ota_update_abort("upload ended early");
+        send_status_json(fd, 400, "upload ended early");
+        return;
+    }
+    cJSON *j = ota_update_end(&e);
+    if (j == NULL) {
+        send_ota_error(fd, &e);
+        return;
+    }
+    cJSON_AddBoolToObject(j, "rebooting", reboot);
+    api_response_t r = { .status = 200 };
+    r.body = cJSON_PrintUnformatted(j);
+    r.len = r.body ? strlen(r.body) : 0;
+    send_api_response(fd, &r);
+    cJSON_free(r.body);
+    cJSON_Delete(j);
+    if (reboot) {
+        controller_api_schedule_reboot();
+    }
+}
+
 /* GET /api/rescue/capture/{busid}/{port}.log: everything still in the
    port's buffer, "[uptime] " at each line start.  ?from=epoch for the
    current epoch only. */
@@ -1571,6 +1707,14 @@ static void handle_connection(int fd)
     /* A capture buffer as a timestamped log file, streamed from PSRAM. */
     if (strncmp(req.url, "/api/rescue/capture/", 20) == 0 && strcmp(req.method, "GET") == 0) {
         handle_capture_download(fd, req.url + 20);
+        free(buf);
+        return;
+    }
+
+    /* Firmware updates are streamed straight into the next OTA slot. */
+    if ((strcmp(req.url, "/api/ota") == 0 || strncmp(req.url, "/api/ota?", 9) == 0) &&
+            (strcmp(req.method, "PUT") == 0 || strcmp(req.method, "POST") == 0)) {
+        handle_ota_upload(fd, &req, buf, total);
         free(buf);
         return;
     }

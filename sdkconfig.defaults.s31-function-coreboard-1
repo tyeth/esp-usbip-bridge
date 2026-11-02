@@ -82,10 +82,18 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 # channels on demand, capped at 4 (bench opt-in; 0 keeps every interrupt channel static).
 CONFIG_USB_HOST_PARKED_INTR_BIND_CAP=4
 
-# 4 MB factory app (the default single-app table has 1 MB); nvs and phy_init
-# stay where they were. See partitions-s31-function-coreboard-1.csv.
+# 4 MB factory app plus two 4 MB OTA slots (the default single-app table has
+# 1 MB); nvs and phy_init stay where they were. See
+# partitions-s31-function-coreboard-1.csv.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-s31-function-coreboard-1.csv"
+
+# OTA rollback: the bootloader already supports it (BOOTLOADER_APP_ROLLBACK,
+# on by default). The app confirms a new image itself (main/ota_update.c) once
+# Ethernet has an address and the HTTP server answers, instead of IDF's
+# automatic confirmation before app_main; an image that never gets there is
+# marked invalid and the previous one boots.
+CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP=y
 
 # esp-serial-flasher: the device rescue flasher brings its own port (USB
 # serial through the bridge), none of the library's built-in ports.

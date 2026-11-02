@@ -15,6 +15,7 @@
 // #include "log_server.h"
 #include "neopixel.h"
 #include "network_init.h"
+#include "ota_update.h"
 #include "usb_backend.h"
 #include "usbip_server.h"
 
@@ -56,6 +57,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    /* A new OTA image confirms itself once the bridge is up, or rolls back
+       (its deadline counts from boot). */
+    ota_update_boot_check_start();
 
     ESP_ERROR_CHECK(network_init_start());
     // ESP_ERROR_CHECK(log_server_start());
@@ -85,5 +89,6 @@ void app_main(void)
     /* Serial capture: armed ports, the watcher and the TCP stream server. */
     capture_init();
 
+    ota_update_app_started();
     ESP_LOGI(TAG, "USB/IP bridge started");
 }

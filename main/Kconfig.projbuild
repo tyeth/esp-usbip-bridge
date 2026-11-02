@@ -406,6 +406,18 @@ config USBIP_NEOPIXEL_GPIO
         When the HTTP UI is loaded the neopixel briefly shows white as a
         visual indicator.
 
+config USBIP_OTA_CONFIRM_TIMEOUT_S
+    int "OTA: seconds a new image has to come up before it is rolled back"
+    range 20 600
+    default 90
+    help
+        After an OTA update (PUT /api/ota) the new image boots pending
+        verification. It marks itself valid once a network interface has an
+        IP address and its own HTTP server answers GET /ping. If that has not
+        happened this many seconds after boot, it marks itself invalid and
+        reboots into the previous image. Needs
+        CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP.
+
 endmenu
 
 menu "Analog I2C Mux Configuration"

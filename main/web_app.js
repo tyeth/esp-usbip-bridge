@@ -360,6 +360,69 @@ function authStatus() {
   });
 }
 
+/* -------------------------------------------------------------------
+ *  Firmware update (OTA): PUT the app .bin to /api/ota
+ * ------------------------------------------------------------------- */
+function otaText(r) {
+  if (!r.supported) return 'not available: this bridge has no OTA slots (needs the one wired migration flash)';
+  var run = null;
+  (r.partitions || []).forEach(function (p) { if (p.running) run = p; });
+  var t = 'running ' + r.running + (run && run.state ? ' (' + run.state + ')' : '') + ', ' + r.fw_version +
+          '; next update goes to ' + r.next_update;
+  if (r.confirm && r.confirm.state == 'waiting') t += '; new image waiting to confirm itself (network ' +
+      (r.confirm.network_up ? 'up' : 'down') + ', HTTP ' + (r.confirm.http_up ? 'up' : 'down') + ')';
+  if (r.confirm && r.confirm.state == 'confirmed') t += '; new image confirmed after ' +
+      Math.round(r.confirm.confirmed_after_ms / 1000) + ' s';
+  if (r.last_invalid) t += '; ' + r.last_invalid + ' was rolled back';
+  return t;
+}
+
+function otaStatus(cb) {
+  api('GET', '/api/ota', null, function (ok, r) {
+    var e = document.getElementById('otast');
+    if (e) e.textContent = ok && r ? otaText(r) : 'unknown';
+    if (cb) cb(ok, r);
+  });
+}
+
+/* After a reboot: wait for the bridge to answer, then until the new image
+   has confirmed itself (or rolled back). */
+function otaWait(st, tries) {
+  setTimeout(function () {
+    otaStatus(function (ok, r) {
+      if (ok && r && !(r.confirm && r.confirm.state == 'waiting')) {
+        st.textContent = 'back up on ' + r.running + (r.last_invalid ? ' (' + r.last_invalid + ' rolled back)' : '');
+        return;
+      }
+      st.textContent = ok ? 'up, confirming the new image ...' : 'rebooting ...';
+      if (tries > 0) otaWait(st, tries - 1);
+    });
+  }, 3000);
+}
+
+function otaUpload() {
+  var f = document.getElementById('otafile').files[0];
+  if (!f) { alert('Pick an app .bin (build/<project>.bin, not the bootloader or the partition table)'); return; }
+  var reboot = document.getElementById('otareboot').checked;
+  if (!confirm('Write ' + f.name + ' (' + f.size + ' bytes) to the next OTA slot' +
+               (reboot ? ' and reboot into it?' : '?'))) return;
+  var st = document.getElementById('otaprog');
+  var x = new XMLHttpRequest();
+  x.open('PUT', '/api/ota' + (reboot ? '?reboot=1' : ''), true);
+  x.upload.onprogress = function (e) { if (e.lengthComputable) st.textContent = 'writing ' + Math.round(100 * e.loaded / e.total) + '%'; };
+  x.onload = function () {
+    var r = null;
+    try { r = JSON.parse(x.responseText); } catch (e) {}
+    if (x.status != 200 || !r) { st.textContent = (r && r.error) || ('HTTP ' + x.status); return; }
+    st.textContent = 'wrote ' + r.partition + ' (' + r.version + ', ' + r.date + ' ' + r.time + ', ' + r.ms + ' ms)' +
+                     (r.rebooting ? '; rebooting ...' : '; boots on the next restart');
+    if (r.rebooting) otaWait(st, 60);
+    else otaStatus();
+  };
+  x.onerror = function () { st.textContent = 'network error'; };
+  x.send(f);
+}
+
 /* JSON request helper: cb(ok, body) */
 function api(method, path, body, cb) {
   var x = new XMLHttpRequest();
@@ -1224,6 +1287,7 @@ function rConsole() {
 rp();
 document.getElementById('tok').value = tokGet();
 authStatus();
+otaStatus();
 refreshUsb();
 loadMux();
 topoLoad();
