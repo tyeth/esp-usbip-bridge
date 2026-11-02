@@ -106,8 +106,9 @@ Once running, a board announces itself over mDNS, so you do not need to know its
 address in advance:
 
 ```bash
-avahi-browse -rt _hil-bridge._tcp   # the bridge (HTTP API on port 80)
+avahi-browse -rt _esp-usbip._tcp    # the bridge (HTTP API on port 80)
 avahi-browse -rt _usbip._tcp        # its USB/IP server and exported devices
+avahi-browse -rt _i2c-strand._tcp   # its I2C strand mux, when the mux bus is up
 ```
 
 ### ESP32-P4-Function-EV
@@ -271,13 +272,13 @@ Virtual devices are on bus 2.
 
 The contract between a bridge and its clients (the HIL controller, CI,
 scripts) is [docs/bridge-discovery-and-capabilities.md](docs/bridge-discovery-and-capabilities.md):
-find bridges by browsing `_hil-bridge._tcp`, read `GET /api/capabilities`,
+find bridges by browsing `_esp-usbip._tcp`, read `GET /api/capabilities`,
 and decide what to use from `api_version` and per-feature versions, never
 from the firmware commit.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/capabilities` | `api_version`, firmware (`version`, `build_time`, `idf`, `elf_sha256`, `running_partition`), board (`target`, `profile`, `mac`, `hostname`, `board_id`), network, ports, auth, limits and `features`: each `{"version": n}`, listed only when the build has it (`mux.available` says whether the ADG729 bus answers; `reset.modes` and `dut_fs.filesystems` are the lists the handlers accept) |
+| GET | `/api/capabilities` | `api_version`, firmware (`version`, `build_time`, `idf`, `elf_sha256`, `running_partition`), board (`target`, `profile`, `mac`, `hostname`, `board_id`), network, ports, auth, limits and `features`: each `{"version": n}`, listed only when the build has it (`mux.available` says whether the ADG729 bus answers, with `mux.service`, `chips`, `groups` and `duts`; `reset.modes` and `dut_fs.filesystems` are the lists the handlers accept) |
 | GET | `/api/info` | identity and firmware version, now with `api_version` |
 | GET | `/api/network` | `transports` and `interfaces`: `eth` and `wifi` with `up`, `ip`, `mac`; Wi-Fi also `ssid`, `rssi`, `configured`, `stored`, `state` (`unconfigured`, `connecting`, `connected`, `retrying`), `attempts`, `last_reason` |
 | PUT | `/api/network/wifi` | `{"ssid", "password"?, "store"?, "wait_ms"?}`: join now, without a reboot. Stored in NVS once the station gets an address, or at once with `"store": true`. Waits up to `wait_ms` (default and max 10000): 200 connected, 202 still connecting. 501 on builds without a Wi-Fi station |
@@ -708,28 +709,45 @@ The virtual test harness device (USB/IP busid `2-1`, CDC-ACM) also accepts
 
 ## Service Discovery (mDNS / DNS-SD)
 
-The bridge advertises two DNS-SD services under its hostname
-(`usbip-<last three MAC bytes>.local` unless set), on every interface that is
-up (Ethernet and Wi-Fi):
+The bridge advertises its DNS-SD services under its hostname, on every
+interface that is up (Ethernet and Wi-Fi). The default hostname (also sent as
+the DHCP host name) is `usbip-<chip>-<last three MAC bytes>`: the IDF target
+without `esp32`, plus the major silicon revision on the ESP32-P4 (v1 and v3
+differ), e.g. `usbip-s31-d19bee.local`, `usbip-s3-0a1b2c.local`,
+`usbip-p4v3-0a1b2c.local`. A hostname set through the API wins; a stored copy
+of the old default (`usbip-<last three MAC bytes>`) is cleared at boot.
 
-- `_hil-bridge._tcp` on port `80`: the bridge itself, for clients of its HTTP
-  API. Instance name: the hostname. A small, static TXT record: `api` (the
-  API version, `1.0`), `fw` (firmware version), `target`, `board` (the
-  build profile, e.g. `s31-function-coreboard-1`), `mac` (base MAC),
-  `caps` (`/api/capabilities`) and `auth` (`0`/`1`). The TXT is a hint;
+- `_esp-usbip._tcp` on port `80`: the bridge itself, for clients of its HTTP
+  API. Instance name: the hostname. A small, static TXT record: `product`
+  (`esp-usbip-bridge`), `api` (the API version, `1.0`), `fw` (firmware
+  version), `target`, `board` (the build profile, e.g.
+  `s31-function-coreboard-1`), `mac` (base MAC), `caps`
+  (`/api/capabilities`) and `auth` (`0`/`1`). The TXT is a hint;
   `GET /api/capabilities` is the truth.
 - `_usbip._tcp` on port `3240` (USB/IP protocol itself does not define mDNS
   discovery): TXT keys `transport`, `state`, `busid`, `vid`, `pid`, `target`,
   `board_id`; `count` is the number of exported devices (`busid=multi` when
   `count > 1`), refreshed as devices come and go.
+- Both carry the subtype `_esp-usbip-bridge`: browsing
+  `_esp-usbip-bridge._sub._usbip._tcp` finds these bridges and no other
+  USB/IP servers. (`_esp-usbip-bridge._tcp` itself would be 16 characters,
+  one over the DNS-SD limit.)
+- `_i2c-strand._tcp` on port `80`, while the I2C strand mux control bus is up
+  (even with no groups configured): the strand mux API under `/api` (the same
+  paths as the standalone `sbc-dut-analog-mux` box, which advertises the same
+  service). TXT: `product` (`esp-usbip-bridge`), `api` (`1`, the mux API
+  version), `mux` (`adg729`, `adg728`, `mixed` or `none`), `groups`, `duts`,
+  `path` (`/api`), `mac`, `caps`; republished when the topology changes.
 
 Discovery examples:
 
 ```bash
-avahi-browse -rt _hil-bridge._tcp
+avahi-browse -rt _esp-usbip._tcp
 avahi-browse -rt _usbip._tcp
-avahi-resolve-host-name usbip-xxxxxx.local
-dns-sd -B _hil-bridge._tcp          # macOS / Windows (Bonjour)
+avahi-browse -rt _i2c-strand._tcp
+avahi-browse -rt _esp-usbip-bridge._sub._usbip._tcp
+avahi-resolve-host-name usbip-s31-xxxxxx.local
+dns-sd -B _esp-usbip._tcp           # macOS / Windows (Bonjour)
 ```
 
 ## Notes

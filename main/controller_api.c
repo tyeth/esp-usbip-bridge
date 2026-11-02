@@ -203,7 +203,7 @@ static esp_err_t set_token(const char *token)
     nvs_close(h);
     if (err == ESP_OK) {
         strlcpy(s_token, token, sizeof(s_token));
-        discovery_service_notify_auth_changed();   /* _hil-bridge TXT "auth" */
+        discovery_service_notify_auth_changed();   /* _esp-usbip TXT "auth" */
     }
     return err;
 }
@@ -2370,7 +2370,17 @@ static api_result_t core_capabilities(void)
     add_feature(features, "claims", 1);
     add_feature(features, "hub_power", 1);
     add_feature(features, "port_events", 1);
-    cJSON_AddBoolToObject(add_feature(features, "mux", 1), "available", analog_mux_bus_ok());
+    {
+        cJSON *mux = add_feature(features, "mux", 1);
+        cJSON_AddBoolToObject(mux, "available", analog_mux_bus_ok());
+        int groups = 0, duts = 0;
+        const char *chips = "none";
+        analog_mux_summary(&groups, &duts, &chips);
+        cJSON_AddStringToObject(mux, "service", "_i2c-strand._tcp");   /* advertised when available */
+        cJSON_AddStringToObject(mux, "chips", chips);
+        cJSON_AddNumberToObject(mux, "groups", groups);
+        cJSON_AddNumberToObject(mux, "duts", duts);
+    }
     add_feature(features, "device_info", 1);
     add_feature(features, "serial_lines", 1);
     cJSON *modes = cJSON_AddArrayToObject(add_feature(features, "reset", 1), "modes");

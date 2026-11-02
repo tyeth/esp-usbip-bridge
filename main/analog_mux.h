@@ -31,6 +31,9 @@ esp_err_t analog_mux_init(void);
 /* Whether the I2C control bus is available. */
 bool analog_mux_bus_ok(void);
 
+/* Counts of the configured groups and DUTs, and the switch chips they use:
+   "adg729", "adg728" (ADG728 pairs), "mixed" or "none" (no groups). */
+void analog_mux_summary(int *groups, int *duts, const char **mux);
 /* {active, manual, duts:[...], groups:[...]} - caller frees with cJSON_Delete. */
 cJSON *analog_mux_describe(void);
 

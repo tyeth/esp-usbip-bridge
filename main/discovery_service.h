@@ -17,7 +17,7 @@ esp_err_t discovery_service_start(void);
 esp_err_t discovery_service_notify_config_changed(void);
 
 /**
- * @brief Republish the _hil-bridge._tcp TXT record after the API token was
+ * @brief Republish the _esp-usbip._tcp TXT record after the API token was
  * set or cleared (its "auth" key).  A no-op before discovery_service_start()
  * or when the value did not change.
  */

@@ -468,6 +468,23 @@ bool analog_mux_bus_ok(void)
     return s_mux.bus != NULL;
 }
 
+void analog_mux_summary(int *groups, int *duts, const char **mux)
+{
+    xSemaphoreTake(s_mux.lock, portMAX_DELAY);
+    bool adg729 = false, adg728 = false;
+    for (size_t i = 0; i < s_mux.map.n_groups; i++) {
+        if (s_mux.map.groups[i].type == MUX_GROUP_ADG729) {
+            adg729 = true;
+        } else {
+            adg728 = true;
+        }
+    }
+    *groups = (int)s_mux.map.n_groups;
+    *duts = (int)s_mux.map.n_duts;
+    xSemaphoreGive(s_mux.lock);
+    *mux = adg729 && adg728 ? "mixed" : adg729 ? "adg729" : adg728 ? "adg728" : "none";
+}
+
 /* ---------------------------------------------------------------------------
  *  Serialisation
  * ------------------------------------------------------------------------- */

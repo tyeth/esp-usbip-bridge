@@ -37,7 +37,7 @@ No auth needed (same rule as `/api/info`).  Response:
     "target": "esp32s31",
     "profile": "s31-function-coreboard-1",
     "mac": "1c:29:04:d1:9b:ee",
-    "hostname": "usbip-d19bee",
+    "hostname": "usbip-s31-d19bee",
     "board_id": null
   },
   "network": {
@@ -62,7 +62,8 @@ No auth needed (same rule as `/api/info`).  Response:
     "claims":         {"version": 1},
     "hub_power":      {"version": 1},
     "port_events":    {"version": 1},
-    "mux":            {"version": 1, "available": true},
+    "mux":            {"version": 1, "available": true, "service": "_i2c-strand._tcp",
+                       "chips": "adg729", "groups": 1, "duts": 4},
     "device_info":    {"version": 1},
     "serial_lines":   {"version": 1},
     "reset":          {"version": 1, "modes": ["esp_bootloader", "esp_hard_reset", "esp_usb_jtag_bootloader",
@@ -103,13 +104,23 @@ The example values are .133's.  Rules:
 
 ## mDNS / DNS-SD
 
-- Hostname `<hostname>.local` as today (`usbip-<last 3 MAC bytes>` unless set).
-- Keep `_usbip._tcp` on 3240 with its existing, frequently updated TXT.
-- **Add `_hil-bridge._tcp` on port 80** with a small, static TXT (republished
-  only when a value changes):
+- Hostname `<hostname>.local`, also the DHCP option 12 name on Ethernet and
+  Wi-Fi: `usbip-<chip>-<last 3 MAC bytes>` unless one is set, where `<chip>`
+  is the IDF target without `esp32` plus, on the ESP32-P4, its major silicon
+  revision (v1 and v3 differ): `usbip-s31-d19bee`, `usbip-s3-0a1b2c`,
+  `usbip-p4v1-0a1b2c`, `usbip-p4v3-0a1b2c`.  A stored hostname wins; a stored
+  copy of the old default (`usbip-<last 3 MAC bytes>`) is cleared on boot
+  (logged once) and the new default applies.
+- Keep `_usbip._tcp` on 3240 with its existing, frequently updated TXT, with
+  the DNS-SD subtype `_esp-usbip-bridge`.
+- **`_esp-usbip._tcp` on port 80** (the bridge's HTTP API; `_esp-usbip-bridge`
+  is 16 characters, over the 15-character service-name limit), subtype
+  `_esp-usbip-bridge`, with a small, static TXT (republished only when a value
+  changes):
 
   | key | value |
   |---|---|
+  | `product` | `esp-usbip-bridge` |
   | `api` | `1.0` |
   | `fw` | firmware version (`ac4fbed`) |
   | `target` | `esp32s31` |
@@ -119,9 +130,29 @@ The example values are .133's.  Rules:
   | `auth` | `0` or `1` |
 
   Instance name: the hostname.  Advertise on every interface that is up
-  (Ethernet and Wi-Fi).
-- Clients browse `_hil-bridge._tcp`, then confirm with `GET /api/capabilities`
-  (TXT is a hint, the endpoint is the truth).
+  (Ethernet and Wi-Fi).  Every board profile advertises it.
+- **`_i2c-strand._tcp` on port 80**: the I2C strand mux API (`/api/select`,
+  `/api/select/<dut>`, `/api/isolate`, `/api/groups/<g>/channel`,
+  `/api/groups/<g>/select/<c>`, `/api/topology`, `/api/duts`, `/api/probe`,
+  `/api/status`), advertised while the mux control bus is up
+  (`features.mux.available`), even with no groups configured.  The standalone
+  CircuitPython mux box advertises the same service with
+  `product=sbc-dut-analog-mux`.  TXT, republished only when a value changes
+  (e.g. after `PUT /api/topology`):
+
+  | key | value |
+  |---|---|
+  | `product` | `esp-usbip-bridge` |
+  | `api` | `1` (the strand-mux API version, independent of the bridge's) |
+  | `mux` | `adg729`, `adg728`, `mixed` or `none` (from the configured groups) |
+  | `groups`, `duts` | counts in the topology |
+  | `path` | `/api` |
+  | `mac` | base MAC |
+  | `caps` | `/api/capabilities` |
+- Clients browse `_esp-usbip._tcp` (or `_esp-usbip-bridge._sub._usbip._tcp`),
+  then confirm with `GET /api/capabilities` (TXT is a hint, the endpoint is
+  the truth).  `_hil-bridge._tcp` (the pre-release name) is no longer
+  advertised.
 
 ## Wi-Fi (S31)
 

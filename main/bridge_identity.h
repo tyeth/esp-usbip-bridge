@@ -4,7 +4,7 @@
 /*
  * What a client reads to decide what a bridge can do (see
  * docs/bridge-discovery-and-capabilities.md): the API version published in
- * /api/info, /api/capabilities and the _hil-bridge._tcp TXT record, the
+ * /api/info, /api/capabilities and the _esp-usbip._tcp TXT record, the
  * board profile name (scripts/build-board.sh) the firmware was built for and
  * the firmware version.
  */
