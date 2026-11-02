@@ -385,7 +385,7 @@ capture is reading, so the freshly flashed board's first boot is recorded.
 | POST | `picoboot/info` | enter BOOTSEL and report the chip |
 | POST | `flash/samba` | bossac: `{"file": <.bin>, "offset": "0x2000" (default: 0x2000 SAMD21, 0x4000 SAMD51), "erase": true, "verify": true, "reset": true}` for SAM-BA bootloaders with the Arduino X/Y/Z extensions (Arduino and Adafruit SAMD bootloaders); 1200-baud touch first when the app is running; CRC16 verify per 4 KB |
 | POST | `samba/info` | bootloader version, chip, flash geometry |
-| POST | `flash/uf2` | copy a UF2 to the device's UF2 bootloader drive (`{"file", "path": "/FIRMWARE.UF2"}`); enters the bootloader first when the device has no drive; the bootloader rebooting after the last block counts as success |
+| POST | `flash/uf2` | copy a UF2 to the device's UF2 bootloader drive (`{"file", "path": "/FIRMWARE.UF2"}`); enters the bootloader first (RP2 reset interface or 1200-baud touch) when the device has no drive or its drive is an app's (no `INFO_UF2.TXT`: CIRCUITPY, WIPPER), and fails rather than copy onto an app's drive when `"enter_bootloader": false`; the bootloader rebooting after the last block counts as success |
 
 Erasing (old firmware, NVS secrets, file systems): `erase_all` on `flash/esp`
 erases the whole chip; on `flash/picoboot` it needs the board's `flash_size`
@@ -397,7 +397,7 @@ with timestamps, and serves it buffered or live:
 
 | Method | Path | |
 |---|---|---|
-| POST | `/api/usb/devices/{busid}/capture/start` | `{"baud": 115200 \| [921600, "auto"] \| "auto", "size": 262144, "dtr", "rts", "arm": false}`: capture every serial function of the device (each CDC function of a composite device, each port of a CP2105/FT2232) into its own ring, through resets and re-enumeration on the same port path, including a new VID:PID or port count |
+| POST | `/api/usb/devices/{busid}/capture/start` | `{"baud": 115200 \| [921600, "auto"] \| "auto", "size": 262144, "dtr", "rts", "arm": false}`: capture every serial function of the device (each CDC function of a composite device, each port of a CP2105/FT2232) into its own ring, through resets and re-enumeration on the same port path, including a new VID:PID or port count. `dtr` defaults on for native USB CDC (TinyUSB, Arduino, CircuitPython print nothing until a host asserts it) and leaves UART bridges and the ESP USB-Serial/JTAG alone (their DTR is a boot strap) |
 | POST | `/api/usb/devices/{busid}/capture/stop` | `{"disarm": false, "clear": false}`; the buffer stays readable unless cleared |
 | GET | `/api/usb/devices/{busid}/capture` | `?port=0&since=<cursor>` or `&from=epoch\|oldest\|tail`, `&max=`, `&format=lines` (prefixes `[uptime s.ms] `). Answers carry `next` (the next cursor), `epoch`, `epoch_cursor`, `serial_baud`, `uptime_ms` |
 | POST | `/api/usb/devices/{busid}/capture/send` | `{"port": 0, "text": "..."}` or `{"hex": "03"}` |

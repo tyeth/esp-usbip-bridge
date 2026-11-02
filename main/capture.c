@@ -342,10 +342,15 @@ static uint32_t probe_baud(cap_dev_t *d, cap_link_t *cl, int port)
 static void configure_link(cap_dev_t *d, cap_link_t *cl, int port)
 {
     serial_link_prepare(&cl->link);
-    if (d->dtr >= 0 || d->rts >= 0) {
+    /* Native USB CDC (TinyUSB, Arduino, CircuitPython) holds its output until
+       the host asserts DTR, as a terminal does.  UART bridges and the ESP
+       USB-Serial/JTAG wire DTR to boot straps, so those keep their lines. */
+    const bool native_cdc = cl->link.caps.serial == RESCUE_SERIAL_CDC_ACM && !cl->link.caps.esp_usb_jtag;
+    const int dtr = d->dtr >= 0 ? d->dtr : (native_cdc ? 1 : -1);
+    if (dtr >= 0 || d->rts >= 0) {
         bool dd, rr;
         serial_link_get_lines(&cl->link, &dd, &rr);
-        serial_link_set_lines(&cl->link, d->dtr >= 0 ? d->dtr == 1 : dd, d->rts >= 0 ? d->rts == 1 : rr);
+        serial_link_set_lines(&cl->link, dtr >= 0 ? dtr == 1 : dd, d->rts >= 0 ? d->rts == 1 : rr);
     }
     const uint32_t baud = probe_baud(d, cl, port);
     lock();

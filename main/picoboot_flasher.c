@@ -20,6 +20,7 @@
 #define PB_PAGE             256
 #define PB_FLASH_BASE       0x10000000u
 #define PB_FLASH_END        0x11000000u     /* 16 MB XIP window */
+#define PB_FAMILY_ABSOLUTE  0xe48bff57u
 #define PB_MAX_SECTORS      4096
 #define PB_CMD_TIMEOUT_MS   3000
 #define PB_BOOTSEL_WAIT_MS  6000
@@ -248,13 +249,27 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
     }
     size_t nsec = 0;
     uint32_t family = 0;
+    bool skip_absolute = false;
     if (is_uf2) {
+        /* RP2350 UF2s start with an absolute-family block at 0x10ffff00 (the
+           RP2350-E10 workaround for drag-and-drop); picotool skips it, and on
+           a smaller flash it is not there to write.  Skip absolute blocks when
+           the image has a real family. */
+        unsigned skipped = 0;
+        for (size_t i = 0; i < nblocks && !skip_absolute; i++) {
+            skip_absolute = rescue_uf2_block(data, len, i, &blk) && !(blk.flags & RESCUE_UF2_FLAG_NOT_MAIN) &&
+                            blk.family_id && blk.family_id != PB_FAMILY_ABSOLUTE;
+        }
         for (size_t i = 0; i < nblocks; i++) {
             if (!rescue_uf2_block(data, len, i, &blk)) {
                 rc = rescue_job_fail(job, "UF2 block %u is malformed", (unsigned)i);
                 goto done;
             }
             if (blk.flags & RESCUE_UF2_FLAG_NOT_MAIN) {
+                continue;
+            }
+            if (skip_absolute && blk.family_id == PB_FAMILY_ABSOLUTE) {
+                skipped++;
                 continue;
             }
             if (blk.family_id && family == 0) {
@@ -280,6 +295,9 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
             }
         }
         qsort(sectors, nsec, sizeof(uint32_t), cmp_u32);
+        if (skipped) {
+            rescue_job_log(job, "skipped %u absolute-family block(s) (RP2350-E10 workaround)", skipped);
+        }
         rescue_job_log(job, "UF2: %u blocks, family %s, %u sectors to write", (unsigned)nblocks,
                        family ? (rescue_uf2_family_name(family) ? rescue_uf2_family_name(family) : "unknown") : "none",
                        (unsigned)nsec);
@@ -366,7 +384,8 @@ int picoboot_flasher_job(rescue_job_t *job, const char *busid, const cJSON *args
         if (is_uf2) {
             for (size_t i = 0; i < nblocks; i++) {
                 rescue_uf2_block(data, len, i, &blk);
-                if ((blk.flags & RESCUE_UF2_FLAG_NOT_MAIN) || blk.target_addr + blk.payload_size <= s ||
+                if ((blk.flags & RESCUE_UF2_FLAG_NOT_MAIN) || (skip_absolute && blk.family_id == PB_FAMILY_ABSOLUTE) ||
+                        blk.target_addr + blk.payload_size <= s ||
                         blk.target_addr >= s + PB_SECTOR) {
                     continue;
                 }

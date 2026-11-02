@@ -40,6 +40,7 @@ typedef struct {
     uint32_t block_size, block_count;
     char vendor[9], product[17], revision[5];
     int last_err;               /* last transport error (-ENODEV when the device left) */
+    uint32_t ms_inquiry, ms_ready, ms_capacity, ms_mount;   /* how long opening took, per step */
 } msc_dev_t;
 
 static msc_dev_t s_dev;
@@ -194,6 +195,7 @@ static int msc_open(msc_dev_t *d, const char *busid, char *msg, size_t msg_len)
         return 409;
     }
     uint8_t buf[36];
+    int64_t ts = esp_timer_get_time();
     if (scsi_simple(d, 0x12, 36, buf, true) == 0) {              /* INQUIRY */
         memcpy(d->vendor, &buf[8], 8);
         memcpy(d->product, &buf[16], 16);
@@ -201,6 +203,7 @@ static int msc_open(msc_dev_t *d, const char *busid, char *msg, size_t msg_len)
         for (char *s = d->vendor; *s; s++) if (*s < ' ') *s = ' ';
         for (char *s = d->product; *s; s++) if (*s < ' ') *s = ' ';
     }
+    d->ms_inquiry = (uint32_t)((esp_timer_get_time() - ts) / 1000);
     /* UF2 drives and CIRCUITPY report NOT READY briefly after enumerating. */
     const int64_t t0 = esp_timer_get_time();
     int rc;
@@ -213,12 +216,15 @@ static int msc_open(msc_dev_t *d, const char *busid, char *msg, size_t msg_len)
         scsi_simple(d, 0x03, 18, sense, true);                  /* REQUEST SENSE clears the condition */
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    d->ms_ready = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    ts = esp_timer_get_time();
     uint8_t cdb[10] = { 0x25 };
     uint8_t cap[8];
     if (bot(d, cdb, 10, cap, 8, true) != 0) {                   /* READ CAPACITY(10) */
         snprintf(msg, msg_len, "READ CAPACITY failed");
         return 502;
     }
+    d->ms_capacity = (uint32_t)((esp_timer_get_time() - ts) / 1000);
     rescue_scsi_capacity(cap, &d->block_count, &d->block_size);
     if (d->block_size != 512 && d->block_size != 1024 && d->block_size != 2048 && d->block_size != 4096) {
         snprintf(msg, msg_len, "unsupported block size %lu", (unsigned long)d->block_size);
@@ -326,7 +332,9 @@ static int mount(const char *busid, mount_t *m, char *msg, size_t msg_len)
         snprintf(msg, msg_len, "out of memory");
         return 503;
     }
+    const int64_t ts = esp_timer_get_time();
     const FRESULT fr = f_mount(m->fs, m->drive, 1);
+    s_dev.ms_mount = (uint32_t)((esp_timer_get_time() - ts) / 1000);
     if (fr != FR_OK) {
         snprintf(msg, msg_len, fr == FR_NO_FILESYSTEM ? "no FAT file system on the volume"
                                : "mount failed (FatFS error %d)", (int)fr);
@@ -452,6 +460,11 @@ int msc_info(const char *busid, cJSON **out)
         cJSON_AddNumberToObject(j, "block_size", s_dev.block_size);
         cJSON_AddNumberToObject(j, "blocks", s_dev.block_count);
         cJSON_AddNumberToObject(j, "capacity", (double)s_dev.block_size * s_dev.block_count);
+        cJSON *t = cJSON_AddObjectToObject(j, "open_ms");
+        cJSON_AddNumberToObject(t, "inquiry", s_dev.ms_inquiry);
+        cJSON_AddNumberToObject(t, "ready", s_dev.ms_ready);
+        cJSON_AddNumberToObject(t, "capacity", s_dev.ms_capacity);
+        cJSON_AddNumberToObject(t, "mount", s_dev.ms_mount);
     }
     if (st == 0) {
         DWORD nclst = 0;
@@ -593,6 +606,22 @@ int msc_mkdir(const char *busid, const cJSON *args, cJSON **out)
  *  Jobs
  * ======================================================================== */
 
+/* A UF2 bootloader's drive has INFO_UF2.TXT; an app's drive (CIRCUITPY,
+   WIPPER) does not, and a UF2 copied there would just sit in a file. */
+static bool volume_is_uf2_bootloader(const char *busid)
+{
+    lock();
+    mount_t m = {0};
+    char msg[128];
+    char p[32];
+    FILINFO fi;
+    const bool yes = mount(busid, &m, msg, sizeof(msg)) == 0 && make_path(&m, "/INFO_UF2.TXT", p, sizeof(p)) &&
+                     f_stat(p, &fi) == FR_OK;
+    unmount(&m);
+    unlock();
+    return yes;
+}
+
 static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, bool uf2)
 {
     const cJSON *file = cJSON_GetObjectItemCaseSensitive(args, "file");
@@ -631,7 +660,17 @@ static int write_file(rescue_job_t *job, const char *busid, const cJSON *args, b
             for (int i = 0; i < cfg.num_ifaces; i++) {
                 has_msc |= cfg.ifaces[i].cls == 0x08;
             }
-            if (!has_msc && !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(args, "enter_bootloader"))) {
+            bool in_bootloader = has_msc;
+            if (has_msc && !volume_is_uf2_bootloader(busid)) {
+                rescue_job_log(job, "its drive is not a UF2 bootloader (no INFO_UF2.TXT)");
+                in_bootloader = false;
+            }
+            if (!in_bootloader && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(args, "enter_bootloader"))) {
+                free(cfgbuf);
+                blob_release(file->valuestring);
+                return rescue_job_fail(job, "not in a UF2 bootloader and enter_bootloader is false");
+            }
+            if (!in_bootloader) {
                 rescue_caps_t caps;
                 rescue_classify(d.id_vendor, d.id_product, d.bcd_device, &cfg, 0, &caps);
                 rescue_job_progress(job, 2, "entering the bootloader");
