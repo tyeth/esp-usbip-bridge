@@ -742,6 +742,16 @@ static void process_backend_events(void)
     }
 }
 
+/* The public entry points can run before usb_backend_start(): hub_ctl_init()
+   starts its port-events poll task and the HTTP server comes up while the
+   network is still negotiating.  Until the state mutex exists there is
+   nothing to report (start creates it once and never clears it).  The
+   static helpers that take the mutex run only in the backend task. */
+static bool backend_started(void)
+{
+    return s_state.state_mutex != NULL;
+}
+
 /* Wake the backend task: it blocks in usb_host_client_handle_events(). */
 static void wake_backend(void)
 {
@@ -1689,15 +1699,17 @@ size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_d
 
     size_t copied = 0;
 
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES && copied < max_devices; i++) {
-        if (!s_state.devices[i].in_use) {
-            continue;
-        }
+    if (backend_started()) {
+        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+        for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES && copied < max_devices; i++) {
+            if (!s_state.devices[i].in_use) {
+                continue;
+            }
 
-        out_devices[copied++] = s_state.devices[i].device;
+            out_devices[copied++] = s_state.devices[i].device;
+        }
+        xSemaphoreGive(s_state.state_mutex);
     }
-    xSemaphoreGive(s_state.state_mutex);
 
     /* Append virtual devices. */
     if (copied < max_devices) {
@@ -1725,46 +1737,50 @@ size_t usb_backend_get_claims(usb_backend_claims_device_t *out, size_t max,
     usb_backend_claims_totals_t sums;
     memset(&sums, 0, sizeof(sums));
 
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES; i++) {
-        if (!s_state.devices[i].in_use) {
-            continue;
-        }
-        uint8_t eps[USBIP_MAX_ENDPOINTS];
-        const int num_eps = collect_claimed_endpoints_locked(i, -1, eps, USBIP_MAX_ENDPOINTS);
-        usb_backend_claims_device_t scratch;
-        usb_backend_claims_device_t *d = (out != NULL && copied < max) ? &out[copied] : &scratch;
-        memset(d, 0, sizeof(*d));
-        strlcpy(d->busid, s_state.devices[i].device.busid, sizeof(d->busid));
-        int num_intf = 0;
-        for (int n = 0; n < USBIP_MAX_INTERFACES; n++) {
-            if (s_state.devices[i].claimed_interfaces[n]) {
-                d->claimed_interfaces[num_intf++] = (uint8_t)n;
+    /* Before usb_backend_start() the table is empty; the host library
+       stats below report "unknown" (-1) on their own. */
+    if (backend_started()) {
+        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+        for (int i = 0; i < CONFIG_USBIP_MAX_DEVICES; i++) {
+            if (!s_state.devices[i].in_use) {
+                continue;
             }
+            uint8_t eps[USBIP_MAX_ENDPOINTS];
+            const int num_eps = collect_claimed_endpoints_locked(i, -1, eps, USBIP_MAX_ENDPOINTS);
+            usb_backend_claims_device_t scratch;
+            usb_backend_claims_device_t *d = (out != NULL && copied < max) ? &out[copied] : &scratch;
+            memset(d, 0, sizeof(*d));
+            strlcpy(d->busid, s_state.devices[i].device.busid, sizeof(d->busid));
+            int num_intf = 0;
+            for (int n = 0; n < USBIP_MAX_INTERFACES; n++) {
+                if (s_state.devices[i].claimed_interfaces[n]) {
+                    d->claimed_interfaces[num_intf++] = (uint8_t)n;
+                }
+            }
+            d->num_claimed_interfaces = num_intf;
+            d->num_claimed_endpoints = num_eps;
+            d->in_flight = count_in_flight_locked(s_state.devices[i].device.busid);
+            d->release_pending = s_state.devices[i].release_pending;
+            d->claim_failures = s_state.devices[i].claim_failures;
+            if (s_state.devices[i].last_claim_err != ESP_OK) {
+                strlcpy(d->last_claim_error, esp_err_to_name(s_state.devices[i].last_claim_err),
+                        sizeof(d->last_claim_error));
+                d->last_claim_was_exhaustion =
+                    (s_state.devices[i].last_claim_err == ESP_ERR_NOT_SUPPORTED);
+            }
+            if (out != NULL && copied < max) {
+                copied++;
+            }
+            sums.connected_devices++;
+            sums.claimed_interfaces += num_intf;
+            sums.claimed_endpoints += num_eps;
         }
-        d->num_claimed_interfaces = num_intf;
-        d->num_claimed_endpoints = num_eps;
-        d->in_flight = count_in_flight_locked(s_state.devices[i].device.busid);
-        d->release_pending = s_state.devices[i].release_pending;
-        d->claim_failures = s_state.devices[i].claim_failures;
-        if (s_state.devices[i].last_claim_err != ESP_OK) {
-            strlcpy(d->last_claim_error, esp_err_to_name(s_state.devices[i].last_claim_err),
-                    sizeof(d->last_claim_error));
-            d->last_claim_was_exhaustion =
-                (s_state.devices[i].last_claim_err == ESP_ERR_NOT_SUPPORTED);
-        }
-        if (out != NULL && copied < max) {
-            copied++;
-        }
-        sums.connected_devices++;
-        sums.claimed_interfaces += num_intf;
-        sums.claimed_endpoints += num_eps;
+        sums.exhaustion_events = s_state.exhaustion_events;
+        sums.last_exhaustion_us = s_state.last_exhaustion_us;
+        strlcpy(sums.last_exhaustion_busid, s_state.last_exhaustion_busid,
+                sizeof(sums.last_exhaustion_busid));
+        xSemaphoreGive(s_state.state_mutex);
     }
-    sums.exhaustion_events = s_state.exhaustion_events;
-    sums.last_exhaustion_us = s_state.last_exhaustion_us;
-    strlcpy(sums.last_exhaustion_busid, s_state.last_exhaustion_busid,
-            sizeof(sums.last_exhaustion_busid));
-    xSemaphoreGive(s_state.state_mutex);
 
     /* Hubs are outside the device table; each holds one interrupt channel. */
     usb_backend_hub_t hubs[USB_BACKEND_MAX_HUBS];
@@ -1907,13 +1923,15 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
 
     bool found = false;
 
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    const int slot = find_slot_by_busid_locked(busid);
-    if (slot >= 0) {
-        *out_device = s_state.devices[slot].device;
-        found = true;
+    if (backend_started()) {
+        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+        const int slot = find_slot_by_busid_locked(busid);
+        if (slot >= 0) {
+            *out_device = s_state.devices[slot].device;
+            found = true;
+        }
+        xSemaphoreGive(s_state.state_mutex);
     }
-    xSemaphoreGive(s_state.state_mutex);
 
     if (!found) {
         virtual_device_t *vdev = virtual_device_find_by_busid(busid);
@@ -1929,6 +1947,11 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
 void usb_backend_submit(usb_backend_req_t *req)
 {
     if (req == NULL || req->done == NULL) {
+        return;
+    }
+    if (!backend_started()) {
+        /* No backend task to answer it: done() always follows a submit. */
+        req->done(req, -ENODEV, 0);
         return;
     }
 
@@ -1959,7 +1982,7 @@ void usb_backend_cancel(usb_backend_req_t *req)
 
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction)
 {
-    if (busid == NULL) {
+    if (busid == NULL || !backend_started()) {
         return false;
     }
 
@@ -2009,6 +2032,11 @@ int usb_backend_debug_control(const char busid[32], const usb_setup_packet_t *se
                               uint8_t *in_buf, size_t in_capacity,
                               size_t *in_len, const char **error_detail)
 {
+    if (!backend_started()) {
+        *in_len = 0;
+        *error_detail = NULL;
+        return -ENODEV;
+    }
     debug_ctrl_t d = {0};
     d.done = xSemaphoreCreateBinary();
     if (d.done == NULL) {
@@ -2055,6 +2083,10 @@ esp_err_t usb_backend_hub_control(uint8_t hub_addr, const usb_setup_packet_t *se
 {
     *in_len = 0;
     *err_class = "none";
+    if (s_state.client_hdl == NULL) {
+        *err_class = "not_started";
+        return ESP_ERR_INVALID_STATE;
+    }
     usb_device_handle_t dev = NULL;
     esp_err_t err = usb_host_device_open(s_state.client_hdl, hub_addr, &dev);
     if (err != ESP_OK) {
