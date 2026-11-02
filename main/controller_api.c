@@ -155,6 +155,11 @@ esp_err_t controller_api_init(void)
     return ESP_OK;
 }
 
+bool controller_api_auth_required(void)
+{
+    return s_token[0] != '\0';
+}
+
 bool controller_api_authorized(const char *auth)
 {
     if (s_token[0] == '\0') {
@@ -198,6 +203,7 @@ static esp_err_t set_token(const char *token)
     nvs_close(h);
     if (err == ESP_OK) {
         strlcpy(s_token, token, sizeof(s_token));
+        discovery_service_notify_auth_changed();   /* _hil-bridge TXT "auth" */
     }
     return err;
 }

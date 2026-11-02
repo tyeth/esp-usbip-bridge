@@ -13,12 +13,19 @@
 #include "mdns.h"
 #include "sdkconfig.h"
 
+#include "bridge_identity.h"
+#include "controller_api.h"
 #include "device_naming.h"
 #include "usb_backend.h"
 #include "usbip_protocol.h"
 
 #define USBIP_MDNS_SERVICE_TYPE "_usbip"
 #define USBIP_MDNS_SERVICE_PROTO "_tcp"
+/* The bridge itself, for clients that drive it over HTTP (the HIL
+   controller): a small, static TXT; GET /api/capabilities is the truth. */
+#define BRIDGE_MDNS_SERVICE_TYPE "_hil-bridge"
+#define BRIDGE_MDNS_SERVICE_PROTO "_tcp"
+#define BRIDGE_HTTP_PORT 80
 #define USBIP_DISCOVERY_TASK_STACK 4096
 #define USBIP_DISCOVERY_TASK_PRIORITY 5
 #define USBIP_DISCOVERY_REFRESH_MS 1000
@@ -34,6 +41,8 @@ typedef struct {
 
 static discovery_snapshot_t s_last_snapshot;
 static char s_board_id[DEVICE_NAME_MAX_LEN];
+static bool s_started;
+static bool s_bridge_auth;                  /* the auth value last published */
 
 static bool snapshot_changed(const discovery_snapshot_t *a, const discovery_snapshot_t *b)
 {
@@ -82,6 +91,36 @@ static esp_err_t discovery_publish_txt_from_snapshot(const discovery_snapshot_t 
     };
 
     return mdns_service_txt_set(USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, txt, sizeof(txt) / sizeof(txt[0]));
+}
+
+/* _hil-bridge._tcp: api, fw, target, board, mac, caps, auth.  add: register
+   the service (instance name = hostname), else replace its TXT. */
+static esp_err_t discovery_publish_bridge(bool add, const char *hostname)
+{
+    char fw[48];
+    bridge_fw_version(fw, sizeof(fw));
+    uint8_t m[6] = {0};
+    esp_read_mac(m, ESP_MAC_BASE);
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+    const char *board = bridge_board_profile();
+    s_bridge_auth = controller_api_auth_required();
+
+    mdns_txt_item_t txt[] = {
+        {.key = "api", .value = BRIDGE_API_VERSION},
+        {.key = "fw", .value = fw},
+        {.key = "target", .value = CONFIG_IDF_TARGET},
+        {.key = "board", .value = board ? board : "none"},
+        {.key = "mac", .value = mac},
+        {.key = "caps", .value = "/api/capabilities"},
+        {.key = "auth", .value = s_bridge_auth ? "1" : "0"},
+    };
+    const size_t n = sizeof(txt) / sizeof(txt[0]);
+    if (add) {
+        return mdns_service_add(hostname, BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO,
+                                BRIDGE_HTTP_PORT, txt, n);
+    }
+    return mdns_service_txt_set(BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, txt, n);
 }
 
 static void discovery_task(void *arg)
@@ -199,6 +238,15 @@ esp_err_t discovery_service_start(void)
     ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d host=%s.local",
              USBIP_MDNS_SERVICE_TYPE, USBIP_MDNS_SERVICE_PROTO, USBIP_TCP_PORT, hostname);
 
+    err = discovery_publish_bridge(true, hostname);
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_started = true;
+    ESP_LOGI(TAG, "DNS-SD service advertised: %s.%s port=%d instance=%s api=%s",
+             BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, BRIDGE_HTTP_PORT, hostname,
+             BRIDGE_API_VERSION);
+
     if (xTaskCreate(discovery_task,
                     "usbip_discovery",
                     USBIP_DISCOVERY_TASK_STACK,
@@ -229,6 +277,10 @@ esp_err_t discovery_service_notify_config_changed(void)
         ESP_LOGW(TAG, "mdns_instance_name_set failed: %s", esp_err_to_name(err));
         /* Non-fatal; continue to update TXT records. */
     }
+    err = mdns_service_instance_name_set(BRIDGE_MDNS_SERVICE_TYPE, BRIDGE_MDNS_SERVICE_PROTO, hostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s instance name: %s", BRIDGE_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+    }
 
     /* Re-read board ID and force re-publish of TXT records. */
     device_naming_get_board_id(s_board_id, sizeof(s_board_id));
@@ -242,4 +294,18 @@ esp_err_t discovery_service_notify_config_changed(void)
     ESP_LOGI(TAG, "mDNS identity refreshed: host=%s.local, board_id=\"%s\"",
              hostname, s_board_id);
     return ESP_OK;
+}
+
+esp_err_t discovery_service_notify_auth_changed(void)
+{
+    if (!s_started || controller_api_auth_required() == s_bridge_auth) {
+        return ESP_OK;
+    }
+    esp_err_t err = discovery_publish_bridge(false, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s TXT: %s", BRIDGE_MDNS_SERVICE_TYPE, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "%s TXT republished: auth=%d", BRIDGE_MDNS_SERVICE_TYPE, s_bridge_auth);
+    }
+    return err;
 }
