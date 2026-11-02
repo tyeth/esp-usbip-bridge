@@ -423,6 +423,68 @@ function otaUpload() {
   x.send(f);
 }
 
+/* -------------------------------------------------------------------
+ *  Network: interfaces and the Wi-Fi station (GET /api/network,
+ *  PUT / DELETE /api/network/wifi).  The password is never read back.
+ * ------------------------------------------------------------------- */
+function netIfText(i) {
+  var t = i.name + ' ' + (i.ip ? i.ip : (i.up ? 'up, no address' : 'down'));
+  if (i.name == 'wifi') {
+    if (!i.configured) t += ' (not configured)';
+    else {
+      t += ' "' + i.ssid + '"';
+      if (i.rssi !== null && i.rssi !== undefined) t += ' ' + i.rssi + ' dBm';
+      if (i.state && i.state != 'connected') t += ' ' + i.state + (i.last_reason ? ' (' + i.last_reason + ')' : '');
+      if (i.stored === false) t += ', not stored yet';
+    }
+  }
+  return t;
+}
+
+function netShow(n) {
+  var e = document.getElementById('netst');
+  if (!n || !n.interfaces) { if (e) e.textContent = 'unknown'; return; }
+  if (e) e.textContent = n.interfaces.map(netIfText).join('; ');
+  var wifi = null;
+  n.interfaces.forEach(function (i) { if (i.name == 'wifi') wifi = i; });
+  /* The form only where the station can be configured (wifi_config) */
+  var f = document.getElementById('netwifi');
+  if (f) f.style.display = wifi && wifi.state !== undefined ? '' : 'none';
+  var s = document.getElementById('netssid');
+  if (s && wifi && wifi.ssid && !s.value && document.activeElement != s) s.value = wifi.ssid;
+}
+
+function netLoad() {
+  api('GET', '/api/network', null, function (ok, r) { netShow(ok ? r : null); });
+}
+
+function netSet() {
+  var ssid = document.getElementById('netssid').value;
+  var pass = document.getElementById('netpass').value;
+  if (!ssid) { alert('Enter the SSID'); return; }
+  if (pass && (pass.length < 8 || pass.length > 63)) { alert('A WPA password is 8-63 characters (empty for an open network)'); return; }
+  var st = document.getElementById('netprog');
+  st.textContent = 'connecting ...';
+  api('PUT', '/api/network/wifi', { ssid: ssid, password: pass, store: document.getElementById('netstore').checked },
+      function (ok, r, code) {
+        document.getElementById('netpass').value = '';
+        if (!ok) { st.textContent = (r && r.error) || ('HTTP ' + code); return; }
+        st.textContent = r.connected ? 'connected' + (r.stored ? ', stored' : '')
+                                     : 'still connecting (stored once it connects' + (r.stored ? '; stored already' : '') + ')';
+        netShow(r.network);
+        if (!r.connected) setTimeout(netLoad, 5000);
+      });
+}
+
+function netClear() {
+  if (!confirm('Forget the Wi-Fi credentials and disconnect Wi-Fi?')) return;
+  api('DELETE', '/api/network/wifi', null, function (ok, r) {
+    document.getElementById('netprog').textContent = ok ? 'forgotten' : ((r && r.error) || 'failed');
+    document.getElementById('netssid').value = '';
+    if (ok) netShow(r.network);
+  });
+}
+
 /* JSON request helper: cb(ok, body) */
 function api(method, path, body, cb) {
   var x = new XMLHttpRequest();
@@ -1456,6 +1518,7 @@ rp();
 document.getElementById('tok').value = tokGet();
 authStatus();
 otaStatus();
+netLoad();
 refreshUsb();
 loadMux();
 topoLoad();

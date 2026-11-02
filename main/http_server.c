@@ -950,6 +950,17 @@ static void stream_html_page(stream_t *s)
         " <label class=\"muted\"><input type=\"checkbox\" id=\"otareboot\" checked> reboot into it</label>"
         " <button onclick=\"otaUpload()\" style=\"font-size:0.7rem\">Upload app .bin</button>"
         " <span id=\"otaprog\" class=\"muted\"></span></p>\n"
+        /* Network: interfaces and the optional Wi-Fi station (web_app.js
+           netLoad / netSet / netClear, GET /api/network) */
+        "<p class=\"sub\">Network: <span id=\"netst\" class=\"muted\">&hellip;</span>"
+        "<span id=\"netwifi\" style=\"display:none\"><br>Wi-Fi: SSID"
+        " <input id=\"netssid\" class=\"txt\" type=\"text\" size=\"14\" maxlength=\"32\">"
+        " password <input id=\"netpass\" class=\"txt\" type=\"password\" size=\"14\" maxlength=\"63\""
+        " placeholder=\"empty: open\">"
+        " <label class=\"muted\"><input type=\"checkbox\" id=\"netstore\"> store now</label>"
+        " <button onclick=\"netSet()\" style=\"font-size:0.7rem\">Connect</button>"
+        " <button onclick=\"netClear()\" style=\"font-size:0.7rem\">Forget</button>"
+        " <span id=\"netprog\" class=\"muted\"></span></span></p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
