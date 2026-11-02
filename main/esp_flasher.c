@@ -24,7 +24,7 @@
 #define ESPF_STUB_BLOCK     0x4000
 #define ESPF_ROM_BLOCK      0x400
 #define ESPF_CONNECT_TRIES  3
-#define ESPF_REENUM_WAIT_MS 4000
+#define ESPF_REENUM_WAIT_MS 8000    /* an ESP32-C5 took ~5 s to come back in download mode */
 
 /* ===========================================================================
  *  The bridge port: esp-serial-flasher over the device's USB serial function
@@ -95,7 +95,10 @@ static void port_enter_bootloader(esp_loader_port_t *port)
         rescue_job_log(p->job, "reset into the bootloader: %s", serial_link_errno_name(st));
     }
     if (usb) {
-        follow_reenumeration(p, devnum, dropped);
+        /* The chip resets with its USB-Serial/JTAG, so it always comes back
+           as a new device, sometimes seconds after the sequence ended. */
+        (void)dropped;
+        follow_reenumeration(p, devnum, true);
         serial_link_set_baud(p->link, ESPF_ROM_BAUD);
     }
     vTaskDelay(pdMS_TO_TICKS(50));
