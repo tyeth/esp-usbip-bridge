@@ -87,5 +87,29 @@ try {
   vm.runInContext("rescueSel('1-1.2'); rEspImgs=[{file:'app.bin',offset:'0x0'}]; rEspFlash();", sandbox);
   if (!el('rjobl').textContent.includes('ESP32-S3')) { console.log('FAIL job log not rendered'); failed++; }
 } catch (e) { console.log('FAIL job: ' + e.stack); failed++; }
+// device flash: map, browse and list through a session job
+answers['POST /api/usb/devices/1-1.2/dutflash'] = [202, { ok: true, job: 9, added_to_open_session: false, queued_ops: 0 }];
+answers['GET /api/rescue/jobs/9'] = [200, { id: 9, kind: 'dut_flash', state: 'running', progress: 50, stage: 'ready', elapsed_s: 4,
+  error: null, log: '', result: { device: { platform: 'esp', chip: 'ESP32-C6', flash_size: 4194304, writable: true },
+  notes: ['no flasher stub'], regions: [
+    { index: 0, name: 'flash', type: 'flash', offset: 0, size: 4194304, protected: true },
+    { index: 1, name: 'app0', type: 'app:ota_0', offset: 65536, size: 1966080, protected: true },
+    { index: 2, name: 'spiffs', type: 'data:spiffs', offset: 3997696, size: 131072, protected: false, fs: 'littlefs',
+      fs_version: '2.0', block_size: 4096, block_count: 32 }],
+  ops: [{ index: 0, op: 'fs_info', ok: true, status: 200, part: 'spiffs', fs: 'littlefs', total: 131072, free: 122880,
+          path: '/', files: [{ name: 'secrets.json', dir: false, size: 30 }, { name: 'lib', dir: true, size: 0 }] }] } }];
+try {
+  answers['GET /api/usb/devices/1-1.2/rescue'] = [200, base];
+  vm.runInContext("rescueSel('1-1.2'); rDfRun([]);", sandbox);
+  if (!el('rinfo').innerHTML.includes('Device flash')) { console.log('FAIL device flash panel missing'); failed++; }
+  const m = el('rdfmap').innerHTML;
+  for (const w of ['ESP32-C6', 'app:ota_0', 'littlefs 2.0', 'Browse', 'Format', 'no flasher stub']) {
+    if (!m.includes(w)) { console.log(`FAIL device flash map: missing "${w}"`); failed++; }
+  }
+  vm.runInContext("rDfBrowse('spiffs');", sandbox);
+  const l = el('rdflist').innerHTML;
+  if (!l.includes('secrets.json') || !l.includes('lib/')) { console.log('FAIL device flash listing'); failed++; }
+  if (!el('rdfinfo').textContent.includes('120 KB free')) { console.log('FAIL device flash usage: ' + el('rdfinfo').textContent); failed++; }
+} catch (e) { console.log('FAIL device flash: ' + e.stack); failed++; }
 console.log(failed ? `${failed} failure(s)` : 'ui smoke: all passed');
 process.exit(failed ? 1 : 0);

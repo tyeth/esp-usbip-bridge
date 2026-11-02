@@ -879,6 +879,15 @@ function rescueRender() {
        ' <button onclick="rUpload()">Upload</button> <span id="rupst" class="muted"></span></p><div id="rfiles" class="sub"></div>' +
        '<p class="sub" id="rcapcfg"></p>';
 
+  if ((r.serial && r.serial.kind != 'none') || (r.rp && (r.rp.picoboot_interface >= 0 || r.rp.reset_interface >= 0))) {
+    h += '<h2>Device flash</h2><p class="sub"><span class="muted">Partitions and the FAT, LittleFS or SPIFFS in them, ' +
+         'through the bootloader (ESP loader, RP2 PICOBOOT, SAMD SAM-BA read-only). The device stays in its bootloader ' +
+         'while the session is open.</span><br>platform <select id="rdfplat"><option>auto</option><option>esp</option>' +
+         '<option>rp2</option><option>samd</option></select> keep open <input id="rdfkeep" class="txt" type="number" value="120" ' +
+         'style="width:60px"> s <button class="act" onclick="rDfRun([])"' + dis + '>Map flash</button>' +
+         ' <button onclick="rDfClose()"' + dis + '>Close session</button> <span id="rdfst" class="muted"></span></p>' +
+         '<div id="rdfmap" class="sub"></div><div id="rdffs" class="sub"></div>';
+  }
   if (r.mass_storage) {
     h += '<h2>Mass storage</h2><p class="sub">Path <input id="rmscpath" class="txt" size="30" value="/">' +
          ' <button onclick="rMscList()"' + dis + '>List</button> <button onclick="rMscUp()">Up</button>' +
@@ -1201,6 +1210,165 @@ function rMscGet(p) {
     rJobPoll();
     wait();
   });
+}
+
+/* --- device flash: partitions and file systems through the bootloader ------ */
+var rDf = { job: 0, next: 0, part: '' };
+
+function rHex(n) { return '0x' + Number(n).toString(16); }
+
+/* Run ops in the device's flash session (starting one if none is open) and
+   call cb with their results once the job has them. */
+function rDfRun(ops, cb) {
+  var st = document.getElementById('rdfst');
+  if (st) st.textContent = 'working...';
+  var body = { ops: ops, platform: rVal('rdfplat') || 'auto', keep_open_s: parseInt(rVal('rdfkeep'), 10) || 0, port: rPort() };
+  api('POST', rUrl('dutflash'), body, function (ok, r) {
+    if (!ok) { if (st) st.textContent = (r && r.error) || 'failed'; return; }
+    if (!r.added_to_open_session || r.job != rDf.job) { rDf.job = r.job; rDf.next = 0; }
+    var first = rDf.next;
+    rDf.next += ops.length;
+    rJobId = r.job;
+    document.getElementById('rjob').style.display = 'block';
+    rJobPoll();
+    var wait = function () {
+      api('GET', '/api/rescue/jobs/' + r.job, null, function (ok2, j) {
+        if (!ok2 || !j) { if (st) st.textContent = 'lost the session job'; return; }
+        var res = j.result || {};
+        if (res.regions) rDfMap(res);
+        var done = (res.ops || []).filter(function (o) { return o.index >= first && o.index < first + ops.length; });
+        if (ops.length ? done.length == ops.length : !!res.regions) {
+          var errs = done.filter(function (o) { return !o.ok; }).map(function (o) { return o.op + ': ' + o.error; });
+          if (st) st.textContent = errs.length ? errs.join('; ') : (j.state == 'running' ? 'session open' : j.state);
+          if (cb) cb(done);
+        } else if (j.state == 'running' || j.state == 'queued') {
+          setTimeout(wait, 600);
+        } else if (st) {
+          st.textContent = 'session ended: ' + (j.error || j.state);
+        }
+      });
+    };
+    wait();
+  });
+}
+
+function rDfClose() {
+  api('POST', rUrl('dutflash/close'), {}, function (ok, r) {
+    var st = document.getElementById('rdfst');
+    if (st) st.textContent = ok ? 'closing (the device is reset)' : ((r && r.error) || 'failed');
+  });
+}
+
+function rDfMap(res) {
+  var el = document.getElementById('rdfmap');
+  if (!el) return;
+  var d = res.device || {};
+  var h = '<strong>' + esc(d.chip || '?') + '</strong> ' + esc(d.platform || '') + ', ' + (d.flash_size >> 10) + ' KB flash' +
+          (d.writable ? '' : ' <span class="muted">(read-only)</span>');
+  (res.notes || []).forEach(function (n) { h += '<br><span class="muted">' + esc(n) + '</span>'; });
+  h += '<table><thead><tr><th>Name</th><th>Type</th><th>Offset</th><th>Size</th><th>File system</th><th></th></tr></thead><tbody>';
+  res.regions.forEach(function (g) {
+    var fs = g.fs || '';
+    var browsable = fs == 'littlefs' || fs == 'fat' || fs == 'spiffs';
+    var n = esc(g.name);
+    h += '<tr><td>' + n + (g.protected ? ' <span class="muted" title="code or system data">(locked)</span>' : '') + '</td><td>' +
+         esc(g.type) + '</td><td>' + rHex(g.offset) + '</td><td>' + (g.size >> 10) + ' KB</td><td>' + esc(fs) +
+         (g.fs_version ? ' ' + esc(g.fs_version) : '') + (g.label ? ' ' + esc(g.label) : '') + '</td><td>' +
+         '<button onclick="rDfRead(\'' + n + '\')">Read</button>' +
+         (browsable ? ' <button onclick="rDfBrowse(\'' + n + '\')">Browse</button>' : '') +
+         (d.writable && !g.protected ? ' <button onclick="rDfFormat(\'' + n + '\',\'' + esc(fs) + '\')">Format</button>' : '') +
+         '</td></tr>';
+  });
+  el.innerHTML = h + '</tbody></table>';
+}
+
+function rDfDownload(o) {
+  rFiles();
+  if (o && o.ok && o.download) window.location = o.download;
+}
+
+function rDfRead(part) {
+  rDfRun([{ op: 'read_region', part: part }], function (d) { rDfDownload(d[0]); });
+}
+
+function rDfFormat(part, was) {
+  var fs = prompt('Format ' + part + (was ? ' (now: ' + was + ')' : '') + ' as littlefs, fat or spiffs?', 'littlefs');
+  if (!fs) return;
+  if (was && was != 'blank' && !confirm('Erase everything in ' + part + '?')) return;
+  rDfRun([{ op: 'format', part: part, fs: fs, confirm: true }]);
+}
+
+function rDfBrowse(part) {
+  rDf.part = part;
+  document.getElementById('rdffs').innerHTML = '<strong>' + esc(part) + '</strong> path <input id="rdfpath" class="txt" size="30" value="/">' +
+    ' <button onclick="rDfList()">List</button> <button onclick="rDfUp()">Up</button> <button onclick="rDfMkdir()">New folder</button>' +
+    '<br>Upload ' + rFileSel('rdffile') + ' <button onclick="rDfPut()">to this folder</button> <span id="rdfinfo" class="muted"></span>' +
+    '<div id="rdflist"></div>';
+  rDfRun([{ op: 'fs_info', part: part }], function (d) {
+    var o = d[0];
+    if (o && o.ok) {
+      document.getElementById('rdfinfo').textContent = o.fs + ', ' + Math.round(o.free / 1024) + ' KB free of ' +
+        Math.round(o.total / 1024) + ' KB';
+      rDfFiles(o);
+    }
+  });
+}
+
+function rDfPath(name) {
+  var p = rVal('rdfpath') || '/';
+  return (p.charAt(p.length - 1) == '/' ? p : p + '/') + name;
+}
+
+function rDfFiles(o) {
+  var h = '<table><thead><tr><th>Name</th><th>Size</th><th></th></tr></thead><tbody>';
+  (o.files || []).forEach(function (f) {
+    var p = esc(rDfPath(f.name));
+    h += '<tr><td>' + (f.dir ? '<a href="#" style="color:#e94560" onclick="document.getElementById(\'rdfpath\').value=\'' + p +
+         '\';rDfList();return false">' + esc(f.name) + '/</a>' : esc(f.name)) + '</td><td>' + (f.dir ? '' : f.size) + '</td><td>' +
+         (f.dir ? '' : '<button onclick="rDfGet(\'' + p + '\')">Download</button> ') +
+         '<button onclick="rDfRename(\'' + p + '\')">Rename</button> <button onclick="rDfDel(\'' + p + '\')">Delete</button></td></tr>';
+  });
+  document.getElementById('rdflist').innerHTML = h + '</tbody></table>';
+}
+
+function rDfList() {
+  rDfRun([{ op: 'list', part: rDf.part, path: rVal('rdfpath') || '/' }], function (d) { if (d[0] && d[0].ok) rDfFiles(d[0]); });
+}
+
+function rDfUp() {
+  var p = rVal('rdfpath').replace(/\/+$/, '');
+  document.getElementById('rdfpath').value = p.substring(0, p.lastIndexOf('/')) || '/';
+  rDfList();
+}
+
+/* A change, then the listing again (both in the same session). */
+function rDfChange(op) {
+  rDfRun([op, { op: 'list', part: rDf.part, path: rVal('rdfpath') || '/' }], function (d) { if (d[1] && d[1].ok) rDfFiles(d[1]); });
+}
+
+function rDfDel(p) {
+  if (confirm('Delete ' + p + ' on the device?')) rDfChange({ op: 'delete', part: rDf.part, path: p });
+}
+
+function rDfRename(p) {
+  var to = prompt('Rename / move ' + p + ' to', p);
+  if (to && to != p) rDfChange({ op: 'rename', part: rDf.part, from: p, to: to });
+}
+
+function rDfMkdir() {
+  var n = prompt('New folder name');
+  if (n) rDfChange({ op: 'mkdir', part: rDf.part, path: rDfPath(n) });
+}
+
+function rDfPut() {
+  var f = rVal('rdffile');
+  if (!f) { alert('Stage a file first'); return; }
+  rDfChange({ op: 'write', part: rDf.part, path: rDfPath(f), file: f });
+}
+
+function rDfGet(p) {
+  var name = p.substring(p.lastIndexOf('/') + 1).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '') || 'file';
+  rDfRun([{ op: 'read', part: rDf.part, path: p, file: name }], function (d) { rDfDownload(d[0]); });
 }
 
 function rUrl(action) { return '/api/usb/devices/' + encodeURIComponent(rBusid) + '/' + action; }
