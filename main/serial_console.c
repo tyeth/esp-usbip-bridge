@@ -11,10 +11,16 @@
 #include "esp_netif_ip_addr.h"
 #include "esp_system.h"
 #include "sdkconfig.h"
+#include "soc/uart_pins.h"
 
 #include "wifi_sta.h"
 
 #define CONSOLE_UART         CONFIG_ESP_CONSOLE_UART_NUM
+#if CONFIG_ESP_CONSOLE_UART_CUSTOM
+#define CONSOLE_RX_GPIO      CONFIG_ESP_CONSOLE_UART_RX_GPIO
+#else
+#define CONSOLE_RX_GPIO      U0RXD_GPIO_NUM
+#endif
 #define CONSOLE_RX_BUF       512
 #define CONSOLE_LINE_MAX     160
 #define CONSOLE_MAX_ARGS     4
@@ -215,10 +221,18 @@ esp_err_t serial_console_start(void)
             ESP_LOGE(TAG, "uart_driver_install(%d): %s", CONSOLE_UART, esp_err_to_name(err));
             return err;
         }
+        /* Startup only sets the baud rate; the RX pin is not routed to the
+           UART on the S31 until something does (TX is left as it is). */
+        err = uart_set_pin(CONSOLE_UART, UART_PIN_NO_CHANGE, CONSOLE_RX_GPIO, UART_PIN_NO_CHANGE,
+                           UART_PIN_NO_CHANGE);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "uart_set_pin(rx=%d): %s", CONSOLE_RX_GPIO, esp_err_to_name(err));
+            return err;
+        }
     }
     if (xTaskCreate(console_task, "console", CONSOLE_TASK_STACK, NULL, CONSOLE_TASK_PRIO, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "console commands on UART%d: wifi status|set|clear, reboot, help", CONSOLE_UART);
+    ESP_LOGI(TAG, "console commands on UART%d (RX GPIO%d): wifi status|set|clear, reboot, help", CONSOLE_UART, CONSOLE_RX_GPIO);
     return ESP_OK;
 }
