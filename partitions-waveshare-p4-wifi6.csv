@@ -1,0 +1,15 @@
+# Waveshare ESP32-P4-WIFI6 (32 MB flash), with OTA updates.
+#
+# The layout of partitions-s31-function-coreboard-1.csv: nvs and phy_init at
+# the offsets of the single-app tables, factory at 0x10000 (the image written
+# over the wire; OTA never touches it, and a first OTA image that fails its
+# checks rolls back to it), then two 4 MB OTA slots and otadata. Everything
+# sits below 16 MB, so the GD25Q256 never needs 4-byte addressing;
+# 0xC12000-0x1FFFFFF is unused.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  4M,
+ota_0,    app,  ota_0,   0x410000, 4M,
+ota_1,    app,  ota_1,   0x810000, 4M,
+otadata,  data, ota,     0xC10000, 0x2000,

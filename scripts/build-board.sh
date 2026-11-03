@@ -12,7 +12,7 @@ BOARD="${1:-}"
 ACTION="build"
 
 if [[ -z "${BOARD}" ]]; then
-    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|p4hil|s3-usb-otg|s31-function-coreboard-1> [build|flash|monitor|clean]" >&2
+    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|p4hil|waveshare-p4-wifi6|s3-usb-otg|s31-function-coreboard-1> [build|flash|monitor|clean]" >&2
     exit 1
 fi
 
@@ -47,6 +47,12 @@ case "${BOARD}" in
         BUILD_DIR="build-p4hil"
         SDKCONFIG_FILE="sdkconfig.p4hil"
         DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.p4hil"
+        ;;
+    waveshare-p4-wifi6)
+        TARGET="esp32p4"
+        BUILD_DIR="build-waveshare-p4-wifi6"
+        SDKCONFIG_FILE="sdkconfig.waveshare-p4-wifi6"
+        DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.waveshare-p4-wifi6"
         ;;
     s31-function-coreboard-1)
         TARGET="esp32s31"

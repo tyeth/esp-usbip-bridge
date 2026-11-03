@@ -42,7 +42,7 @@ USB/IP wire format is implemented from Linux kernel documentation:
 
 - `main/main.c`: application startup
 - `main/network_init.c`: target-specific network bring-up (Ethernet or Wi-Fi STA), `GET /api/network`
-- `main/wifi_sta.c`, `main/serial_console.c`: the optional Wi-Fi station next to Ethernet (S31) and its console commands
+- `main/wifi_sta.c`, `main/serial_console.c`: the optional Wi-Fi station next to Ethernet (S31), or alone (Waveshare ESP32-P4-WIFI6), and its console commands
 - `main/usb_backend.c`: USB Host backend, device discovery, EP0 control transfers
 - `main/usbip_server.c`: TCP server and USB/IP message handling
 - `main/usbip_protocol.h`: protocol constants and packet structs
@@ -79,12 +79,14 @@ source ./scripts/idf-env.sh
 
 ## Build and Flash
 
-Five board profiles are provided:
+Six board profiles are provided:
 
 - `p4-function-ev`: ESP32-P4-Function-EV board, USB/IP over Ethernet
 - `m5stack-poe-p4`: M5Stack PoE ESP32-P4, USB/IP over Ethernet
 - `p4hil`: [P4HIL](https://github.com/tannewt/p4hil) hardware-in-the-loop
   fixture, USB/IP over Ethernet
+- `waveshare-p4-wifi6`: Waveshare ESP32-P4-WIFI6 (ESP32-P4 rev v1.x), USB/IP
+  over Wi-Fi through its ESP32-C6 co-processor (ESP-Hosted), no Ethernet
 - `s3-usb-otg`: ESP32-S3-USB-OTG board, USB/IP over Wi-Fi STA
 - `s31-function-coreboard-1`: ESP32-S31-Function-CoreBoard-1, USB/IP over
   gigabit (RGMII) Ethernet, USB host on the USB-HS port
@@ -98,6 +100,8 @@ export ESPPORT=/dev/ttyUSB0
 Console output defaults by target:
 - ESP32-P4 boards: USB Serial/JTAG console
 - `s3-usb-otg`: `UART0` console (to avoid USB host conflicts)
+- `waveshare-p4-wifi6`: `UART0` console through the board's CH343 (USB-C,
+  115200), with the [console commands](#wi-fi-next-to-ethernet-s31)
 - `s31-function-coreboard-1`: `UART0` console through the board's CP2102N
   (115200; USB Serial/JTAG as a secondary console), with the
   [console commands](#wi-fi-next-to-ethernet-s31)
@@ -165,7 +169,7 @@ by DHCP under the same hostname, and HTTP, USB/IP (3240), the serial streams
 (3241) and mDNS answer on both. A board with no Ethernet cable is fully usable
 over Wi-Fi. Boot never waits for Wi-Fi: the station starts after the USB host,
 and a lost or failed association is retried with a backoff (1 s doubling to
-30 s). The ESP32-P4 has no radio, so P4 builds have no Wi-Fi.
+30 s). The ESP32-P4 has no radio, so the Ethernet P4 builds have no Wi-Fi.
 
 Credentials live in NVS namespace `wifi` (keys `ssid`, `pass`); without them
 the radio stays idle. Set them the way a user would, any of:
@@ -187,6 +191,35 @@ the radio stays idle. Set them the way a user would, any of:
 - **Web page**: the Network line under the firmware update controls.
 
 The password is never returned, shown or logged.
+
+### Waveshare ESP32-P4-WIFI6
+
+The [Waveshare ESP32-P4-WIFI6](https://www.waveshare.com/wiki/ESP32-P4-WIFI6)
+has no Ethernet: its network is an ESP32-C6-MINI-1 on SDIO, running ESP-Hosted
+slave firmware. The build adds `espressif/esp_hosted` and
+`espressif/esp_wifi_remote` (`main/idf_component.yml`, only for this board), so
+the same Wi-Fi station code (`main/wifi_sta.c`) runs on the `esp_wifi` API and
+the station is the only transport (`CONFIG_USBIP_TRANSPORT_WIFI_STA_ONLY`).
+Set the credentials as for the S31 (above): on the serial console (115200 on
+the USB-C connector, a CH343), over HTTP or on the web page. Until then the
+board is reachable only on its console.
+
+```bash
+./scripts/build-board.sh waveshare-p4-wifi6 build
+ESPPORT=$ESPPORT ./scripts/build-board.sh waveshare-p4-wifi6 flash
+```
+
+- ESP32-P4 rev v1.x (pre-ECO5) silicon, 32 MB flash, 32 MB PSRAM.
+- USB host: the MX1.25 4-pin "USB OTG 2.0 High Speed" header (VBUS hard-wired
+  on).
+- The strand-mux control bus is the board's I2C (SDA GPIO7, SCL GPIO8, on the
+  40-pin header), so `_i2c-strand._tcp` is advertised.
+- Partition table `partitions-waveshare-p4-wifi6.csv`: the S31 layout (4 MB
+  factory, two 4 MB OTA slots, otadata at `0xC10000`), so it updates over the
+  network like the S31.
+- The C6's own firmware is not part of this build. Its version is printed at
+  boot (`transport: Version mismatch: Host [...] > Co-proc [...]` when they
+  differ).
 
 `components/esp-serial-flasher` is a vendored copy of Espressif's host-side
 flasher (see its `VENDORED.md` for why the registry package is not used).
