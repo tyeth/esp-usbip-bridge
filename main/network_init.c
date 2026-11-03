@@ -559,6 +559,10 @@ esp_err_t network_init_start(void)
     return network_init_ethernet();
 #elif CONFIG_USBIP_TRANSPORT_WIFI
     return network_init_wifi();
+#elif CONFIG_USBIP_TRANSPORT_WIFI_STA_ONLY
+    /* The station is the transport; it starts in network_init_start_secondary(). */
+    ESP_LOGI(TAG, "Wi-Fi station only: it starts once the USB host is up");
+    return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
@@ -569,7 +573,8 @@ esp_err_t network_init_start_secondary(void)
 #if CONFIG_USBIP_WIFI_STA
     esp_err_t err = wifi_sta_start();
     if (err != ESP_OK) {
-        /* Ethernet carries on without it */
+        /* Ethernet carries on without it; a Wi-Fi-only board is left with
+           its serial console. */
         ESP_LOGE(TAG, "Wi-Fi station failed to start: %s", esp_err_to_name(err));
     }
     return serial_console_start();

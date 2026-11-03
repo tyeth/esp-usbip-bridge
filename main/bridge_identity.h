@@ -30,6 +30,8 @@ static inline const char *bridge_board_profile(void)
     return "m5stack-poe-p4";
 #elif CONFIG_USBIP_BOARD_P4HIL_BOARD
     return "p4hil";
+#elif CONFIG_USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
+    return "waveshare-p4-wifi6";
 #elif CONFIG_USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG
     return "s3-usb-otg";
 #elif CONFIG_USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1

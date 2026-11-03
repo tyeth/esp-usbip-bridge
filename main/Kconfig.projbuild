@@ -32,6 +32,10 @@ choice USBIP_BOARD
         bool "p4hil_board"
         depends on IDF_TARGET_ESP32P4
 
+    config USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
+        bool "waveshare_esp32p4_wifi6"
+        depends on IDF_TARGET_ESP32P4
+
     config USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG
         bool "espressif_esp32s3_usb_otg"
         depends on IDF_TARGET_ESP32S3
@@ -41,8 +45,24 @@ choice USBIP_BOARD
         depends on IDF_TARGET_ESP32S31
 endchoice
 
+# Wi-Fi from a co-processor: espressif/esp_wifi_remote + espressif/esp_hosted
+# (main/idf_component.yml pulls them in when this is set) put the esp_wifi API
+# on a chip without a radio.  Per board, not per target: on other ESP32-P4
+# boards the co-processor reset GPIO (54) is wired to something else.
+config USBIP_WIFI_REMOTE
+    bool
+    default y if USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
+    default n
+
+# The esp_wifi API is there: a native radio or Wi-Fi through a co-processor.
+config USBIP_HAS_WIFI
+    bool
+    default y if SOC_WIFI_SUPPORTED || USBIP_WIFI_REMOTE
+    default n
+
 choice USBIP_TRANSPORT
     prompt "Network transport"
+    default USBIP_TRANSPORT_WIFI_STA_ONLY if USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
     default USBIP_TRANSPORT_ETHERNET if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
     default USBIP_TRANSPORT_WIFI if IDF_TARGET_ESP32S3
     default USBIP_TRANSPORT_ETHERNET
@@ -53,6 +73,16 @@ choice USBIP_TRANSPORT
     config USBIP_TRANSPORT_WIFI
         bool "Wi-Fi STA"
         depends on IDF_TARGET_ESP32S3
+    config USBIP_TRANSPORT_WIFI_STA_ONLY
+        bool "Wi-Fi station only (no Ethernet; credentials set at run time)"
+        depends on USBIP_HAS_WIFI && !IDF_TARGET_ESP32S3
+        select USBIP_WIFI_STA
+        help
+            The Wi-Fi station of USBIP_WIFI_STA as the only transport: boot
+            never waits for it, and the credentials come from NVS, the serial
+            console (wifi set), HTTP (PUT /api/network/wifi) or the web page.
+            For boards without Ethernet whose Wi-Fi may be a co-processor
+            (the Waveshare ESP32-P4-WIFI6's ESP32-C6 over ESP-Hosted).
 endchoice
 
 if USBIP_TRANSPORT_ETHERNET
@@ -205,11 +235,11 @@ endif
 
 config USBIP_WIFI_STA
     bool "Also join Wi-Fi as a station (credentials in NVS)"
-    depends on USBIP_TRANSPORT_ETHERNET && SOC_WIFI_SUPPORTED
+    depends on (USBIP_TRANSPORT_ETHERNET || USBIP_TRANSPORT_WIFI_STA_ONLY) && USBIP_HAS_WIFI
     default y
     help
         Bring up a Wi-Fi station next to Ethernet, which stays the primary
-        transport.  Credentials live in NVS (namespace "wifi", keys "ssid"
+        transport (or, with USBIP_TRANSPORT_WIFI_STA_ONLY, as the only one).  Credentials live in NVS (namespace "wifi", keys "ssid"
         and "pass") and are set from the serial console (wifi set), over
         HTTP (PUT /api/network/wifi) or on the web page; without them the
         radio stays idle.  Every service answers on both interfaces.  Boot
@@ -445,6 +475,7 @@ menu "Analog I2C Mux Configuration"
     config USBIP_MUX_I2C_SDA_GPIO
         int "Mux control bus SDA GPIO (-1 to disable)"
         default 2 if USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+        default 7 if USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
         default -1
         help
             I2C bus that drives the ADG729/ADG728 analog switches routing the
@@ -453,6 +484,7 @@ menu "Analog I2C Mux Configuration"
     config USBIP_MUX_I2C_SCL_GPIO
         int "Mux control bus SCL GPIO (-1 to disable)"
         default 3 if USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+        default 8 if USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
         default -1
 
     config USBIP_MUX_I2C_FREQ_HZ

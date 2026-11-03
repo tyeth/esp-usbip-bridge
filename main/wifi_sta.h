@@ -3,7 +3,9 @@
 
 /*
  * Optional Wi-Fi station next to Ethernet (CONFIG_USBIP_WIFI_STA, boards
- * with a radio: the S31).  Credentials live in NVS namespace "wifi", keys
+ * with a radio: the S31), or the only transport
+ * (CONFIG_USBIP_TRANSPORT_WIFI_STA_ONLY: the Waveshare ESP32-P4-WIFI6, whose
+ * esp_wifi API reaches an ESP32-C6 through esp_wifi_remote/esp_hosted).  Credentials live in NVS namespace "wifi", keys
  * "ssid" and "pass" (the S3 Wi-Fi transport's keys); without them the radio
  * stays idle.  Connecting never blocks: a lost or failed association is
  * retried with a backoff of 1 s doubling to 30 s, for ever.  DHCP, the

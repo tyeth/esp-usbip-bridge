@@ -59,7 +59,11 @@ if(CONFIG_USBIP_VIRTUAL_HARNESS)
 endif()
 
 if(IDF_TARGET STREQUAL "esp32p4")
-    list(APPEND req_components esp_eth)
+    # esp_wifi and esp_driver_uart: the Wi-Fi station and serial console of a
+    # Wi-Fi-only board (waveshare-p4-wifi6).  The P4 has no radio, so esp_wifi
+    # is the API only, backed by esp_hosted (main/idf_component.yml) on that
+    # board; the other P4 builds compile nothing that calls it.
+    list(APPEND req_components esp_eth esp_wifi esp_driver_uart)
 elseif(IDF_TARGET STREQUAL "esp32s31")
     # Ethernet, and the optional Wi-Fi station next to it
     list(APPEND req_components esp_eth esp_wifi esp_driver_uart)
@@ -67,7 +71,8 @@ elseif(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND req_components esp_wifi esp_driver_gpio)
 endif()
 
-# Optional Wi-Fi station next to Ethernet (S31), with its serial console
+# Optional Wi-Fi station next to Ethernet (S31), or alone (a P4 with an
+# ESP-Hosted co-processor), with its serial console
 # commands (wifi set/status/clear, reboot).  The requirements above go by
 # target: sdkconfig values are not known yet when IDF expands them.
 if(CONFIG_USBIP_WIFI_STA)

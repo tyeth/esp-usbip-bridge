@@ -154,13 +154,18 @@ The example values are .133's.  Rules:
   the truth).  `_hil-bridge._tcp` (the pre-release name) is no longer
   advertised.
 
-## Wi-Fi (S31)
+## Wi-Fi (S31, Waveshare ESP32-P4-WIFI6)
 
-Only targets with a radio: the ESP32-P4 has none, so P4 builds have no Wi-Fi
-and no `wifi_config` feature (their `/api/network` lists `eth` only, and
-`PUT`/`DELETE /api/network/wifi` answer 501).  The S3 build's Wi-Fi is its only
-transport, configured at boot as before; it lists `wifi` without
-`wifi_config`.
+Only builds with the `esp_wifi` API: a radio (the S31), or a Wi-Fi
+co-processor through `esp_wifi_remote` and `esp_hosted` (the Waveshare
+ESP32-P4-WIFI6's ESP32-C6, `CONFIG_USBIP_WIFI_REMOTE`).  The Ethernet P4 builds
+have neither, so no Wi-Fi and no `wifi_config` feature (their `/api/network`
+lists `eth` only, and `PUT`/`DELETE /api/network/wifi` answer 501).  The S3
+build's Wi-Fi is its only transport, configured at boot as before; it lists
+`wifi` without `wifi_config`.  The Waveshare ESP32-P4-WIFI6 has no Ethernet:
+its station is the only transport (`transports: ["wifi"]`, with
+`wifi_config`), configured the same three ways below; everything about
+Ethernet in this section does not apply to it.
 
 Ethernet stays the primary transport (and the default route).  A board may
 also join a Wi-Fi network as a station; both interfaces can be up at once and
@@ -179,7 +184,7 @@ Credentials live in NVS namespace `wifi`, keys `ssid` and `pass` (the existing
 S3 keys).  They can be set the way a user would, three ways:
 
 1. **Serial console** (the board's console UART, 115200: the CP2102N on the
-   S31): line commands, never blocking boot —
+   S31, the CH343 on the Waveshare ESP32-P4-WIFI6): line commands, never blocking boot —
    `wifi status`, `wifi set <ssid> [<password>]` (quotes allowed for spaces;
    no password joins an open network; stores at once and connects without a
    reboot), `wifi clear`, `reboot`, `help`.  Answers are one line starting

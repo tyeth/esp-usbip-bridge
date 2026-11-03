@@ -1,0 +1,101 @@
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6=y
+
+# Waveshare ESP32-P4-WIFI6 (https://www.waveshare.com/wiki/ESP32-P4-WIFI6).
+# Sources for the values below:
+#   [sch]  the board schematic, files.waveshare.com/wiki/ESP32-P4-WIFI6/
+#          ESP32-P4-WIFI6-datasheet.pdf (net names quoted)
+#   [ard]  arduino-esp32 3.3.11, variants/esp32p4/pins_arduino.h
+#          (BOARD_SDIO_ESP_HOSTED_*) and tools/esp32p4_es-libs/3.3.11/sdkconfig,
+#          the build WipperSnapper (board id waveshare-p4-wifi6) runs on this
+#          board with working Wi-Fi
+#   [wiki] the Waveshare wiki page above
+
+# No Ethernet on this board ([sch]: no PHY, no RMII nets; [wiki] lists none).
+# Wi-Fi is the only transport: the ESP32-C6-MINI-1 co-processor over SDIO
+# (ESP-Hosted), behind the esp_wifi API (esp_wifi_remote).
+CONFIG_USBIP_TRANSPORT_WIFI_STA_ONLY=y
+
+# ESP32-P4NRW32 rev v1.x (the board on the bench reads v1.3, ROM
+# esp32p4-eco2-20240710). IDF master defaults to v3.x silicon only; accept the
+# v1 range, as the p4hil profile does.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_ESP32P4_REV_MIN_FULL=100
+CONFIG_ESP_REV_MIN_FULL=100
+CONFIG_ESP32P4_REV_MAX_FULL=199
+CONFIG_ESP_REV_MAX_FULL=199
+
+# 32 MB GD25Q256 QSPI NOR ([sch] U7; esptool flash id c8/4019). Every
+# partition stays below 16 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+
+# 32 MB of PSRAM in the ESP32-P4NRW32 package ([sch] U6; [wiki] "32 MB PSRAM
+# is stacked in the package").
+CONFIG_SPIRAM=y
+
+# Console on UART0, GPIO37 (TX) / GPIO38 (RX): the only USB-C connector goes to
+# a CH343P USB-UART ([sch] "USB to UART": CH343P TXD/RXD on GPIO38/GPIO37).
+# The base defaults' USB Serial/JTAG console would be on GPIO24/25, which only
+# reach the 40-pin header ([sch] USBD1_N/USBD1_P). The serial console's
+# wifi/reboot commands read this UART.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# USB host: the P4's USB 2.0 HS OTG PHY (DM/DP, package pins 49/50) goes to P1,
+# the MX1.25 4-pin "USB OTG 2.0 High Speed" header ([sch] USBD_N/USBD_P;
+# [wiki] item 9). P1's VBUS is VCC_5V, hard-wired: no enable GPIO to drive.
+
+# No user LED or RGB LED ([sch]: LED1 is the power LED; [wiki] item 13). The
+# default GPIO0 is the 32.768 kHz crystal (Y2) on this board.
+CONFIG_USBIP_NEOPIXEL_GPIO=-1
+
+# The virtual logic analyzer's default GPIO10-13 are the ES8311 codec's I2S
+# lines here ([sch] I2S_LRCK/ASDOUT/SCLK/MCLK).
+# CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER is not set
+
+# Analog strand-mux control bus (ADG729/ADG728) on the board's I2C,
+# SDA GPIO7 / SCL GPIO8 ([sch] ESP_I2C_SDA/ESP_I2C_SCL, on the 40-pin header;
+# [wiki] "SCL(GPIO8) and SDA(GPIO7) by default"). The ES8311 codec shares it
+# at 0x18, away from the mux addresses.
+CONFIG_USBIP_MUX_I2C_SDA_GPIO=7
+CONFIG_USBIP_MUX_I2C_SCL_GPIO=8
+
+# ---------------------------------------------------------------------------
+# ESP-Hosted host, SDIO to the ESP32-C6 (espressif/esp_hosted, see
+# main/idf_component.yml). Pins: [sch] nets GPIO18/19/14-17 to the C6's SDIO
+# slave pins (C6 IO19 CLK, IO18 CMD, IO20-23 D0-D3, 51k pull-ups R85-R90) and
+# P4 GPIO54 through R83 to C6_CHIP_PU; [ard] BOARD_SDIO_ESP_HOSTED_CLK 18,
+# CMD 19, D0-D3 14-17, RESET 54. Bus settings as in [ard]'s sdkconfig: slot 1,
+# 4-bit, 40 MHz, reset active high, streaming RX.
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_NONE=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+
+# esp_wifi_remote: the ESP32-C6 slave through ESP-Hosted ([ard]).
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+
+# ---------------------------------------------------------------------------
+# 4 MB factory app plus two 4 MB OTA slots, nvs and phy_init where the
+# single-app tables have them; see partitions-waveshare-p4-wifi6.csv. Wi-Fi
+# is this board's only network, so it updates itself over the air
+# (PUT /api/ota) rather than over the CH343.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-waveshare-p4-wifi6.csv"
+
+# OTA rollback: the app confirms a new image itself (main/ota_update.c) once
+# an interface has an address and the HTTP server answers.
+CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP=y

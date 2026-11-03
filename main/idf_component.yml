@@ -35,3 +35,23 @@ dependencies:
     version: main
     rules:
       - if: "target in [esp32p4]"
+  # Wi-Fi through the Waveshare ESP32-P4-WIFI6's ESP32-C6 (ESP-Hosted over
+  # SDIO), behind the plain esp_wifi API.  Only for boards that set
+  # CONFIG_USBIP_WIFI_REMOTE (main/Kconfig.projbuild): esp_hosted claims the
+  # co-processor reset GPIO at boot, which other P4 boards use for Ethernet.
+  # Exact versions: the pair arduino-esp32 3.3.11 ships for the ESP32-P4
+  # (tools/esp32p4_es-libs/3.3.11/versions.txt), proven against this board's
+  # C6 slave firmware by WipperSnapper.  dependencies.lock is not committed
+  # (it is shared by every target), so these pins are the pin.  On IDF >= 6.1
+  # esp_wifi carries the remote layer itself (components/esp_wifi/remote) and
+  # esp_wifi_remote registers as an empty component; it does the work on 5.x.
+  espressif/esp_wifi_remote:
+    version: "==1.6.3"
+    rules:
+      - if: "target in [esp32p4]"
+      - if: "$CONFIG{USBIP_WIFI_REMOTE} == True"
+  espressif/esp_hosted:
+    version: "==2.12.11"
+    rules:
+      - if: "target in [esp32p4]"
+      - if: "$CONFIG{USBIP_WIFI_REMOTE} == True"
