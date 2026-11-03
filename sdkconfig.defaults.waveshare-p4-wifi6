@@ -83,6 +83,12 @@ CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
 CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
 CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+# esp_hosted starts from a constructor, before IDF adds the startup-stack
+# region to the heap: only ~69 KB of internal DMA RAM is free then, and the
+# SDIO buffer pool after the host tasks' stacks does not fit ("HS_MP: mempool
+# create failed: no mem", assert in sdio_mempool_create). The P4's DMA reaches
+# PSRAM, so put the transport buffers there (internal RAM as the fallback).
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 
 # esp_wifi_remote: the ESP32-C6 slave through ESP-Hosted ([ard]).
 CONFIG_SLAVE_IDF_TARGET_ESP32C6=y

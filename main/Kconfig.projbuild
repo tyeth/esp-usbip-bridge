@@ -45,14 +45,20 @@ choice USBIP_BOARD
         depends on IDF_TARGET_ESP32S31
 endchoice
 
-# Wi-Fi from a co-processor: espressif/esp_wifi_remote + espressif/esp_hosted
-# (main/idf_component.yml pulls them in when this is set) put the esp_wifi API
-# on a chip without a radio.  Per board, not per target: on other ESP32-P4
-# boards the co-processor reset GPIO (54) is wired to something else.
 config USBIP_WIFI_REMOTE
-    bool
+    bool "Wi-Fi through an ESP-Hosted co-processor (esp_wifi_remote)"
+    depends on IDF_TARGET_ESP32P4
     default y if USBIP_BOARD_WAVESHARE_ESP32P4_WIFI6
     default n
+    help
+        Put the esp_wifi API on a chip without a radio: espressif/esp_hosted
+        and espressif/esp_wifi_remote (main/idf_component.yml pulls them in
+        when this is set) reach a Wi-Fi co-processor, the Waveshare
+        ESP32-P4-WIFI6's ESP32-C6 over SDIO.  Per board, not per target:
+        esp_hosted resets the co-processor through a GPIO (54) at startup,
+        which other ESP32-P4 boards wire to something else (Ethernet MDIO on
+        p4hil).  A prompt, so the option is always in sdkconfig: the
+        component manager's "if" rule needs its value on every P4 build.
 
 # The esp_wifi API is there: a native radio or Wi-Fi through a co-processor.
 config USBIP_HAS_WIFI
