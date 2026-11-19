@@ -15,6 +15,14 @@ CONFIG_USBIP_ETH_PHY_RST_GPIO=52
 
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 
+# Large composite devices.  esp-usb reads the whole configuration descriptor through the per-device control
+# buffer, so a device whose wTotalLength exceeds it never enumerates: the port is enabled, then disabled.  The
+# default 256 rejected a Jumperless V5 (five CDC functions + MSC, ~360 bytes).  Its interface/endpoint count
+# (11 / 17) also overran the export tables, which silently drop what does not fit.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+CONFIG_USBIP_MAX_INTERFACES=16
+CONFIG_USBIP_MAX_ENDPOINTS=32
+
 
 # The HTTP API serves one request at a time; connections wait in the accept
 # mailbox meanwhile (a console peek holds it up to 12 s).  At the default 6,
